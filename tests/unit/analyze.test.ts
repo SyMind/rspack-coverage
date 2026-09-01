@@ -183,4 +183,100 @@ describe("coverage analysis", () => {
       }),
     ).rejects.toThrow(/does not match build/);
   });
+
+  it("uses one executed state for a partially covered source line", async () => {
+    const text = "aaaaabbbbb";
+    const build: BuildManifest = {
+      hash: "build-line",
+      mode: "production",
+      context: "/project",
+      publicPath: "/",
+      builtAt: 1,
+      assets: [
+        {
+          id: "main",
+          name: "main.js",
+          urlPath: "/main.js",
+          size: text.length,
+          contentHash: hash(text),
+          chunks: ["main"],
+          mapAvailable: true,
+        },
+      ],
+      chunks: [],
+      modules: [],
+      entrypoints: [],
+      diagnostics: [],
+      counts: { assets: 1, javascriptAssets: 1, chunks: 0, modules: 0, sourceMaps: 1 },
+      previewAvailable: true,
+      publicPathSupported: true,
+    };
+    const report = await analyzeCoverage({
+      build,
+      coverage: [{ url: "/main.js", text, ranges: [{ start: 0, end: 5 }] }],
+      maps: {
+        main: {
+          version: 3,
+          sources: ["/project/src/one-line.js"],
+          sourcesContent: ["run();"],
+          names: [],
+          mappings: "AAAA,KAAA",
+        },
+      },
+      generatedAssets: { main: text },
+      originalSources: {},
+      precision: "per-block",
+    });
+
+    const line = report.files.find((file) => file.path === "src/one-line.js")?.lines[0];
+    expect(line?.runtimeState).toBe("executed");
+    expect(new Set(line?.ranges.map((range) => range.executed))).toEqual(new Set([true]));
+  });
+
+  it("does not create empty rows beyond available sourcesContent", async () => {
+    const text = "generated";
+    const build: BuildManifest = {
+      hash: "build-content",
+      mode: "production",
+      context: "/project",
+      publicPath: "/",
+      builtAt: 1,
+      assets: [
+        {
+          id: "main",
+          name: "main.js",
+          urlPath: "/main.js",
+          size: text.length,
+          contentHash: hash(text),
+          chunks: ["main"],
+          mapAvailable: true,
+        },
+      ],
+      chunks: [],
+      modules: [],
+      entrypoints: [],
+      diagnostics: [],
+      counts: { assets: 1, javascriptAssets: 1, chunks: 0, modules: 0, sourceMaps: 1 },
+      previewAvailable: true,
+      publicPathSupported: true,
+    };
+    const report = await analyzeCoverage({
+      build,
+      coverage: [{ url: "/main.js", text, ranges: [{ start: 0, end: text.length }] }],
+      maps: {
+        main: {
+          version: 3,
+          sources: ["/project/src/single-line.js"],
+          sourcesContent: ["singleLine();"],
+          names: [],
+          mappings: "AAKA",
+        },
+      },
+      generatedAssets: { main: text },
+      originalSources: {},
+      precision: "per-block",
+    });
+
+    expect(report.files.find((file) => file.path === "src/single-line.js")?.lines).toHaveLength(1);
+  });
 });

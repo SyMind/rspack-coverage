@@ -110,9 +110,7 @@ async function matchCoverage(
 
 function runtimeState(line: MutableLine): RuntimeState {
   if (line.loadedBytes === 0) return "not-loaded";
-  if (line.executedBytes === 0) return "not-executed";
-  if (line.executedBytes >= line.loadedBytes) return "executed";
-  return "partial";
+  return line.executedBytes > 0 ? "executed" : "not-executed";
 }
 
 function mutableFile(
@@ -169,19 +167,11 @@ function addLineBytes(
   line.executedBytes += input.executed;
   for (const chunk of input.chunks) line.chunks.add(chunk);
   if (input.loaded > 0) {
-    const width = Math.max(1, input.endColumn - input.startColumn);
-    if (input.executed > 0 && input.executed < input.loaded) {
-      const split =
-        input.startColumn + Math.max(1, Math.round(width * (input.executed / input.loaded)));
-      line.ranges.push({ startColumn: input.startColumn, endColumn: split, executed: true });
-      line.ranges.push({ startColumn: split, endColumn: input.endColumn, executed: false });
-    } else {
-      line.ranges.push({
-        startColumn: input.startColumn,
-        endColumn: input.endColumn,
-        executed: input.executed > 0,
-      });
-    }
+    line.ranges.push({
+      startColumn: input.startColumn,
+      endColumn: input.endColumn,
+      executed: input.executed > 0,
+    });
   }
   file.lines.set(lineNumber, line);
 }
@@ -207,7 +197,9 @@ function toFileReports(files: Map<string, MutableFile>, build: BuildManifest): S
       finalizeMetrics(file.metrics);
       const sourceLines = file.content === null ? [] : splitSourceLines(file.content);
       const maxMappedLine = Math.max(-1, ...file.lines.keys());
-      const lineCount = Math.max(sourceLines.length, maxMappedLine + 1);
+      // sourcesContent is authoritative for the source drawer. A malformed or
+      // incompatible map must not manufacture thousands of empty source rows.
+      const lineCount = file.content === null ? maxMappedLine + 1 : sourceLines.length;
       const moduleIds = moduleIdsForSource(build, file.path);
       const moduleChunks = build.modules
         .filter((module) => moduleIds.includes(module.id))
@@ -217,15 +209,20 @@ function toFileReports(files: Map<string, MutableFile>, build: BuildManifest): S
       for (let index = 0; index < lineCount; index += 1) {
         const mapped = file.lines.get(index);
         const text = sourceLines[index] ?? "";
+        const lineRuntimeState = mapped ? runtimeState(mapped) : "not-loaded";
         lines.push({
           line: index + 1,
           text,
           buildState: mapped?.emittedBytes ? "retained" : text.trim() ? "not-emitted" : "unknown",
-          runtimeState: mapped ? runtimeState(mapped) : "not-loaded",
+          runtimeState: lineRuntimeState,
           emittedBytes: mapped?.emittedBytes ?? 0,
           executedBytes: mapped?.executedBytes ?? 0,
           chunks: mapped ? [...mapped.chunks] : chunks,
-          ranges: mapped?.ranges ?? [],
+          ranges:
+            mapped?.ranges.map((range) => ({
+              ...range,
+              executed: lineRuntimeState === "executed",
+            })) ?? [],
         });
       }
       const loadedChunks = [...file.loadedChunks];

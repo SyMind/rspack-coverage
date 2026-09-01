@@ -7,8 +7,15 @@ function buildLabel(line: SourceLineState): string {
   if (line.buildState === "not-emitted") return "Removed from final generated output";
   if (line.runtimeState === "not-loaded") return "Retained, but its chunk was not loaded";
   if (line.runtimeState === "not-executed") return "Retained and loaded, but not executed";
-  if (line.runtimeState === "partial") return "Partially executed mapped ranges";
   return "Executed mapped ranges";
+}
+
+function displayedRuntimeState(
+  line: SourceLineState,
+): Exclude<SourceLineState["runtimeState"], "partial"> {
+  // Reports cached by an older UI may still contain `partial`. The product now
+  // uses line coverage semantics, so any partial execution displays as executed.
+  return line.runtimeState === "partial" ? "executed" : line.runtimeState;
 }
 
 export function SourceDrawer(props: { file: SourceFileReport | null; onClose: () => void }) {
@@ -91,9 +98,10 @@ export function SourceDrawer(props: { file: SourceFileReport | null; onClose: ()
             {virtualizer.getVirtualItems().map((virtualRow) => {
               const line = lines[virtualRow.index];
               if (!line) return null;
+              const runtimeState = displayedRuntimeState(line);
               return (
                 <div
-                  className={`source-line build-${line.buildState} runtime-${line.runtimeState}`}
+                  className={`source-line build-${line.buildState} runtime-${runtimeState}`}
                   key={line.line}
                   style={{ transform: `translateY(${virtualRow.start}px)` }}
                   title={`${buildLabel(line)} · generated ${formatBytes(line.emittedBytes)} · executed ${formatBytes(line.executedBytes)} · chunks ${line.chunks.join(", ") || "none"}`}
@@ -106,13 +114,11 @@ export function SourceDrawer(props: { file: SourceFileReport | null; onClose: ()
                         : "·"}
                   </span>
                   <span className="runtime-gutter">
-                    {line.runtimeState === "executed"
+                    {runtimeState === "executed"
                       ? "●"
-                      : line.runtimeState === "partial"
-                        ? "◐"
-                        : line.runtimeState === "not-executed"
-                          ? "○"
-                          : "·"}
+                      : runtimeState === "not-executed"
+                        ? "○"
+                        : "·"}
                   </span>
                   <span className="line-number">{line.line}</span>
                   <code>{line.text || " "}</code>

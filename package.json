@@ -45,7 +45,6 @@
   "dependencies": {
     "@jridgewell/trace-mapping": "0.3.31",
     "@tanstack/react-virtual": "3.14.10",
-    "d3-hierarchy": "3.1.2",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },
@@ -62,7 +61,6 @@
     "@rspack/core": "2.2.1",
     "@testing-library/jest-dom": "7.0.0",
     "@testing-library/react": "16.3.2",
-    "@types/d3-hierarchy": "3.1.7",
     "@types/node": "24.13.3",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.4",

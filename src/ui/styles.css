@@ -44,6 +44,17 @@ a {
 code {
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
 }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 
 .topbar {
   position: sticky;
@@ -496,11 +507,6 @@ input:focus {
   font-size: 10px;
 }
 
-.sources-grid {
-  display: grid;
-  grid-template-columns: minmax(550px, 1.05fr) minmax(440px, 0.95fr);
-  gap: 12px;
-}
 .panel {
   min-width: 0;
   background: var(--surface);
@@ -531,6 +537,12 @@ input:focus {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.5;
+}
+.source-explorer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
 }
 .tree-controls {
   display: flex;
@@ -651,8 +663,11 @@ input:focus {
 
 .segmented {
   display: flex;
+  min-width: 0;
+  margin: 0;
   padding: 3px;
   background: #edf0ec;
+  border: 0;
   border-radius: 8px;
 }
 .segmented button {
@@ -669,81 +684,6 @@ input:focus {
   color: var(--ink);
   background: #fff;
   box-shadow: 0 1px 3px rgba(10, 25, 15, 0.12);
-}
-.treemap-breadcrumb {
-  height: 34px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 0 12px;
-  color: var(--muted);
-  background: #f7f8f6;
-  border-bottom: 1px solid var(--line);
-  font-size: 10px;
-  overflow: hidden;
-  white-space: nowrap;
-}
-.treemap-breadcrumb button {
-  padding: 0;
-  color: var(--green);
-  border: 0;
-  background: transparent;
-  font-weight: 750;
-  cursor: pointer;
-}
-.treemap-canvas {
-  height: 510px;
-}
-.treemap-cell {
-  cursor: pointer;
-}
-.treemap-cell rect {
-  stroke: rgba(255, 255, 255, 0.7);
-  stroke-width: 1px;
-  transition: filter 0.12s;
-}
-.treemap-cell:hover rect {
-  filter: brightness(1.08);
-  stroke: #17211b;
-}
-.treemap-cell text {
-  fill: white;
-  font-size: 10px;
-  font-weight: 700;
-  pointer-events: none;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
-}
-.treemap-cell .treemap-value {
-  fill: rgba(255, 255, 255, 0.8);
-  font-size: 9px;
-  font-weight: 500;
-}
-.treemap-legend {
-  min-height: 32px;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
-  padding: 0 12px;
-  color: var(--muted);
-  border-top: 1px solid var(--line);
-  font-size: 9px;
-}
-.treemap-legend span {
-  display: inline-block;
-  width: 15px;
-  height: 8px;
-  margin-left: 8px;
-  border-radius: 2px;
-}
-.legend-low {
-  background: hsl(24 66% 44%);
-}
-.legend-high {
-  background: hsl(140 66% 36%);
-}
-.legend-not-loaded {
-  background: repeating-linear-gradient(135deg, #b5bdb6 0 2px, #e0e4e0 2px 4px);
 }
 
 .data-panel {
@@ -1095,22 +1035,11 @@ input:focus {
 .runtime-executed .runtime-gutter {
   color: var(--green);
 }
-.runtime-partial .runtime-gutter {
-  color: #9a8a27;
-}
 .runtime-not-executed .runtime-gutter {
   color: var(--orange);
 }
 .runtime-executed code {
   background: linear-gradient(90deg, rgba(66, 174, 111, 0.14), transparent 72%);
-}
-.runtime-partial code {
-  background: linear-gradient(
-    90deg,
-    rgba(66, 174, 111, 0.16) 0 45%,
-    rgba(235, 137, 57, 0.15) 45% 80%,
-    transparent 80%
-  );
 }
 .runtime-not-executed code {
   background: linear-gradient(90deg, rgba(235, 137, 57, 0.16), transparent 72%);
@@ -1154,9 +1083,6 @@ input:focus {
     border-right: 0;
     border-bottom: 1px solid var(--line);
   }
-  .sources-grid {
-    grid-template-columns: 1fr;
-  }
   .metric-grid {
     grid-template-columns: repeat(3, 1fr);
   }
@@ -1187,15 +1113,27 @@ input:focus {
     align-items: flex-start;
     flex-direction: column;
   }
-  .source-tree-panel {
+  .source-explorer-panel {
     overflow-x: auto;
+  }
+  .source-explorer-header,
+  .source-explorer-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .source-explorer-actions {
+    width: 100%;
+  }
+  .tree-controls {
+    width: 100%;
+  }
+  .tree-controls input,
+  .tree-controls select {
+    width: 50%;
   }
   .tree-table-head,
   .tree-row {
     min-width: 650px;
-  }
-  .treemap-panel {
-    display: none;
   }
   .drawer-metrics {
     grid-template-columns: repeat(3, 1fr);

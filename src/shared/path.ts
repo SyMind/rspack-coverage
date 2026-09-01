@@ -1,4 +1,13 @@
 const SCHEME_RE = /^(?:webpack|rspack|file):\/\//;
+const RESOURCE_REQUEST_RE = /^(?:[a-z][a-z\d+.-]*:\/\/|\/|\.\.?\/|[a-z]:[\\/])/i;
+
+function stripLoaderPrefix(value: string): string {
+  const separator = value.lastIndexOf("!");
+  if (separator === -1) return value;
+
+  const resource = value.slice(separator + 1);
+  return RESOURCE_REQUEST_RE.test(resource) ? resource : value;
+}
 
 export function stripQueryAndFragment(value: string): string {
   const query = value.indexOf("?");
@@ -20,7 +29,11 @@ export function normalizeUrlPath(value: string): string {
 }
 
 export function normalizeSourcePath(value: string): string {
-  let normalized = stripQueryAndFragment(value).replace(/\\/g, "/");
+  // Rspack/webpack may expose a source as a full loader request:
+  //   /loader.js??options!/absolute/path/to/source.js
+  // The loader query must be removed before looking for `?`, otherwise every
+  // resource handled by the loader collapses into the loader's own path.
+  let normalized = stripQueryAndFragment(stripLoaderPrefix(value)).replace(/\\/g, "/");
   normalized = normalized.replace(/^webpack:\/\/[^/]*\//, "");
   normalized = normalized.replace(/^rspack:\/\/[^/]*\//, "");
   normalized = normalized.replace(SCHEME_RE, "");

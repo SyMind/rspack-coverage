@@ -13,8 +13,7 @@ import { MetricCard } from "./components/MetricCard.js";
 import { OpportunitiesView } from "./components/OpportunitiesView.js";
 import { SetupGuide } from "./components/SetupGuide.js";
 import { SourceDrawer } from "./components/SourceDrawer.js";
-import { SourceTree } from "./components/SourceTree.js";
-import { TreemapView } from "./components/TreemapView.js";
+import { SourceExplorer } from "./components/SourceExplorer.js";
 import { loadAnalysisPayload, loadBuild } from "./lib/api.js";
 import { loadRecording, loadReport, saveRecording, saveReport } from "./lib/storage.js";
 
@@ -235,15 +234,12 @@ export function App() {
             </button>
           </nav>
           {tab === "sources" ? (
-            <div className="sources-grid">
-              <SourceTree
-                tree={report.tree}
-                files={report.files}
-                selectedFileId={selectedFile?.id ?? null}
-                onSelectFile={setSelectedFile}
-              />
-              <TreemapView tree={report.tree} files={report.files} onSelectFile={setSelectedFile} />
-            </div>
+            <SourceExplorer
+              tree={report.tree}
+              files={report.files}
+              selectedFileId={selectedFile?.id ?? null}
+              onSelectFile={setSelectedFile}
+            />
           ) : tab === "chunks" ? (
             <ChunksView chunks={report.chunks} />
           ) : (

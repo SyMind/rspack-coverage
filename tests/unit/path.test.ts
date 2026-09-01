@@ -9,6 +9,15 @@ describe("path normalization", () => {
     expect(normalizeUrlPath("https://127.0.0.1/assets/main.js?v=1#x")).toBe("/assets/main.js");
   });
 
+  it("keeps the resource path from a full Rspack loader request", () => {
+    expect(
+      normalizeSourcePath(
+        "/project/node_modules/@code-inspector/webpack/dist/loader.js??ruleSet[1].rules[25].use[0]!/project/src/page.tsx?compiled=true",
+      ),
+    ).toBe("project/src/page.tsx");
+    expect(normalizeSourcePath("/loader.js?value!=x#fragment")).toBe("loader.js");
+  });
+
   it("classifies dependency and runtime sources", () => {
     expect(sourceCategory("node_modules/react/index.js")).toBe("node_modules");
     expect(sourceCategory("[rspack runtime / unmapped]/main.js")).toBe("runtime");
