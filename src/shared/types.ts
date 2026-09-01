@@ -51,6 +51,8 @@ export interface BuildModule {
   readableIdentifier?: string;
   name: string;
   resource: string | null;
+  /** Original source-map sources owned by this Rspack module after loaders. */
+  sourcePaths?: string[];
   chunks: string[];
   issuer: string | null;
   type?: string | null;
@@ -76,7 +78,11 @@ export interface BuildReference {
   request: string | null;
   exports: string[] | null;
   active: boolean | null;
+  /** Location in the post-loader module source used by Rspack's parser. */
   location: ReferenceLocation | null;
+  /** Original source and location after tracing the module's loader source map. */
+  sourcePath?: string | null;
+  sourceLocation?: ReferenceLocation | null;
 }
 
 export interface ModuleCodeGeneration {

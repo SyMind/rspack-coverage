@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { GREATEST_LOWER_BOUND, originalPositionFor, TraceMap } from "@jridgewell/trace-mapping";
 import type { Compiler, Stats } from "@rspack/core";
-import { assetUrlPath } from "../shared/path.js";
+import { assetUrlPath, normalizeSourcePath } from "../shared/path.js";
 import type {
   BuildAsset,
   BuildChunk,
@@ -109,6 +110,35 @@ function moduleIdentifier(module: any): string {
   );
 }
 
+interface RawModuleRecord {
+  module: any;
+  parent: any | null;
+  nested: boolean;
+}
+
+function collectRawModuleRecords(compilation: Stats["compilation"]): RawModuleRecord[] {
+  const records: RawModuleRecord[] = [];
+  const recordsByModule = new WeakMap<object, RawModuleRecord>();
+  const visit = (module: any, parent: any | null, nested: boolean): void => {
+    if (!module || (typeof module !== "object" && typeof module !== "function")) return;
+    const existing = recordsByModule.get(module);
+    if (existing) {
+      if (nested) {
+        existing.nested = true;
+        existing.parent ??= parent;
+      }
+      return;
+    }
+    const record = { module, parent, nested };
+    records.push(record);
+    recordsByModule.set(module, record);
+    const children = safeCall(() => asArray(module.modules as Iterable<any>), []);
+    for (const child of children) visit(child, module, true);
+  };
+  for (const module of compilation.modules as Iterable<any>) visit(module, null, false);
+  return records;
+}
+
 function stableModuleId(identifier: string, layer: unknown, type: unknown, duplicate = 0): string {
   return `mod_${shortHash(`${identifier}\0${String(layer ?? "")}\0${String(type ?? "")}\0${duplicate}`)}`;
 }
@@ -178,35 +208,136 @@ function readAssetContent(asset: any, outputPath: string): Buffer | null {
   return safeCall(() => readFileSync(filename), null);
 }
 
-function collectOriginalSources(compilation: Stats["compilation"]): Map<string, string> {
+interface CapturedModuleSource {
+  content: string;
+  map: RawSourceMapPayload | null;
+  traceMap: TraceMap | null;
+  resource: string | null;
+  resourceContent: string | null;
+}
+
+interface OriginalSourceCapture {
+  sources: Map<string, string>;
+  capture(module: any, owner: BuildModule | null): CapturedModuleSource | null;
+}
+
+function sourceName(map: RawSourceMapPayload, index: number): string {
+  const source = map.sources[index] ?? `[unknown source ${index}]`;
+  if (!map.sourceRoot || /^(?:webpack|rspack|file):\/\//.test(source)) return source;
+  return `${map.sourceRoot.replace(/\/$/, "")}/${source.replace(/^\//, "")}`;
+}
+
+function collectOriginalSources(
+  records: RawModuleRecord[],
+  lookup: Map<string, BuildModule[]>,
+): OriginalSourceCapture {
   const sources = new Map<string, string>();
-  for (const module of compilation.modules) {
-    try {
-      const originalSource = module.originalSource();
-      if (!originalSource) continue;
-      const sourceAndMap = getSourceAndMap({ source: originalSource });
-      if (sourceAndMap.map?.sourcesContent) {
-        for (let index = 0; index < sourceAndMap.map.sources.length; index += 1) {
-          const content = sourceAndMap.map.sourcesContent[index];
-          const name = sourceAndMap.map.sources[index];
-          const rootedName =
-            name && sourceAndMap.map.sourceRoot
-              ? `${sourceAndMap.map.sourceRoot.replace(/\/$/, "")}/${name.replace(/^\//, "")}`
-              : name;
-          if (typeof content === "string" && rootedName && isAnalyzableSource(rootedName)) {
-            sources.set(rootedName, content);
+  const captured = new WeakMap<object, CapturedModuleSource | null>();
+  const registeredSources = new WeakSet<object>();
+  const registeredOwners = new WeakMap<object, Set<string>>();
+  const pathsByIdentifier = new Map<string, Set<string>>();
+
+  const capture = (module: any, owner: BuildModule | null): CapturedModuleSource | null => {
+    if (!module || (typeof module !== "object" && typeof module !== "function")) return null;
+    let result = captured.get(module);
+    if (result === undefined) {
+      result = safeCall(() => {
+        const originalSource = module.originalSource();
+        if (!originalSource) return null;
+        const sourceAndMap = getSourceAndMap({ source: originalSource });
+        const moduleResource = safeCall(() => module.nameForCondition?.() ?? null, null);
+        const resource = moduleResource ? String(moduleResource) : (owner?.resource ?? null);
+        return {
+          content: sourceAndMap.content.toString("utf8"),
+          map: sourceAndMap.map,
+          traceMap: sourceAndMap.map
+            ? safeCall(() => new TraceMap(sourceAndMap.map as any), null)
+            : null,
+          resource,
+          // `originalSource()` is the source entering Rspack after loaders. In
+          // production pipelines that source may already be compacted to one
+          // line, while dependency locations still describe the real resource.
+          // Prefer the local resource text when it is available so reference
+          // locations and the source view share the same coordinate system.
+          resourceContent:
+            resource && isAbsolute(resource)
+              ? safeCall(() => readFileSync(resource, "utf8"), null)
+              : null,
+        };
+      }, null);
+      captured.set(module, result);
+    }
+    if (!result) return null;
+
+    if (!registeredSources.has(module)) {
+      const map = result.map;
+      const identifier = moduleIdentifier(module);
+      const knownPaths = pathsByIdentifier.get(identifier) ?? new Set<string>();
+      if (map) {
+        for (let index = 0; index < map.sources.length; index += 1) {
+          const path = sourceName(map, index);
+          if (!path || !isAnalyzableSource(path)) continue;
+          const mappedContent = map.sourcesContent?.[index];
+          const content =
+            result.resourceContent && result.resource && sameSourcePath(path, result.resource)
+              ? result.resourceContent
+              : mappedContent;
+          if (typeof content === "string") {
+            for (const knownPath of [...knownPaths]) {
+              if (knownPath !== path && sameSourcePath(path, knownPath)) {
+                sources.delete(knownPath);
+                knownPaths.delete(knownPath);
+              }
+            }
+            sources.set(path, content);
+            knownPaths.add(path);
           }
         }
       }
-      const resource = module.nameForCondition();
-      if (resource && isAnalyzableSource(resource) && !sources.has(resource)) {
-        sources.set(resource, sourceAndMap.content.toString("utf8"));
+      const resource = result.resource;
+      const mappedResourceWithContent =
+        resource &&
+        result.map?.sources.some(
+          (_source, index) =>
+            typeof result.map?.sourcesContent?.[index] === "string" &&
+            sameSourcePath(sourceName(result.map as RawSourceMapPayload, index), resource),
+        );
+      const resourceAlreadyCaptured =
+        resource && [...knownPaths].some((path) => sameSourcePath(path, resource));
+      if (
+        resource &&
+        isAnalyzableSource(resource) &&
+        !mappedResourceWithContent &&
+        !resourceAlreadyCaptured
+      ) {
+        if (!sources.has(resource)) sources.set(resource, result.resourceContent ?? result.content);
+        knownPaths.add(resource);
       }
-    } catch {
-      // Synthetic and runtime modules may not expose an original source.
+      pathsByIdentifier.set(identifier, knownPaths);
+      registeredSources.add(module);
     }
+
+    const ownedPaths = owner ? new Set(owner.sourcePaths ?? []) : null;
+    const newlyRegistered = registeredOwners.get(module) ?? new Set<string>();
+    if (owner && !newlyRegistered.has(owner.id)) {
+      if (result.map) {
+        for (let index = 0; index < result.map.sources.length; index += 1) {
+          const path = sourceName(result.map, index);
+          if (path && isAnalyzableSource(path)) ownedPaths?.add(path);
+        }
+      }
+      if (result.resource && isAnalyzableSource(result.resource)) ownedPaths?.add(result.resource);
+      if (ownedPaths?.size) owner.sourcePaths = [...ownedPaths];
+      newlyRegistered.add(owner.id);
+      registeredOwners.set(module, newlyRegistered);
+    }
+    return result;
+  };
+
+  for (const { module } of records) {
+    capture(module, buildModuleFor(module, lookup));
   }
-  return sources;
+  return { sources, capture };
 }
 
 function stringifyDiagnostic(diagnostic: any): string {
@@ -279,15 +410,6 @@ function collectModules(rawModules: any[], entryIdentifiers: Set<string>): Build
   };
 
   for (const raw of rawModules) visit(raw, [], false);
-  const readableCounts = new Map<string, number>();
-  for (const module of modules) {
-    const readable = module.readableIdentifier ?? module.name;
-    readableCounts.set(readable, (readableCounts.get(readable) ?? 0) + 1);
-  }
-  for (const module of modules) {
-    module.showFullIdentifier =
-      (readableCounts.get(module.readableIdentifier ?? module.name) ?? 0) > 1;
-  }
   return modules;
 }
 
@@ -316,6 +438,102 @@ function buildModuleFor(module: any, lookup: Map<string, BuildModule[]>): BuildM
   );
 }
 
+function addMissingNestedModules(
+  compilation: Stats["compilation"],
+  records: RawModuleRecord[],
+  modules: BuildModule[],
+  entryIdentifiers: Set<string>,
+): void {
+  const lookup = moduleLookup(modules);
+  const rawToBuildModule = new WeakMap<object, BuildModule>();
+  const usedIds = new Set(modules.map((module) => module.id));
+  for (const record of records) {
+    const existing = buildModuleFor(record.module, lookup);
+    if (existing) {
+      if (record.nested) existing.nested = true;
+      rawToBuildModule.set(record.module, existing);
+      continue;
+    }
+    const identifier = moduleIdentifier(record.module);
+    const layer = safeCall(() => String(record.module.layer ?? ""), "");
+    const type = safeCall(() => String(record.module.type ?? ""), "");
+    let duplicate = 0;
+    let id = stableModuleId(identifier, layer, type, duplicate);
+    while (usedIds.has(id)) {
+      duplicate += 1;
+      id = stableModuleId(identifier, layer, type, duplicate);
+    }
+    usedIds.add(id);
+    const parent = record.parent ? rawToBuildModule.get(record.parent) : null;
+    const rawChunks = safeCall(
+      () =>
+        asArray((compilation.chunkGraph as any).getModuleChunksIterable(record.module)).map(
+          (chunk: any) => String(chunk.id ?? chunk.name ?? "unknown"),
+        ),
+      [],
+    );
+    const resource = safeCall(() => record.module.nameForCondition?.() ?? null, null);
+    const readableIdentifier = String(
+      safeCall(() => record.module.readableIdentifier?.(), null) ?? resource ?? identifier,
+    );
+    const issuerModule = safeCall(
+      () => (compilation.moduleGraph as any).getIssuer(record.module),
+      null,
+    );
+    const providedExports = safeCall(
+      () => (compilation.moduleGraph as any).getProvidedExports(record.module),
+      null,
+    );
+    const created: BuildModule = {
+      id,
+      runtimeId: null,
+      identifier,
+      readableIdentifier,
+      name: readableIdentifier,
+      resource: resource ? String(resource) : null,
+      chunks: rawChunks.length ? rawChunks : (parent?.chunks ?? []),
+      issuer: issuerModule ? moduleIdentifier(issuerModule) : null,
+      type: type || null,
+      layer: layer || null,
+      entry: entryIdentifiers.has(identifier),
+      size: Number(safeCall(() => record.module.size?.(), 0) ?? 0),
+      usedExports: null,
+      providedExports: Array.isArray(providedExports) ? providedExports.map(String) : null,
+      nested: record.nested,
+    };
+    modules.push(created);
+    rawToBuildModule.set(record.module, created);
+    const values = lookup.get(identifier) ?? [];
+    values.push(created);
+    lookup.set(identifier, values);
+  }
+
+  for (const record of records) {
+    if (!record.nested || !record.parent) continue;
+    const module = rawToBuildModule.get(record.module);
+    const parent = rawToBuildModule.get(record.parent);
+    const rootModule = safeCall(() => record.parent.rootModule ?? null, null);
+    if (
+      module &&
+      parent?.entry &&
+      rootModule &&
+      moduleIdentifier(rootModule) === module.identifier
+    ) {
+      module.entry = true;
+    }
+  }
+
+  const readableCounts = new Map<string, number>();
+  for (const module of modules) {
+    const readable = module.readableIdentifier ?? module.name;
+    readableCounts.set(readable, (readableCounts.get(readable) ?? 0) + 1);
+  }
+  for (const module of modules) {
+    module.showFullIdentifier =
+      (readableCounts.get(module.readableIdentifier ?? module.name) ?? 0) > 1;
+  }
+}
+
 function normalizeLocation(value: any): ReferenceLocation | null {
   if (!value?.start || !Number.isFinite(Number(value.start.line))) return null;
   // Rspack dependency locations expose one-based columns, while JavaScript string
@@ -337,36 +555,128 @@ function normalizeLocation(value: any): ReferenceLocation | null {
   };
 }
 
+function tracedSourceName(captured: CapturedModuleSource, resolvedSource: string): string | null {
+  if (!captured.map || !captured.traceMap) return null;
+  const index = captured.traceMap.resolvedSources.indexOf(resolvedSource);
+  return index >= 0 ? sourceName(captured.map, index) : resolvedSource;
+}
+
+function sameSourcePath(left: string, right: string): boolean {
+  const normalizedLeft = normalizeSourcePath(left);
+  const normalizedRight = normalizeSourcePath(right);
+  if (normalizedLeft === normalizedRight) return true;
+  const [shorter, longer] =
+    normalizedLeft.length < normalizedRight.length
+      ? [normalizedLeft, normalizedRight]
+      : [normalizedRight, normalizedLeft];
+  return shorter.includes("/") && longer.endsWith(`/${shorter}`);
+}
+
+function traceReferenceLocation(
+  captured: CapturedModuleSource | null,
+  location: ReferenceLocation | null,
+): { sourcePath: string; sourceLocation: ReferenceLocation } | null {
+  if (!captured?.traceMap || !location) return null;
+  const start = safeCall(
+    () =>
+      originalPositionFor(captured.traceMap as TraceMap, {
+        line: location.start.line,
+        column: location.start.column,
+        bias: GREATEST_LOWER_BOUND,
+      }),
+    null,
+  );
+  if (!start?.source || start.line === null || start.column === null) return null;
+  const sourcePath = tracedSourceName(captured, start.source);
+  if (!sourcePath || !isAnalyzableSource(sourcePath)) return null;
+  // Rspack dependency locations for a module's own resource are already in
+  // original-source coordinates. Applying the loader map again double-maps
+  // them (notably to line 1 with SWC/Babel chains).
+  if (captured.resource && sameSourcePath(sourcePath, captured.resource)) return null;
+  const sourceIndex = captured.traceMap.resolvedSources.indexOf(start.source);
+  const sourceContent = sourceIndex >= 0 ? captured.map?.sourcesContent?.[sourceIndex] : null;
+  if (sourceContent === null || sourceContent === undefined) return null;
+  const end = safeCall(
+    () =>
+      originalPositionFor(captured.traceMap as TraceMap, {
+        line: location.end.line,
+        column: location.end.column,
+        bias: GREATEST_LOWER_BOUND,
+      }),
+    null,
+  );
+  const endSource = end?.source ? tracedSourceName(captured, end.source) : null;
+  const mappedEnd =
+    end && endSource === sourcePath && end.line !== null && end.column !== null
+      ? { line: end.line, column: end.column }
+      : null;
+  const generatedWidth =
+    location.start.line === location.end.line
+      ? Math.max(1, location.end.column - location.start.column)
+      : 1;
+  const fallbackEnd = { line: start.line, column: start.column + generatedWidth };
+  const sourceEnd =
+    mappedEnd &&
+    (mappedEnd.line > start.line ||
+      (mappedEnd.line === start.line && mappedEnd.column > start.column))
+      ? mappedEnd
+      : fallbackEnd;
+  return {
+    sourcePath,
+    sourceLocation: {
+      start: { line: start.line, column: start.column },
+      end: sourceEnd,
+    },
+  };
+}
+
 function collectReferences(
   compilation: Stats["compilation"],
+  records: RawModuleRecord[],
   lookup: Map<string, BuildModule[]>,
+  originalSources: OriginalSourceCapture,
 ): BuildReference[] {
   const references: BuildReference[] = [];
-  const seen = new Map<string, number>();
-  for (const originModule of compilation.modules as Iterable<any>) {
-    const origin = buildModuleFor(originModule, lookup);
-    if (!origin) continue;
+  const seen = new Set<string>();
+  for (const { module: originModule } of records) {
+    const containingOrigin = buildModuleFor(originModule, lookup);
+    if (!containingOrigin) continue;
     const connections = safeCall(
       () => asArray((compilation.moduleGraph as any).getOutgoingConnections(originModule)),
       [],
     );
     for (const connection of connections as any[]) {
+      const dependency = connection.dependency ?? null;
+      const dependencyOriginModule = dependency
+        ? safeCall(
+            () =>
+              (compilation.moduleGraph as any).getParentModule(dependency) ??
+              dependency._parentModule ??
+              null,
+            null,
+          )
+        : null;
+      const graphOriginModule = dependencyOriginModule ?? connection.originModule ?? originModule;
+      const origin = buildModuleFor(graphOriginModule, lookup) ?? containingOrigin;
       const targetModule = connection.resolvedModule ?? connection.module;
       const target = targetModule ? buildModuleFor(targetModule, lookup) : null;
       if (!target) continue;
-      const dependency = connection.dependency ?? null;
       const dependencyType = dependency?.type ? String(dependency.type) : null;
       const request = dependency?.request ? String(dependency.request) : null;
       const exports = Array.isArray(dependency?.ids) ? dependency.ids.map(String) : null;
       const location = normalizeLocation(dependency?.loc);
+      const capturedOrigin = originalSources.capture(graphOriginModule, origin);
+      const traced = traceReferenceLocation(capturedOrigin, location);
       const identity = `${origin.id}\0${target.id}\0${dependencyType ?? ""}\0${request ?? ""}\0${JSON.stringify(
         location,
+      )}\0${traced?.sourcePath ?? origin.resource ?? ""}\0${JSON.stringify(
+        traced?.sourceLocation ?? location,
       )}\0${JSON.stringify(exports)}`;
-      const duplicate = seen.get(identity) ?? 0;
-      seen.set(identity, duplicate + 1);
+      if (seen.has(identity)) continue;
+      seen.add(identity);
       const activeState = safeCall(() => connection.getActiveState(undefined), null);
       references.push({
-        id: `ref_${shortHash(`${identity}\0${duplicate}`)}`,
+        id: `ref_${shortHash(identity)}`,
         originId: origin.id,
         targetId: target.id,
         dependencyType,
@@ -374,6 +684,8 @@ function collectReferences(
         exports,
         active: typeof activeState === "boolean" ? activeState : null,
         location,
+        sourcePath: traced?.sourcePath ?? origin.resource,
+        sourceLocation: traced?.sourceLocation ?? location,
       });
     }
   }
@@ -449,13 +761,17 @@ function collectCodeGenerationForModule(
 
 function createCodeGenerationStore(
   compilation: Stats["compilation"],
+  records: RawModuleRecord[],
   lookup: Map<string, BuildModule[]>,
 ): {
   cache: Map<string, ModuleCodeGeneration[]>;
   load: (moduleId: string) => ModuleCodeGeneration[];
 } {
   const rawModules = new Map<string, { raw: any; module: BuildModule }>();
-  for (const raw of compilation.modules as Iterable<any>) {
+  for (const { module: raw, nested } of records) {
+    // Concatenated children do not own code-generation entries. Asking older
+    // Rspack bindings for one panics in native code instead of returning null.
+    if (nested) continue;
     const module = buildModuleFor(raw, lookup);
     if (module && !rawModules.has(module.id)) rawModules.set(module.id, { raw, module });
   }
@@ -570,9 +886,21 @@ export function createBuildSnapshot(
     }
   }
   const modules = collectModules(json.modules ?? [], entryIdentifiers);
+  const rawModuleRecords = collectRawModuleRecords(compilation);
+  addMissingNestedModules(compilation, rawModuleRecords, modules, entryIdentifiers);
   const modulesByIdentifier = moduleLookup(modules);
-  const references = collectReferences(compilation, modulesByIdentifier);
-  const codeGenerationStore = createCodeGenerationStore(compilation, modulesByIdentifier);
+  const originalSources = collectOriginalSources(rawModuleRecords, modulesByIdentifier);
+  const references = collectReferences(
+    compilation,
+    rawModuleRecords,
+    modulesByIdentifier,
+    originalSources,
+  );
+  const codeGenerationStore = createCodeGenerationStore(
+    compilation,
+    rawModuleRecords,
+    modulesByIdentifier,
+  );
   const moduleIdsByChunk = new Map<string, string[]>();
   for (const module of modules) {
     for (const chunkId of module.chunks) {
@@ -654,7 +982,7 @@ export function createBuildSnapshot(
     manifest,
     assets,
     maps,
-    originalSources: collectOriginalSources(compilation),
+    originalSources: originalSources.sources,
     references,
     codeGeneration: codeGenerationStore.cache,
     loadCodeGeneration: codeGenerationStore.load,

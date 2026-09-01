@@ -240,9 +240,11 @@ export function SourceDrawer(props: {
         <header className="investigation-header">
           <div className="investigation-title">
             <span className="eyebrow">Module investigation</span>
-            <h2>{selectedBuildModule?.name ?? props.file.path.split("/").at(-1)}</h2>
+            <h2>{props.file.path.split("/").at(-1)}</h2>
             <code title={selectedBuildModule?.identifier ?? props.file.path}>
-              {selectedBuildModule ? displayModule(selectedBuildModule) : props.file.path}
+              {selectedBuildModule
+                ? `${props.file.path} · owned by ${displayModule(selectedBuildModule)}`
+                : props.file.path}
             </code>
           </div>
           <div className="investigation-actions">

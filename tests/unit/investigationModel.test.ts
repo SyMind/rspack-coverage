@@ -235,4 +235,61 @@ describe("InvestigationModel", () => {
       highlight: { coverageStatus: "executed" },
     });
   });
+
+  it("finds the dependency request when Rspack does not expose a usable location", () => {
+    const consumer = source(
+      "src/consumer.js",
+      "consumer",
+      'const before = 1;\nimport { value } from "./target.js";\nconsole.log(before, value);',
+    );
+    const target = source("src/target.js", "target", "export const value = 1;");
+    const build = snapshot([consumer, target]);
+    const edge = build.references[0];
+    if (!edge) throw new Error("Missing reference fixture");
+    edge.location = null;
+    const model = new InvestigationModel(build, report([consumer, target]), new Map());
+
+    const snippet = model.snippet("edge");
+    expect(snippet).toMatchObject({
+      available: true,
+      filename: "src/consumer.js",
+      location: {
+        start: { line: 2 },
+        end: { line: 2 },
+      },
+    });
+    expect(snippet?.content?.slice(snippet.highlight?.start, snippet.highlight?.end)).toBe(
+      "./target.js",
+    );
+  });
+
+  it("opens the traced loader source instead of an arbitrary owner source", () => {
+    const generated = source("src/consumer.js", "consumer", "generated consumer source");
+    const transformed = source("outside/project/src/internal.ts", "consumer", "one line");
+    const original = source("src/internal.ts", "consumer", "first\nxxxxxTARGETyyyy");
+    const target = source("src/target.js", "target", "export const value = 1;");
+    const build = snapshot([generated, transformed, original, target]);
+    const edge = build.references[0];
+    if (!edge) throw new Error("Missing reference fixture");
+    edge.sourcePath = "/outside/project/src/internal.ts";
+    edge.sourceLocation = {
+      start: { line: 2, column: 5 },
+      end: { line: 2, column: 11 },
+    };
+    const model = new InvestigationModel(
+      build,
+      report([generated, transformed, original, target]),
+      new Map(),
+    );
+
+    const snippet = model.snippet("edge");
+    expect(snippet).toMatchObject({
+      available: true,
+      filename: "src/internal.ts",
+      location: edge.sourceLocation,
+    });
+    expect(snippet?.content?.slice(snippet.highlight?.start, snippet.highlight?.end)).toBe(
+      "TARGET",
+    );
+  });
 });

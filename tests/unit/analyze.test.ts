@@ -234,6 +234,119 @@ describe("coverage analysis", () => {
     expect(report.files[0]?.moduleIds).toEqual([]);
   });
 
+  it("associates a loader source-map source with its owning Rspack module", async () => {
+    const text = "x";
+    const build: BuildManifest = {
+      hash: "build-loader-source",
+      mode: "production",
+      context: "/project",
+      publicPath: "/",
+      builtAt: 1,
+      assets: [
+        {
+          id: "main",
+          name: "main.js",
+          urlPath: "/main.js",
+          size: text.length,
+          contentHash: hash(text),
+          chunks: ["main"],
+          mapAvailable: true,
+        },
+      ],
+      chunks: [],
+      modules: [
+        {
+          id: "owner",
+          identifier: "/project/loaders/post.js!/project/generated/dependency.js",
+          name: "./generated/dependency.js",
+          resource: "/project/generated/dependency.js",
+          sourcePaths: ["webpack:///virtual/inner.ts"],
+          chunks: ["main"],
+          issuer: null,
+          size: 1,
+          usedExports: true,
+          providedExports: null,
+          nested: false,
+        },
+      ],
+      entrypoints: [],
+      diagnostics: [],
+      counts: { assets: 1, javascriptAssets: 1, chunks: 0, modules: 1, sourceMaps: 1 },
+      previewAvailable: true,
+      publicPathSupported: true,
+    };
+    const report = await analyzeCoverage({
+      build,
+      coverage: [{ url: "/main.js", text, ranges: [{ start: 0, end: 1 }] }],
+      maps: {
+        main: {
+          version: 3,
+          sources: ["webpack:///virtual/inner.ts"],
+          sourcesContent: ["x"],
+          names: [],
+          mappings: "AAAA",
+        },
+      },
+      generatedAssets: { main: text },
+      originalSources: {},
+      precision: "per-block",
+    });
+
+    expect(report.files[0]?.moduleIds).toEqual(["owner"]);
+  });
+
+  it("prefers a captured original resource over compacted map content for an equivalent path", async () => {
+    const text = "x";
+    const build: BuildManifest = {
+      hash: "build-original-source",
+      mode: "production",
+      context: "/project/app",
+      publicPath: "/",
+      builtAt: 1,
+      assets: [
+        {
+          id: "main",
+          name: "main.js",
+          urlPath: "/main.js",
+          size: text.length,
+          contentHash: hash(text),
+          chunks: ["main"],
+          mapAvailable: true,
+        },
+      ],
+      chunks: [],
+      modules: [],
+      entrypoints: [],
+      diagnostics: [],
+      counts: { assets: 1, javascriptAssets: 1, chunks: 0, modules: 0, sourceMaps: 1 },
+      previewAvailable: true,
+      publicPathSupported: true,
+    };
+    const original = "import { value } from './value';\nexport const result = value;\n";
+    const report = await analyzeCoverage({
+      build,
+      coverage: [{ url: "/main.js", text, ranges: [{ start: 0, end: 1 }] }],
+      maps: {
+        main: {
+          version: 3,
+          sources: ["webpack:///shared/pkg/source.ts"],
+          sourcesContent: ["import{value}from'./value';export const result=value;"],
+          names: [],
+          mappings: "AAAA",
+        },
+      },
+      generatedAssets: { main: text },
+      originalSources: {
+        "/outside/worktree/shared/pkg/source.ts": original,
+      },
+      precision: "per-block",
+    });
+
+    expect(report.files.find((file) => file.path === "shared/pkg/source.ts")?.content).toBe(
+      original,
+    );
+  });
+
   it("rejects stale generated content instead of producing a report", async () => {
     const text = "current";
     const build: BuildManifest = {

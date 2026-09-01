@@ -18,6 +18,7 @@ import type {
   CoverageReport,
   ModuleInvestigationDetail,
   ModuleReferencesResponse,
+  ReferenceLocation,
   ReferenceSnippetResponse,
   SourceFileReport,
   UsageMetrics,
@@ -39,6 +40,65 @@ function lineStarts(content: string): number[] {
     if (content.charCodeAt(index) === 10) starts.push(index + 1);
   }
   return starts;
+}
+
+function locationFitsContent(content: string, location: ReferenceLocation | null): boolean {
+  if (!location) return false;
+  const lines = content.split("\n");
+  const start = lines[location.start.line - 1];
+  const end = lines[location.end.line - 1];
+  return (
+    start !== undefined &&
+    end !== undefined &&
+    location.start.column <= start.length &&
+    location.end.column <= end.length + 1
+  );
+}
+
+function positionForOffset(starts: number[], offset: number): ReferenceLocation["start"] {
+  let low = 0;
+  let high = starts.length - 1;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if ((starts[middle] ?? 0) <= offset) low = middle;
+    else high = middle - 1;
+  }
+  return { line: low + 1, column: offset - (starts[low] ?? 0) };
+}
+
+function searchedReferenceLocation(
+  content: string,
+  edge: BuildReference,
+  hint: ReferenceLocation | null,
+): ReferenceLocation | null {
+  const terms = [
+    edge.request,
+    edge.request?.includes("!") ? edge.request.split("!").at(-1) : null,
+    ...(edge.exports ?? []),
+  ].filter((term, index, all): term is string => Boolean(term) && all.indexOf(term) === index);
+  if (!terms.length) return null;
+  const starts = lineStarts(content);
+  for (const term of terms) {
+    let bestOffset = -1;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    let offset = content.indexOf(term);
+    while (offset >= 0) {
+      const position = positionForOffset(starts, offset);
+      const distance = hint ? Math.abs(position.line - hint.start.line) : 0;
+      if (distance < bestDistance) {
+        bestOffset = offset;
+        bestDistance = distance;
+      }
+      offset = content.indexOf(term, offset + Math.max(1, term.length));
+    }
+    if (bestOffset >= 0) {
+      return {
+        start: positionForOffset(starts, bestOffset),
+        end: positionForOffset(starts, bestOffset + term.length),
+      };
+    }
+  }
+  return null;
 }
 
 function mergeSpans(spans: CodeCoverageSpan[]): CodeCoverageSpan[] {
@@ -209,6 +269,35 @@ export class InvestigationModel {
         file.path.endsWith(`/${resource}`) ||
         resource.endsWith(`/${file.path}`),
     );
+  }
+
+  #fileForSourcePath(
+    sourcePath: string,
+    location: BuildReference["sourceLocation"],
+    edge: BuildReference,
+  ): SourceFileReport | null {
+    const normalized = normalizeBuildSourcePath(sourcePath, this.snapshot.manifest.context);
+    const referenceLocation = location ?? null;
+    const candidates = this.report.files
+      .filter(
+        (file) =>
+          file.path === normalized ||
+          file.path.endsWith(`/${normalized}`) ||
+          normalized.endsWith(`/${file.path}`),
+      )
+      .sort((left, right) => {
+        const locationFits = (file: SourceFileReport): boolean =>
+          Boolean(file.content && locationFitsContent(file.content, referenceLocation));
+        const canSearch = (file: SourceFileReport): boolean =>
+          Boolean(file.content && searchedReferenceLocation(file.content, edge, referenceLocation));
+        return (
+          Number(locationFits(right)) - Number(locationFits(left)) ||
+          Number(canSearch(right)) - Number(canSearch(left)) ||
+          right.metrics.mappedBytes - left.metrics.mappedBytes ||
+          Number(Boolean(right.content)) - Number(Boolean(left.content))
+        );
+      });
+    return candidates[0] ?? null;
   }
 
   #moduleMetrics(moduleId: string): UsageMetrics {
@@ -465,35 +554,45 @@ export class InvestigationModel {
     const edge = this.#references.get(referenceId);
     if (!edge) return null;
     const origin = this.#modules.get(edge.originId);
-    const rawFile = origin
-      ? this.#filesForModule(origin.id).find((candidate) => candidate.content)
+    const tracedFile = edge.sourcePath
+      ? this.#fileForSourcePath(edge.sourcePath, edge.sourceLocation ?? edge.location, edge)
       : null;
+    const rawFile =
+      tracedFile ??
+      (origin ? this.#filesForModule(origin.id).find((candidate) => candidate.content) : null);
     const file = rawFile ? this.source(rawFile.id) : null;
-    if (!origin || !file?.content || !edge.location) {
+    const compilerLocation =
+      tracedFile && edge.sourceLocation ? edge.sourceLocation : edge.location;
+    const location =
+      file?.content && locationFitsContent(file.content, compilerLocation)
+        ? compilerLocation
+        : file?.content
+          ? searchedReferenceLocation(file.content, edge, compilerLocation)
+          : null;
+    if (!origin || !file?.content || !location) {
       return {
         edge,
         available: false,
         gap: !file?.content
           ? "Consumer source is unavailable"
-          : "Reference location is unavailable",
+          : compilerLocation
+            ? "Reference location does not fit the captured consumer source"
+            : "Reference location is unavailable and the dependency request was not found",
       };
     }
     const sourceLines = file.content.split("\n");
-    const startLine = Math.max(1, edge.location.start.line - Math.max(0, contextLines));
-    const endLine = Math.min(
-      sourceLines.length,
-      edge.location.end.line + Math.max(0, contextLines),
-    );
+    const startLine = Math.max(1, location.start.line - Math.max(0, contextLines));
+    const endLine = Math.min(sourceLines.length, location.end.line + Math.max(0, contextLines));
     const content = sourceLines.slice(startLine - 1, endLine).join("\n");
     const starts = lineStarts(content);
-    const relativeStartLine = edge.location.start.line - startLine;
-    const relativeEndLine = edge.location.end.line - startLine;
-    const highlightStart = (starts[relativeStartLine] ?? 0) + edge.location.start.column;
+    const relativeStartLine = location.start.line - startLine;
+    const relativeEndLine = location.end.line - startLine;
+    const highlightStart = (starts[relativeStartLine] ?? 0) + location.start.column;
     const highlightEnd = Math.max(
       highlightStart + 1,
-      (starts[relativeEndLine] ?? highlightStart) + edge.location.end.column,
+      (starts[relativeEndLine] ?? highlightStart) + location.end.column,
     );
-    const sourceLine = file.lines[edge.location.start.line - 1];
+    const sourceLine = file.lines[location.start.line - 1];
     return {
       edge,
       available: true,
@@ -508,7 +607,7 @@ export class InvestigationModel {
         coverageStatus: sourceLine ? sourceLineCoverageStatus(sourceLine) : "unknown",
       },
       coverage: this.#moduleMetrics(origin.id),
-      location: edge.location,
+      location,
     };
   }
 

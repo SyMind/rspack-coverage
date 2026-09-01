@@ -25,10 +25,29 @@ describe("RspackCoveragePlugin", () => {
     temporaryDirectory = await mkdtemp(join(tmpdir(), "rspack-coverage-"));
     const entry = join(temporaryDirectory, "index.js");
     const dependency = join(temporaryDirectory, "dependency.js");
+    const leaf = join(temporaryDirectory, "leaf.js");
+    const loader = join(temporaryDirectory, "identity-source-loader.cjs");
     const output = join(temporaryDirectory, "dist");
     await writeFile(
       dependency,
-      "export const live = () => 'live'; export const cold = () => 'cold';\n",
+      "import { leaf } from './leaf.js'; export const live = () => leaf(); export const cold = () => 'cold';\n",
+    );
+    await writeFile(leaf, "export const leaf = () =>\n  'live';\n");
+    await writeFile(
+      loader,
+      `module.exports = function identitySourceLoader(source) {
+  const compact = this.resourcePath.endsWith("leaf.js") ? source.replace(/\\s+/g, " ") : source;
+  const mappings = "AAAA" + ",CAAC".repeat(Math.max(0, compact.length - 1));
+  this.callback(null, compact, {
+    version: 3,
+    file: this.resourcePath,
+    sources: [this.resourcePath.endsWith("leaf.js") ? this.resourcePath : "virtual/inner.js"],
+    sourcesContent: [compact],
+    names: [],
+    mappings,
+  });
+};
+`,
     );
     await writeFile(
       entry,
@@ -41,7 +60,8 @@ describe("RspackCoveragePlugin", () => {
       context: temporaryDirectory,
       entry,
       devtool: false,
-      optimization: { concatenateModules: false },
+      module: { rules: [{ test: /(?:dependency|leaf)\.js$/, use: [loader] }] },
+      optimization: { concatenateModules: true },
       output: { path: output, filename: "main.js", publicPath: "auto", clean: true },
       plugins: [new HtmlRspackPlugin(), new RspackCoveragePlugin({ port: 49840, open: false })],
     });
@@ -121,21 +141,37 @@ describe("RspackCoveragePlugin", () => {
     ).then((response) => response.json())) as { content: string; lines: unknown[] };
     expect(sourceDetail.content).toContain("export const live");
     expect(sourceDetail.lines.length).toBeGreaterThan(0);
+    const leafSourceDetails = await Promise.all(
+      report.files
+        .filter((file) => file.path.endsWith("leaf.js"))
+        .map(
+          async (file) =>
+            (await fetch(
+              `${origin}/__rspack_coverage__/api/source?id=${encodeURIComponent(file.id)}`,
+              { headers: { "X-Rspack-Coverage-Token": token ?? "" } },
+            ).then((response) => response.json())) as { content: string },
+        ),
+    );
+    expect(leafSourceDetails.map((source) => source.content)).toContain(
+      "export const leaf = () =>\n  'live';\n",
+    );
     const moduleId = dependencySource?.moduleIds[0] ?? "";
     const moduleDetail = (await fetch(`${origin}/__rspack_coverage__/api/modules/${moduleId}`, {
       headers: { "X-Rspack-Coverage-Token": token ?? "" },
     }).then((response) => response.json())) as {
-      views: { output: boolean; codeGeneration: boolean };
+      views: { source: boolean; output: boolean; codeGeneration: boolean };
     };
-    expect(moduleDetail.views).toMatchObject({ output: true, codeGeneration: true });
+    expect(moduleDetail.views.source).toBe(true);
     const references = (await fetch(
       `${origin}/__rspack_coverage__/api/modules/${moduleId}/references?direction=in`,
       { headers: { "X-Rspack-Coverage-Token": token ?? "" } },
     ).then((response) => response.json())) as {
       total: number;
       edges: Array<{ id: string; exports: string[] | null }>;
+      entryPath: Array<{ entry: boolean }>;
     };
     expect(references.total).toBeGreaterThan(0);
+    expect(references.entryPath.at(-1)?.entry).toBe(true);
     const liveReference = references.edges.find((edge) => edge.exports?.includes("live"));
     expect(liveReference).toBeTruthy();
     const snippet = (await fetch(
@@ -149,6 +185,35 @@ describe("RspackCoveragePlugin", () => {
     expect(snippet.available).toBe(true);
     expect(snippet.content).toContain("dependency.js");
     expect(snippet.content.slice(snippet.highlight.start, snippet.highlight.end)).toBe("live");
+
+    const internalSource = report.files.find((file) => file.path.endsWith("virtual/inner.js"));
+    expect(internalSource?.moduleIds.length).toBeGreaterThan(0);
+    const internalModuleId = internalSource?.moduleIds[0] ?? "";
+    const outgoing = (await fetch(
+      `${origin}/__rspack_coverage__/api/modules/${internalModuleId}/references?direction=out`,
+      { headers: { "X-Rspack-Coverage-Token": token ?? "" } },
+    ).then((response) => response.json())) as {
+      total: number;
+      edges: Array<{ id: string; request: string | null; sourcePath: string | null }>;
+    };
+    const leafReference = outgoing.edges.find((edge) => edge.request === "./leaf.js");
+    expect(outgoing.total).toBeGreaterThan(0);
+    expect(leafReference?.sourcePath).toContain("virtual/inner.js");
+    const tracedSnippet = (await fetch(
+      `${origin}/__rspack_coverage__/api/references/${leafReference?.id}/snippet`,
+      { headers: { "X-Rspack-Coverage-Token": token ?? "" } },
+    ).then((response) => response.json())) as {
+      available: boolean;
+      filename: string;
+      content: string;
+      highlight: { start: number; end: number };
+    };
+    expect(tracedSnippet.available).toBe(true);
+    expect(tracedSnippet.filename).toContain("virtual/inner.js");
+    expect(tracedSnippet.content).toContain("./leaf.js");
+    expect(
+      tracedSnippet.content.slice(tracedSnippet.highlight.start, tracedSnippet.highlight.end),
+    ).toContain("leaf");
     expect(await fetch(`${origin}/`).then((response) => response.text())).toContain("<script");
 
     const files = await readdir(output);

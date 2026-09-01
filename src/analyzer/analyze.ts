@@ -167,7 +167,11 @@ function mutableFile(
 ): MutableFile {
   const existing = files.get(path);
   if (existing) {
-    if (content !== null) existing.content = content;
+    // Sources captured from the compilation are seeded before emitted maps are
+    // decoded. Keep that source text: loader/output maps may carry a compacted
+    // `sourcesContent` for the same path even though dependency locations use
+    // the original resource coordinates.
+    if (existing.content === null && content !== null) existing.content = content;
     return existing;
   }
   const created: MutableFile = {
@@ -188,6 +192,41 @@ function normalizeBuildSourcePath(value: string, context: string): string {
   if (source === normalizedContext) return source.split("/").at(-1) ?? source;
   if (source.startsWith(`${normalizedContext}/`)) return source.slice(normalizedContext.length + 1);
   return source;
+}
+
+interface CapturedSourceContentIndex {
+  exact: Map<string, string>;
+  suffix: Map<string, string | null>;
+}
+
+function indexCapturedSourceContent(
+  index: CapturedSourceContentIndex,
+  path: string,
+  content: string,
+): void {
+  index.exact.set(path, content);
+  const parts = path.split("/").filter(Boolean);
+  // A basename alone is not a stable source identity. Index suffixes with at
+  // least two path segments and mark conflicting suffixes as ambiguous.
+  for (let offset = 0; offset < parts.length - 1; offset += 1) {
+    const suffix = parts.slice(offset).join("/");
+    const existing = index.suffix.get(suffix);
+    if (existing === undefined) index.suffix.set(suffix, content);
+    else if (existing !== content) index.suffix.set(suffix, null);
+  }
+}
+
+function capturedSourceContent(index: CapturedSourceContentIndex, path: string): string | null {
+  const exact = index.exact.get(path);
+  if (exact !== undefined) return exact;
+  const directSuffix = index.suffix.get(path);
+  if (directSuffix !== undefined) return directSuffix;
+  const parts = path.split("/").filter(Boolean);
+  for (let offset = 1; offset < parts.length - 1; offset += 1) {
+    const matched = index.suffix.get(parts.slice(offset).join("/"));
+    if (matched !== undefined) return matched;
+  }
+  return null;
 }
 
 function addLineBytes(
@@ -228,12 +267,17 @@ function buildModuleSourceIndex(build: BuildManifest): ModuleSourceIndex {
   const exact = new Map<string, string[]>();
   const suffix = new Map<string, string[]>();
   for (const module of build.modules) {
-    if (!module.resource) continue;
-    const resource = normalizeBuildSourcePath(module.resource, build.context);
-    appendModuleIndex(exact, resource, module.id);
-    const parts = resource.split("/").filter(Boolean);
-    for (let index = 0; index < parts.length; index += 1) {
-      appendModuleIndex(suffix, parts.slice(index).join("/"), module.id);
+    const paths = new Set([
+      ...(module.resource ? [module.resource] : []),
+      ...(module.sourcePaths ?? []),
+    ]);
+    for (const path of paths) {
+      const resource = normalizeBuildSourcePath(path, build.context);
+      appendModuleIndex(exact, resource, module.id);
+      const parts = resource.split("/").filter(Boolean);
+      for (let index = 0; index < parts.length; index += 1) {
+        appendModuleIndex(suffix, parts.slice(index).join("/"), module.id);
+      }
     }
   }
   return { exact, suffix };
@@ -517,8 +561,14 @@ export async function analyzeCoverageWithMatches(
   }
 
   const files = new Map<string, MutableFile>();
+  const capturedContentIndex: CapturedSourceContentIndex = {
+    exact: new Map(),
+    suffix: new Map(),
+  };
   for (const [source, content] of collectionEntries(input.originalSources)) {
-    mutableFile(files, normalizeBuildSourcePath(source, input.build.context), content);
+    const path = normalizeBuildSourcePath(source, input.build.context);
+    mutableFile(files, path, content);
+    indexCapturedSourceContent(capturedContentIndex, path, content);
   }
   const globalMetrics = emptyMetrics();
   const assetMetrics = new Map<string, UsageMetrics>();
@@ -589,7 +639,11 @@ export async function analyzeCoverageWithMatches(
       const path = span.source
         ? normalizeBuildSourcePath(span.source, input.build.context)
         : `[rspack runtime / unmapped]/${asset.name}`;
-      const file = mutableFile(files, path, span.sourceContent);
+      const file = mutableFile(
+        files,
+        path,
+        capturedSourceContent(capturedContentIndex, path) ?? span.sourceContent,
+      );
       addMetrics(file.metrics, metrics);
       for (const chunk of asset.chunks) {
         file.chunks.add(chunk);
