@@ -95,7 +95,10 @@ export function SetupGuide(props: {
           <span className="step-number">3</span>
           <div>
             <h2>Import Coverage JSON</h2>
-            <p>The file stays in this browser. Nothing is uploaded.</p>
+            <p>
+              The file is sent only to this token-protected <code>127.0.0.1</code> process and
+              remains on your machine.
+            </p>
             <label
               className="drop-zone"
               onDragOver={(event) => event.preventDefault()}

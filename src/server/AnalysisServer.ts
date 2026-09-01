@@ -1,10 +1,13 @@
+import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dirname, extname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { analyzeCoverageWithMatches } from "../analyzer/analyze.js";
 import type { ResolvedRspackCoveragePluginOptions } from "../plugin/types.js";
-import type { BuildSnapshot } from "../shared/types.js";
+import type { BuildSnapshot, ChromeCoverageEntry, CoverageImportSummary } from "../shared/types.js";
+import { InvestigationModel } from "./InvestigationModel.js";
 
 const ANALYSIS_PREFIX = "/__rspack_coverage__/";
 
@@ -45,10 +48,60 @@ function safeDecode(value: string): string {
   }
 }
 
+async function requestJson(request: IncomingMessage, maximumBytes = 1024 * 1024 * 1024) {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.byteLength;
+    if (bytes > maximumBytes)
+      throw new Error("Request body exceeds the 1 GiB local analysis limit");
+    chunks.push(buffer);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+}
+
+function vscodeUrl(target: { path: string; line: number; column: number }): string {
+  const normalized = target.path.replace(/\\/g, "/");
+  const encoded = normalized
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+  return `vscode://file${encoded.startsWith("/") ? encoded : `/${encoded}`}:${target.line}:${target.column}`;
+}
+
+function openEditor(target: { path: string; line: number; column: number }) {
+  const goto = `${target.path}:${target.line}:${target.column}`;
+  const editor = process.env.RSPACK_COVERAGE_EDITOR || "code";
+  const result = spawnSync(editor, ["--goto", goto], { stdio: "ignore", timeout: 5_000 });
+  if (result.status === 0) return { opened: true, method: editor, url: vscodeUrl(target) };
+  if (process.platform === "darwin") {
+    const fallback = spawnSync("open", [vscodeUrl(target)], { stdio: "ignore", timeout: 5_000 });
+    return { opened: fallback.status === 0, method: "vscode-url", url: vscodeUrl(target) };
+  }
+  return { opened: false, method: null, url: vscodeUrl(target) };
+}
+
 export class AnalysisServer {
   readonly token = randomBytes(24).toString("base64url");
   #snapshot: BuildSnapshot | null = null;
-  #server = createServer((request, response) => void this.#handle(request, response));
+  #investigation: InvestigationModel | null = null;
+  #server = createServer((request, response) => {
+    void this.#handle(request, response).catch((error: unknown) => {
+      if (response.headersSent) {
+        response.destroy();
+        return;
+      }
+      const message = error instanceof Error ? error.message : "Coverage analysis failed";
+      const invalidInput =
+        error instanceof SyntaxError ||
+        message.startsWith("Chrome Coverage") ||
+        message.startsWith("No JavaScript assets") ||
+        message.startsWith("Request body exceeds") ||
+        message.includes("does not match build");
+      sendJson(response, invalidInput ? 400 : 500, { error: message });
+    });
+  });
   #port: number | null = null;
   #uiDirectory: string;
 
@@ -74,6 +127,7 @@ export class AnalysisServer {
 
   update(snapshot: BuildSnapshot): void {
     this.#snapshot = snapshot;
+    this.#investigation = null;
   }
 
   async start(): Promise<number> {
@@ -129,8 +183,8 @@ export class AnalysisServer {
       sendJson(response, 403, { error: "Invalid host" });
       return;
     }
-    if (request.method !== "GET" && request.method !== "HEAD") {
-      response.writeHead(405, { Allow: "GET, HEAD" });
+    if (request.method !== "GET" && request.method !== "HEAD" && request.method !== "POST") {
+      response.writeHead(405, { Allow: "GET, HEAD, POST" });
       response.end();
       return;
     }
@@ -143,7 +197,7 @@ export class AnalysisServer {
         sendJson(response, 401, { error: "Missing or invalid analysis token" });
         return;
       }
-      this.#serveApi(pathname, response);
+      await this.#serveApi(request, pathname, url, response);
       return;
     }
 
@@ -155,7 +209,12 @@ export class AnalysisServer {
     this.#serveApplication(pathname, request, response);
   }
 
-  #serveApi(pathname: string, response: ServerResponse): void {
+  async #serveApi(
+    request: IncomingMessage,
+    pathname: string,
+    url: URL,
+    response: ServerResponse,
+  ): Promise<void> {
     const snapshot = this.#snapshot;
     if (!snapshot) {
       sendJson(response, 503, { error: "Build data is not ready" });
@@ -170,7 +229,144 @@ export class AnalysisServer {
       return;
     }
     if (pathname === `${ANALYSIS_PREFIX}api/sources`) {
-      sendJson(response, 200, Object.fromEntries(snapshot.originalSources));
+      sendJson(
+        response,
+        200,
+        [...snapshot.originalSources].map(([path, content]) => ({
+          path,
+          characters: content.length,
+        })),
+      );
+      return;
+    }
+    if (pathname === `${ANALYSIS_PREFIX}api/analyze` && request.method === "POST") {
+      const body = (await requestJson(request)) as {
+        coverage?: ChromeCoverageEntry[];
+        precision?: CoverageImportSummary["precision"];
+      };
+      if (!Array.isArray(body.coverage)) {
+        sendJson(response, 400, { error: "Chrome Coverage JSON must contain an array of entries" });
+        return;
+      }
+      const precision = ["per-block", "per-function", "unknown"].includes(String(body.precision))
+        ? (body.precision as CoverageImportSummary["precision"])
+        : "unknown";
+      const result = await analyzeCoverageWithMatches({
+        build: snapshot.manifest,
+        coverage: body.coverage,
+        maps: snapshot.maps,
+        generatedAssets: snapshot.assets,
+        originalSources: snapshot.originalSources,
+        precision,
+      });
+      this.#investigation = new InvestigationModel(
+        snapshot,
+        result.report,
+        result.matched,
+        result.lineEvidence,
+        result.analyzedAssetIds,
+      );
+      sendJson(response, 200, this.#investigation.summary);
+      return;
+    }
+    if (pathname === `${ANALYSIS_PREFIX}api/report`) {
+      if (!this.#investigation) {
+        sendJson(response, 404, { error: "No recording has been analyzed by this server" });
+        return;
+      }
+      sendJson(response, 200, this.#investigation.summary);
+      return;
+    }
+    if (pathname === `${ANALYSIS_PREFIX}api/source`) {
+      if (!this.#investigation) {
+        sendJson(response, 409, { error: "Analyze a recording before loading source details" });
+        return;
+      }
+      const source = this.#investigation.source(url.searchParams.get("id") ?? "");
+      sendJson(response, source ? 200 : 404, source ?? { error: "Unknown source" });
+      return;
+    }
+    if (pathname === `${ANALYSIS_PREFIX}api/evidence-gaps`) {
+      sendJson(response, 200, this.#investigation?.evidenceGaps() ?? []);
+      return;
+    }
+    const moduleMatch = pathname.match(/\/api\/modules\/([^/]+)(?:\/(code|references|context))?$/);
+    if (moduleMatch) {
+      if (!this.#investigation) {
+        sendJson(response, 409, { error: "Analyze a recording before investigating modules" });
+        return;
+      }
+      const moduleId = moduleMatch[1] ?? "";
+      const action = moduleMatch[2] ?? "detail";
+      if (action === "detail") {
+        const detail = this.#investigation.module(moduleId);
+        sendJson(response, detail ? 200 : 404, detail ?? { error: "Unknown module" });
+        return;
+      }
+      if (action === "code") {
+        const view = url.searchParams.get("view") === "output" ? "output" : "source";
+        const code = this.#investigation.code(
+          moduleId,
+          view,
+          url.searchParams.get("source"),
+          Number(url.searchParams.get("offset") ?? 0),
+          Number(url.searchParams.get("limit") ?? 240_000),
+        );
+        sendJson(response, code ? 200 : 404, code ?? { error: "Unknown module" });
+        return;
+      }
+      if (action === "references") {
+        const requestedDirection = url.searchParams.get("direction");
+        const direction =
+          requestedDirection === "in" || requestedDirection === "out" ? requestedDirection : "both";
+        const references = this.#investigation.references(
+          moduleId,
+          direction,
+          Number(url.searchParams.get("cursor") ?? 0),
+          Number(url.searchParams.get("limit") ?? 80),
+        );
+        sendJson(response, references ? 200 : 404, references ?? { error: "Unknown module" });
+        return;
+      }
+      const context = this.#investigation.aiContext(moduleId);
+      sendJson(response, context ? 200 : 404, context ?? { error: "Unknown module" });
+      return;
+    }
+    const snippetMatch = pathname.match(/\/api\/references\/([^/]+)\/snippet$/);
+    if (snippetMatch) {
+      if (!this.#investigation) {
+        sendJson(response, 409, { error: "Analyze a recording before loading references" });
+        return;
+      }
+      const snippet = this.#investigation.snippet(
+        snippetMatch[1] ?? "",
+        Number(url.searchParams.get("context") ?? 3),
+      );
+      sendJson(response, snippet ? 200 : 404, snippet ?? { error: "Unknown reference" });
+      return;
+    }
+    if (pathname === `${ANALYSIS_PREFIX}api/open-in-editor` && request.method === "POST") {
+      if (!this.#investigation) {
+        sendJson(response, 409, { error: "Analyze a recording before opening source" });
+        return;
+      }
+      const body = (await requestJson(request, 64 * 1024)) as {
+        moduleId?: string;
+        sourceId?: string | null;
+        line?: number;
+        column?: number;
+      };
+      const target = this.#investigation.editorTarget(
+        String(body.moduleId ?? ""),
+        body.sourceId ?? null,
+        Number(body.line ?? 1),
+        Number(body.column ?? 1),
+      );
+      if (!target) {
+        sendJson(response, 400, { error: "The selected module has no local absolute source path" });
+        return;
+      }
+      sendJson(response, 200, { target, ...openEditor(target) });
       return;
     }
     const assetMatch = pathname.match(/\/api\/asset\/([^/]+)$/);

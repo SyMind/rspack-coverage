@@ -12,6 +12,7 @@ export function formatPercent(value: number | null): string {
 export function usageColor(ratio: number | null, loadedBytes: number): string {
   if (loadedBytes === 0) return "var(--not-loaded)";
   const safe = Math.max(0, Math.min(1, ratio ?? 0));
-  const hue = 24 + safe * 116;
-  return `hsl(${hue} 66% ${44 - safe * 8}%)`;
+  if (safe === 0) return "#ef4444";
+  if (safe === 1) return "#34d399";
+  return `linear-gradient(90deg, #34d399 0 ${safe * 100}%, #ef4444 ${safe * 100}% 100%)`;
 }

@@ -20,10 +20,58 @@ import { intersectRanges, mergeRanges } from "./ranges.js";
 import { buildGeneratedSpans } from "./sourceMap.js";
 import { buildUtf8Prefix, splitSourceLines, utf8BytesBetween } from "./utf.js";
 
-interface MatchedCoverage {
+export interface MatchedCoverage {
   asset: BuildAsset;
   text: string;
   ranges: ChromeCoverageRange[];
+}
+
+export type AnalysisCollection<T> = Record<string, T> | ReadonlyMap<string, T>;
+
+export interface CoverageAnalysisInput {
+  build: BuildManifest;
+  coverage: ChromeCoverageEntry[];
+  maps: AnalysisCollection<RawSourceMapPayload>;
+  generatedAssets: AnalysisCollection<string | Uint8Array>;
+  originalSources: AnalysisCollection<string>;
+  precision: CoverageImportSummary["precision"];
+  onProgress?: (phase: string, completed: number, total: number) => void;
+}
+
+export interface CoverageAnalysisResult {
+  report: CoverageReport;
+  matched: Map<string, MatchedCoverage>;
+  lineEvidence: CoverageLineEvidence;
+  analyzedAssetIds: ReadonlySet<string>;
+}
+
+export interface CoverageLineEvidenceItem {
+  emittedBytes: number;
+  loadedBytes: number;
+  executedBytes: number;
+  chunks: ReadonlySet<string>;
+}
+
+export type CoverageLineEvidence = ReadonlyMap<
+  string,
+  ReadonlyMap<number, CoverageLineEvidenceItem>
+>;
+
+function collectionGet<T>(collection: AnalysisCollection<T>, key: string): T | undefined {
+  return typeof (collection as ReadonlyMap<string, T>).get === "function"
+    ? (collection as ReadonlyMap<string, T>).get(key)
+    : (collection as Record<string, T>)[key];
+}
+
+function collectionEntries<T>(collection: AnalysisCollection<T>): Array<[string, T]> {
+  return typeof (collection as ReadonlyMap<string, T>).entries === "function"
+    ? [...(collection as ReadonlyMap<string, T>).entries()]
+    : Object.entries(collection as Record<string, T>);
+}
+
+function generatedText(value: string | Uint8Array | undefined): string | undefined {
+  if (typeof value === "string") return value;
+  return value ? new TextDecoder().decode(value) : undefined;
 }
 
 interface MutableLine {
@@ -31,7 +79,6 @@ interface MutableLine {
   loadedBytes: number;
   executedBytes: number;
   chunks: Set<string>;
-  ranges: SourceLineState["ranges"];
 }
 
 interface MutableFile {
@@ -59,7 +106,7 @@ function pathMatches(entryUrl: string, asset: BuildAsset): boolean {
   return entryPath === assetPath || entryPath === plainName || entryPath.endsWith(plainName);
 }
 
-async function matchCoverage(
+export async function matchCoverage(
   build: BuildManifest,
   coverage: ChromeCoverageEntry[],
 ): Promise<{
@@ -108,7 +155,7 @@ async function matchCoverage(
   return { matched, ignored };
 }
 
-function runtimeState(line: MutableLine): RuntimeState {
+function runtimeState(line: { loadedBytes: number; executedBytes: number }): RuntimeState {
   if (line.loadedBytes === 0) return "not-loaded";
   return line.executedBytes > 0 ? "executed" : "not-executed";
 }
@@ -151,8 +198,6 @@ function addLineBytes(
     loaded: number;
     executed: number;
     chunks: string[];
-    startColumn: number;
-    endColumn: number;
   },
 ): void {
   const line = file.lines.get(lineNumber) ?? {
@@ -160,71 +205,68 @@ function addLineBytes(
     loadedBytes: 0,
     executedBytes: 0,
     chunks: new Set<string>(),
-    ranges: [],
   };
   line.emittedBytes += input.emitted;
   line.loadedBytes += input.loaded;
   line.executedBytes += input.executed;
   for (const chunk of input.chunks) line.chunks.add(chunk);
-  if (input.loaded > 0) {
-    line.ranges.push({
-      startColumn: input.startColumn,
-      endColumn: input.endColumn,
-      executed: input.executed > 0,
-    });
-  }
   file.lines.set(lineNumber, line);
 }
 
-function moduleIdsForSource(build: BuildManifest, sourcePath: string): string[] {
+interface ModuleSourceIndex {
+  exact: Map<string, string[]>;
+  suffix: Map<string, string[]>;
+}
+
+function appendModuleIndex(index: Map<string, string[]>, key: string, moduleId: string): void {
+  const ids = index.get(key) ?? [];
+  if (!ids.includes(moduleId)) ids.push(moduleId);
+  index.set(key, ids);
+}
+
+function buildModuleSourceIndex(build: BuildManifest): ModuleSourceIndex {
+  const exact = new Map<string, string[]>();
+  const suffix = new Map<string, string[]>();
+  for (const module of build.modules) {
+    if (!module.resource) continue;
+    const resource = normalizeBuildSourcePath(module.resource, build.context);
+    appendModuleIndex(exact, resource, module.id);
+    const parts = resource.split("/").filter(Boolean);
+    for (let index = 0; index < parts.length; index += 1) {
+      appendModuleIndex(suffix, parts.slice(index).join("/"), module.id);
+    }
+  }
+  return { exact, suffix };
+}
+
+function moduleIdsForSource(
+  build: BuildManifest,
+  sourceIndex: ModuleSourceIndex,
+  sourcePath: string,
+): string[] {
   const normalizedSource = normalizeBuildSourcePath(sourcePath, build.context);
-  return build.modules
-    .filter((module) => {
-      if (!module.resource) return false;
-      const resource = normalizeBuildSourcePath(module.resource, build.context);
-      return (
-        resource === normalizedSource ||
-        resource.endsWith(`/${normalizedSource}`) ||
-        normalizedSource.endsWith(`/${resource}`)
-      );
-    })
-    .map((module) => module.id);
+  const matches = new Set([
+    ...(sourceIndex.exact.get(normalizedSource) ?? []),
+    ...(sourceIndex.suffix.get(normalizedSource) ?? []),
+  ]);
+  const parts = normalizedSource.split("/").filter(Boolean);
+  for (let index = 1; index < parts.length; index += 1) {
+    for (const moduleId of sourceIndex.exact.get(parts.slice(index).join("/")) ?? []) {
+      matches.add(moduleId);
+    }
+  }
+  return [...matches];
 }
 
 function toFileReports(files: Map<string, MutableFile>, build: BuildManifest): SourceFileReport[] {
+  const sourceIndex = buildModuleSourceIndex(build);
+  const chunksByModule = new Map(build.modules.map((module) => [module.id, module.chunks]));
   return [...files.values()]
     .map((file) => {
       finalizeMetrics(file.metrics);
-      const sourceLines = file.content === null ? [] : splitSourceLines(file.content);
-      const maxMappedLine = Math.max(-1, ...file.lines.keys());
-      // sourcesContent is authoritative for the source drawer. A malformed or
-      // incompatible map must not manufacture thousands of empty source rows.
-      const lineCount = file.content === null ? maxMappedLine + 1 : sourceLines.length;
-      const moduleIds = moduleIdsForSource(build, file.path);
-      const moduleChunks = build.modules
-        .filter((module) => moduleIds.includes(module.id))
-        .flatMap((module) => module.chunks);
+      const moduleIds = moduleIdsForSource(build, sourceIndex, file.path);
+      const moduleChunks = moduleIds.flatMap((moduleId) => chunksByModule.get(moduleId) ?? []);
       const chunks = [...new Set([...file.chunks, ...moduleChunks])];
-      const lines: SourceLineState[] = [];
-      for (let index = 0; index < lineCount; index += 1) {
-        const mapped = file.lines.get(index);
-        const text = sourceLines[index] ?? "";
-        const lineRuntimeState = mapped ? runtimeState(mapped) : "not-loaded";
-        lines.push({
-          line: index + 1,
-          text,
-          buildState: mapped?.emittedBytes ? "retained" : text.trim() ? "not-emitted" : "unknown",
-          runtimeState: lineRuntimeState,
-          emittedBytes: mapped?.emittedBytes ?? 0,
-          executedBytes: mapped?.executedBytes ?? 0,
-          chunks: mapped ? [...mapped.chunks] : chunks,
-          ranges:
-            mapped?.ranges.map((range) => ({
-              ...range,
-              executed: lineRuntimeState === "executed",
-            })) ?? [],
-        });
-      }
       const loadedChunks = [...file.loadedChunks];
       return {
         id: file.path,
@@ -237,10 +279,61 @@ function toFileReports(files: Map<string, MutableFile>, build: BuildManifest): S
         moduleIds,
         duplicated: new Set(loadedChunks).size > 1,
         content: file.content,
-        lines,
+        lines: [],
       } satisfies SourceFileReport;
     })
     .sort((a, b) => b.metrics.unusedBytes - a.metrics.unusedBytes || a.path.localeCompare(b.path));
+}
+
+export function materializeSourceFile(
+  file: SourceFileReport,
+  evidence: ReadonlyMap<number, CoverageLineEvidenceItem> | undefined,
+  build: BuildManifest,
+  analyzedAssetIds: ReadonlySet<string>,
+): SourceFileReport {
+  if (file.lines.length > 0 || file.content === null) return file;
+  const sourceLines = splitSourceLines(file.content);
+  const maxMappedLine = Math.max(-1, ...(evidence?.keys() ?? []));
+  // sourcesContent is authoritative. A malformed map must not manufacture
+  // thousands of empty rows beyond the actual captured source.
+  const lineCount = file.content === null ? maxMappedLine + 1 : sourceLines.length;
+  const relevantAssets = build.assets.filter(
+    (asset) =>
+      file.chunks.length === 0 || asset.chunks.some((chunk) => file.chunks.includes(chunk)),
+  );
+  const canProveAbsence =
+    relevantAssets.length > 0 &&
+    relevantAssets.every((asset) => asset.mapAvailable && analyzedAssetIds.has(asset.id));
+  const lines: SourceLineState[] = [];
+  for (let index = 0; index < lineCount; index += 1) {
+    const mapped = evidence?.get(index);
+    const text = sourceLines[index] ?? "";
+    const lineRuntimeState = mapped ? runtimeState(mapped) : "not-loaded";
+    lines.push({
+      line: index + 1,
+      text,
+      buildState: mapped?.emittedBytes
+        ? "retained"
+        : text.trim() && canProveAbsence
+          ? "not-emitted"
+          : "unknown",
+      runtimeState: lineRuntimeState,
+      emittedBytes: mapped?.emittedBytes ?? 0,
+      executedBytes: mapped?.executedBytes ?? 0,
+      chunks: mapped ? [...mapped.chunks] : file.chunks,
+      ranges:
+        mapped?.loadedBytes && text.length
+          ? [
+              {
+                startColumn: 0,
+                endColumn: text.length,
+                executed: lineRuntimeState === "executed" || lineRuntimeState === "partial",
+              },
+            ]
+          : [],
+    });
+  }
+  return { ...file, lines };
 }
 
 function buildTree(files: SourceFileReport[]): TreeNodeReport {
@@ -414,15 +507,9 @@ function buildOpportunities(files: SourceFileReport[], chunks: ChunkReport[]): O
   return opportunities.sort((a, b) => b.metrics.unusedBytes - a.metrics.unusedBytes).slice(0, 100);
 }
 
-export async function analyzeCoverage(input: {
-  build: BuildManifest;
-  coverage: ChromeCoverageEntry[];
-  maps: Record<string, RawSourceMapPayload>;
-  generatedAssets: Record<string, string>;
-  originalSources: Record<string, string>;
-  precision: CoverageImportSummary["precision"];
-  onProgress?: (phase: string, completed: number, total: number) => void;
-}): Promise<CoverageReport> {
+export async function analyzeCoverageWithMatches(
+  input: CoverageAnalysisInput,
+): Promise<CoverageAnalysisResult> {
   if (!Array.isArray(input.coverage)) throw new Error("Chrome Coverage JSON must be an array.");
   const { matched, ignored } = await matchCoverage(input.build, input.coverage);
   if (matched.size === 0) {
@@ -430,7 +517,7 @@ export async function analyzeCoverage(input: {
   }
 
   const files = new Map<string, MutableFile>();
-  for (const [source, content] of Object.entries(input.originalSources)) {
+  for (const [source, content] of collectionEntries(input.originalSources)) {
     mutableFile(files, normalizeBuildSourcePath(source, input.build.context), content);
   }
   const globalMetrics = emptyMetrics();
@@ -442,9 +529,19 @@ export async function analyzeCoverage(input: {
     input.onProgress?.("Mapping generated code", index, input.build.assets.length);
     const coverage = matched.get(asset.id);
     const loaded = Boolean(coverage);
-    const generated = coverage?.text ?? input.generatedAssets[asset.id];
+    if (!loaded) {
+      // Keep the not-loaded byte total exact without claiming source attribution.
+      // Decoding every unloaded source map makes large builds unusable; mapped and
+      // unmapped evidence for those assets stays unknown until selected on demand.
+      const metrics = finalizeMetrics({ ...emptyMetrics(), emittedBytes: asset.size });
+      assetMetrics.set(asset.id, metrics);
+      addMetrics(globalMetrics, metrics);
+      continue;
+    }
+    const generated =
+      coverage?.text ?? generatedText(collectionGet(input.generatedAssets, asset.id));
     const ranges = coverage?.ranges ?? [];
-    const map = input.maps[asset.id];
+    const map = collectionGet(input.maps, asset.id);
     if (!generated) {
       const metrics = metricsFromBytes({
         emittedBytes: asset.size,
@@ -499,15 +596,11 @@ export async function analyzeCoverage(input: {
         if (loaded) file.loadedChunks.add(chunk);
       }
       if (span.originalLine !== null) {
-        const startColumn = Math.max(0, span.originalColumn ?? 0);
-        const endColumn = Math.max(startColumn + 1, span.originalEndColumn ?? startColumn + 1);
         addLineBytes(file, span.originalLine, {
           emitted: emittedBytes,
           loaded: loaded ? emittedBytes : 0,
           executed: executedBytes,
           chunks: asset.chunks,
-          startColumn,
-          endColumn,
         });
       }
     }
@@ -534,7 +627,7 @@ export async function analyzeCoverage(input: {
     };
   });
 
-  return {
+  const report: CoverageReport = {
     version: 1,
     buildHash: input.build.hash,
     createdAt: Date.now(),
@@ -550,4 +643,23 @@ export async function analyzeCoverage(input: {
     chunks,
     opportunities: buildOpportunities(fileReports, chunks),
   };
+  return {
+    report,
+    matched,
+    lineEvidence: new Map([...files].map(([path, file]) => [path, file.lines] as const)),
+    analyzedAssetIds: new Set(matched.keys()),
+  };
+}
+
+export async function analyzeCoverage(input: CoverageAnalysisInput): Promise<CoverageReport> {
+  const result = await analyzeCoverageWithMatches(input);
+  result.report.files = result.report.files.map((file) =>
+    materializeSourceFile(
+      file,
+      result.lineEvidence.get(file.path),
+      input.build,
+      result.analyzedAssetIds,
+    ),
+  );
+  return result.report;
 }

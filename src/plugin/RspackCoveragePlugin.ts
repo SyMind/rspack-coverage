@@ -1,7 +1,6 @@
 import type { Compiler, Stats } from "@rspack/core";
 import { AnalysisServer } from "../server/AnalysisServer.js";
 import { openBrowser } from "../server/openBrowser.js";
-import type { RawSourceMapPayload } from "../shared/types.js";
 import { createBuildSnapshot } from "./snapshot.js";
 import type { ResolvedRspackCoveragePluginOptions, RspackCoveragePluginOptions } from "./types.js";
 
@@ -29,7 +28,7 @@ export class RspackCoveragePlugin {
   readonly #options: ResolvedRspackCoveragePluginOptions;
   #server: AnalysisServer | null = null;
   #opened = false;
-  #privateMaps = new WeakMap<object, Map<string, RawSourceMapPayload>>();
+  #privateMaps = new WeakMap<object, Map<string, Buffer>>();
 
   constructor(options: RspackCoveragePluginOptions = {}) {
     this.#options = resolveOptions(options);
@@ -50,7 +49,7 @@ export class RspackCoveragePlugin {
       }).apply(compiler);
 
       compiler.hooks.thisCompilation.tap(PLUGIN_NAME, (compilation) => {
-        const maps = new Map<string, RawSourceMapPayload>();
+        const maps = new Map<string, Buffer>();
         this.#privateMaps.set(compilation, maps);
         compilation.hooks.processAssets.tap(
           {
@@ -65,10 +64,14 @@ export class RspackCoveragePlugin {
               )
                 continue;
               try {
-                const parsed = JSON.parse(asset.source.source().toString()) as RawSourceMapPayload;
-                const generatedName =
-                  parsed.file || asset.name.slice("__rspack_coverage_maps__/".length, -4);
-                maps.set(generatedName, parsed);
+                const raw: unknown = asset.source.source();
+                const content = Buffer.isBuffer(raw)
+                  ? raw
+                  : raw instanceof Uint8Array
+                    ? Buffer.from(raw)
+                    : Buffer.from(String(raw));
+                const generatedName = asset.name.slice("__rspack_coverage_maps__/".length, -4);
+                maps.set(generatedName, content);
               } catch (error) {
                 compilation.warnings.push(
                   new Error(

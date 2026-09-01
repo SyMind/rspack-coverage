@@ -1,21 +1,20 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type {
   BuildManifest,
   ChromeCoverageEntry,
   CoverageImportSummary,
   CoverageReport,
   SourceFileReport,
-  WorkerRequest,
-  WorkerResponse,
 } from "../shared/types.js";
 import { ChunksView } from "./components/ChunksView.js";
+import { EvidenceGapsDialog } from "./components/EvidenceGapsDialog.js";
 import { MetricCard } from "./components/MetricCard.js";
 import { OpportunitiesView } from "./components/OpportunitiesView.js";
 import { SetupGuide } from "./components/SetupGuide.js";
 import { SourceDrawer } from "./components/SourceDrawer.js";
 import { SourceExplorer } from "./components/SourceExplorer.js";
-import { loadAnalysisPayload, loadBuild } from "./lib/api.js";
-import { loadRecording, loadReport, saveRecording, saveReport } from "./lib/storage.js";
+import { analyzeOnServer, loadBuild, loadCurrentReport, loadEvidenceGaps } from "./lib/api.js";
+import { loadRecording, saveRecording, saveReport } from "./lib/storage.js";
 
 type Tab = "sources" | "chunks" | "opportunities";
 
@@ -28,23 +27,35 @@ export function App() {
   const [recentAvailable, setRecentAvailable] = useState(false);
   const [progress, setProgress] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const workerRef = useRef<Worker | null>(null);
+  const [evidenceGaps, setEvidenceGaps] = useState<Array<{ kind: string; message: string }>>([]);
+  const [evidenceOpen, setEvidenceOpen] = useState(false);
 
   useEffect(() => {
     void loadBuild()
       .then(async (nextBuild) => {
         setBuild(nextBuild);
-        const [recording, savedReport] = await Promise.all([
+        const [recording, currentReport] = await Promise.all([
           loadRecording(nextBuild.hash),
-          loadReport(nextBuild.hash),
+          loadCurrentReport(),
         ]);
         setRecentAvailable(Boolean(recording));
         if (recording) setPrecision(recording.precision);
-        if (savedReport) setReport(savedReport);
+        if (currentReport?.buildHash === nextBuild.hash) setReport(currentReport);
       })
       .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
-    return () => workerRef.current?.terminate();
   }, []);
+
+  useEffect(() => {
+    if (!report) return;
+    void loadEvidenceGaps()
+      .then(setEvidenceGaps)
+      .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
+    const moduleId = new URL(location.href).searchParams.get("module");
+    if (moduleId && !selectedFile) {
+      const file = report.files.find((candidate) => candidate.moduleIds.includes(moduleId));
+      if (file) setSelectedFile(file);
+    }
+  }, [report, selectedFile]);
 
   const runAnalysis = async (coverage: ChromeCoverageEntry[], fileName: string) => {
     if (!build) return;
@@ -52,7 +63,7 @@ export function App() {
     try {
       if (!Array.isArray(coverage))
         throw new Error("Chrome Coverage JSON must contain an array of entries.");
-      setProgress(`Reading ${fileName}…`);
+      setProgress(`Validating ${fileName} against build ${build.hash.slice(0, 10)}…`);
       const currentBuild = await loadBuild();
       if (currentBuild.hash !== build.hash) {
         setBuild(currentBuild);
@@ -61,9 +72,6 @@ export function App() {
           "The build changed while this page was open. Import Coverage recorded from the updated preview.",
         );
       }
-      const payload = await loadAnalysisPayload(currentBuild, (completed, total) => {
-        setProgress(`Loading build assets and source maps · ${completed}/${total}`);
-      });
       await saveRecording({
         buildHash: currentBuild.hash,
         coverage,
@@ -71,40 +79,12 @@ export function App() {
         savedAt: Date.now(),
       });
       setRecentAvailable(true);
-      workerRef.current?.terminate();
-      const worker = new Worker(new URL("../analyzer/analyzer.worker.ts", import.meta.url), {
-        type: "module",
-      });
-      workerRef.current = worker;
-      worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
-        const message = event.data;
-        if (message.type === "progress") {
-          setProgress(`${message.phase} · ${message.completed}/${message.total}`);
-        } else if (message.type === "error") {
-          setProgress(null);
-          setError(message.message);
-          worker.terminate();
-        } else {
-          setReport(message.report);
-          setProgress(null);
-          setTab("sources");
-          void saveReport(message.report);
-          worker.terminate();
-        }
-      };
-      worker.onerror = (event) => {
-        setProgress(null);
-        setError(event.message || "Coverage worker failed.");
-      };
-      worker.postMessage({
-        type: "analyze",
-        build: currentBuild,
-        coverage,
-        maps: payload.maps,
-        generatedAssets: payload.generatedAssets,
-        originalSources: payload.originalSources,
-        precision,
-      } satisfies WorkerRequest);
+      setProgress("Mapping generated ranges to modules and original sources on the local server…");
+      const nextReport = await analyzeOnServer(coverage, precision);
+      setReport(nextReport);
+      setProgress(null);
+      setTab("sources");
+      await saveReport(nextReport);
     } catch (cause) {
       setProgress(null);
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -137,22 +117,36 @@ export function App() {
         <a className="brand" href="/__rspack_coverage__/">
           <span className="brand-mark">R</span>
           <span>
-            Rspack Coverage<small>runtime-to-source analysis</small>
+            Rspack Coverage<small>runtime-to-module investigation</small>
           </span>
         </a>
         <div className="build-status">
           <span className="status-light" /> Build {build.hash.slice(0, 10)}
           <small>{build.mode}</small>
         </div>
-        {report ? (
-          <button
-            type="button"
-            className="button button--secondary"
-            onClick={() => setReport(null)}
-          >
-            Import another recording
-          </button>
-        ) : null}
+        <div className="topbar-actions">
+          {report ? (
+            <>
+              <button
+                type="button"
+                className="button button--secondary"
+                onClick={() => setEvidenceOpen(true)}
+              >
+                Evidence gaps <span className="button-count">{evidenceGaps.length}</span>
+              </button>
+              <button
+                type="button"
+                className="button button--secondary"
+                onClick={() => {
+                  setSelectedFile(null);
+                  setReport(null);
+                }}
+              >
+                Import another recording
+              </button>
+            </>
+          ) : null}
+        </div>
       </header>
 
       {!report ? (
@@ -171,16 +165,17 @@ export function App() {
           <section className="report-heading">
             <div>
               <span className="eyebrow">Imported user journey</span>
-              <h1>What loaded, what ran, what remained</h1>
+              <h1>Module coverage, source evidence, and reference paths</h1>
               <p>
                 {report.importSummary.matchedAssets} matched assets ·{" "}
-                {report.importSummary.ignoredEntries.length} ignored ·{" "}
+                {build.counts.modules.toLocaleString()} modules ·{" "}
+                {(build.counts.references ?? 0).toLocaleString()} references ·{" "}
                 {report.importSummary.precision.replace("-", " ")} precision
               </p>
             </div>
             {report.importSummary.precision !== "per-block" ? (
               <div className="precision-warning">
-                Low/unknown precision: record with JavaScript Per block for line-level decisions.
+                Low/unknown precision: record with JavaScript Per block for code-range decisions.
               </div>
             ) : null}
           </section>
@@ -192,7 +187,7 @@ export function App() {
             />
             <MetricCard label="Executed" value={report.metrics.executedBytes} tone="green" />
             <MetricCard
-              label="Unused"
+              label="Unexecuted"
               value={report.metrics.unusedBytes}
               tone="orange"
               note="loaded, not executed"
@@ -251,7 +246,24 @@ export function App() {
           )}
         </main>
       )}
-      <SourceDrawer file={selectedFile} onClose={() => setSelectedFile(null)} />
+      <SourceDrawer
+        key={selectedFile?.id ?? "closed"}
+        file={selectedFile}
+        modules={build.modules}
+        onClose={() => {
+          setSelectedFile(null);
+          const url = new URL(location.href);
+          url.searchParams.delete("module");
+          url.searchParams.delete("view");
+          url.searchParams.delete("source");
+          history.replaceState(null, "", url);
+        }}
+      />
+      <EvidenceGapsDialog
+        open={evidenceOpen}
+        gaps={evidenceGaps}
+        onClose={() => setEvidenceOpen(false)}
+      />
     </div>
   );
 }

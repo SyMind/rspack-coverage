@@ -46,15 +46,45 @@ export interface BuildChunk {
 
 export interface BuildModule {
   id: string;
+  runtimeId?: string | null;
   identifier: string;
+  readableIdentifier?: string;
   name: string;
   resource: string | null;
   chunks: string[];
   issuer: string | null;
+  type?: string | null;
+  layer?: string | null;
+  entry?: boolean;
+  showFullIdentifier?: boolean;
   size: number;
   usedExports: boolean | string[] | null;
   providedExports: string[] | null;
   nested: boolean;
+}
+
+export interface ReferenceLocation {
+  start: { line: number; column: number };
+  end: { line: number; column: number };
+}
+
+export interface BuildReference {
+  id: string;
+  originId: string;
+  targetId: string;
+  dependencyType: string | null;
+  request: string | null;
+  exports: string[] | null;
+  active: boolean | null;
+  location: ReferenceLocation | null;
+}
+
+export interface ModuleCodeGeneration {
+  moduleId: string;
+  runtimes: string[][];
+  content: string;
+  map: RawSourceMapPayload | null;
+  mapError: string | null;
 }
 
 export interface BuildEntrypoint {
@@ -87,6 +117,8 @@ export interface BuildManifest {
     chunks: number;
     modules: number;
     sourceMaps: number;
+    references?: number;
+    codeGenerationSources?: number;
   };
   previewAvailable: boolean;
   publicPathSupported: boolean;
@@ -105,11 +137,102 @@ export interface RawSourceMapPayload {
 
 export interface BuildSnapshot {
   manifest: BuildManifest;
-  assets: Map<string, Buffer>;
-  maps: Map<string, RawSourceMapPayload>;
+  assets: ReadonlyMap<string, Buffer>;
+  maps: ReadonlyMap<string, RawSourceMapPayload>;
   originalSources: Map<string, string>;
+  references: BuildReference[];
+  codeGeneration: Map<string, ModuleCodeGeneration[]>;
+  loadCodeGeneration?: (moduleId: string) => ModuleCodeGeneration[];
   outputPath: string;
   indexAsset: string | null;
+}
+
+export type CodeCoverageState =
+  | "executed"
+  | "unexecuted"
+  | "not-emitted"
+  | "unloaded"
+  | "unknown"
+  | "neutral";
+
+export interface CodeCoverageSpan {
+  start: number;
+  end: number;
+  status: CodeCoverageState;
+  count?: number | null;
+}
+
+export interface CodeViewResponse {
+  view: "source" | "output";
+  sourceId: string | null;
+  filename: string;
+  language: string;
+  content: string;
+  spans: CodeCoverageSpan[];
+  offset: number;
+  endOffset: number;
+  startLine: number;
+  totalCharacters: number;
+  hasPrevious: boolean;
+  hasNext: boolean;
+  provenance: string;
+  gap: string | null;
+}
+
+export interface ModuleViewAvailability {
+  source: boolean;
+  output: boolean;
+  finalAsset: boolean;
+  codeGeneration: boolean;
+  hasMappedOutput: boolean;
+  preferred: "source" | "output";
+  outputKind: "final-asset" | "module-code-generation" | null;
+}
+
+export interface ModuleInvestigationDetail extends BuildModule {
+  sources: Array<{
+    id: string;
+    name: string;
+    mappedBytes: number;
+    loadedBytes: number;
+    executedBytes: number;
+  }>;
+  metrics: UsageMetrics;
+  incomingReferences: number;
+  outgoingReferences: number;
+  views: ModuleViewAvailability;
+}
+
+export interface ReferenceEdgeReport extends BuildReference {
+  origin: BuildModule;
+  target: BuildModule;
+}
+
+export interface ModuleReferencesResponse {
+  module: BuildModule;
+  direction: "in" | "out" | "both";
+  total: number;
+  cursor: number;
+  nextCursor: number | null;
+  edges: ReferenceEdgeReport[];
+  entryPath: BuildModule[];
+}
+
+export interface ReferenceSnippetResponse {
+  edge: BuildReference;
+  available: boolean;
+  gap: string | null;
+  filename?: string;
+  startLine?: number;
+  endLine?: number;
+  content?: string;
+  highlight?: {
+    start: number;
+    end: number;
+    coverageStatus: CodeCoverageState;
+  };
+  coverage?: UsageMetrics;
+  location?: ReferenceLocation;
 }
 
 export interface SourceLineState {
