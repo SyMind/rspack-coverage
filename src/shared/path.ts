@@ -44,6 +44,14 @@ export function normalizeSourcePath(value: string): string {
   return normalized || "[unknown source]";
 }
 
+export function normalizeSourcePathForContext(value: string, context: string): string {
+  const source = normalizeSourcePath(value);
+  const normalizedContext = normalizeSourcePath(context);
+  if (source === normalizedContext) return source.split("/").at(-1) ?? source;
+  if (source.startsWith(`${normalizedContext}/`)) return source.slice(normalizedContext.length + 1);
+  return source;
+}
+
 export function sourceCategory(path: string): "first-party" | "node_modules" | "runtime" {
   if (path.startsWith("[rspack runtime") || path.includes("webpack/runtime")) return "runtime";
   if (path.includes("node_modules/")) return "node_modules";

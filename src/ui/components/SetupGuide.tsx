@@ -1,22 +1,25 @@
-import type {
-  BuildManifest,
-  ChromeCoverageEntry,
-  CoverageImportSummary,
-} from "../../shared/types.js";
+import type { BuildManifest, CoverageImportSummary } from "../../shared/types.js";
 
 export function SetupGuide(props: {
   build: BuildManifest;
   precision: CoverageImportSummary["precision"];
   onPrecisionChange: (precision: CoverageImportSummary["precision"]) => void;
-  onImport: (coverage: ChromeCoverageEntry[], fileName: string) => void;
+  onImport: (file: File) => void;
   recentAvailable: boolean;
   onReuseRecent: () => void;
   error: string | null;
   progress: string | null;
 }) {
-  const readFile = async (file: File) => {
-    const parsed = JSON.parse(await file.text()) as ChromeCoverageEntry[];
-    props.onImport(parsed, file.name);
+  const capabilityWarnings = [
+    props.build.capabilities.usedExports !== "enabled"
+      ? "Rspack usedExports data is unavailable; unreferenced exports will be marked unknown."
+      : null,
+    props.build.capabilities.originalLocations !== "exact"
+      ? "A full column source map is unavailable; reference locations may be approximate or unavailable."
+      : null,
+  ].filter((message): message is string => Boolean(message));
+  const readFile = (file: File) => {
+    props.onImport(file);
   };
 
   return (
@@ -32,13 +35,25 @@ export function SetupGuide(props: {
         <div className="build-facts">
           <span>✓ {props.build.counts.chunks} chunks</span>
           <span>✓ {props.build.counts.modules} modules</span>
-          <span>✓ {props.build.counts.sourceMaps} full source maps</span>
+          <span>
+            {props.build.capabilities.sourceMap === "full" ? "✓" : "!"}{" "}
+            {props.build.counts.sourceMaps} {props.build.capabilities.sourceMap} source maps
+          </span>
           <span>
             {props.build.previewAvailable ? "✓" : "!"} application preview{" "}
             {props.build.previewAvailable ? "available" : "unavailable"}
           </span>
         </div>
       </section>
+
+      {capabilityWarnings.length ? (
+        <section className="capability-warning">
+          <strong>Analysis capability warning</strong>
+          {capabilityWarnings.map((message) => (
+            <p key={message}>{message}</p>
+          ))}
+        </section>
+      ) : null}
 
       {props.build.diagnostics.length > 0 ? (
         <section className="diagnostics">
@@ -96,8 +111,8 @@ export function SetupGuide(props: {
           <div>
             <h2>Import Coverage JSON</h2>
             <p>
-              The file is sent only to this token-protected <code>127.0.0.1</code> process and
-              remains on your machine.
+              The file is streamed only to the local Node process. Analysis data never leaves this
+              machine.
             </p>
             <label
               className="drop-zone"
@@ -105,7 +120,7 @@ export function SetupGuide(props: {
               onDrop={(event) => {
                 event.preventDefault();
                 const file = event.dataTransfer.files[0];
-                if (file) void readFile(file);
+                if (file) readFile(file);
               }}
             >
               <input
@@ -113,7 +128,7 @@ export function SetupGuide(props: {
                 accept="application/json,.json"
                 onChange={(event) => {
                   const file = event.target.files?.[0];
-                  if (file) void readFile(file);
+                  if (file) readFile(file);
                 }}
               />
               <span className="drop-icon">⇩</span>

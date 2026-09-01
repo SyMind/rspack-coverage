@@ -1,43 +1,22 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useMemo, useRef, useState } from "react";
-import type { SourceFileReport, TreeNodeReport } from "../../shared/types.js";
+import type { SourceFileSummary, TreeNodeReport } from "../../shared/types.js";
 import { formatBytes, formatPercent, usageColor } from "../lib/format.js";
 
 type SourceView = "modules" | "directory";
-type SourceSort = "name" | "coverage" | "size" | "unused";
 type FlatNode = { node: TreeNodeReport; depth: number };
 
 function compareByUnusedBytesAndPath(
-  left: Pick<SourceFileReport, "path" | "metrics">,
-  right: Pick<SourceFileReport, "path" | "metrics">,
+  left: Pick<SourceFileSummary, "path" | "metrics">,
+  right: Pick<SourceFileSummary, "path" | "metrics">,
 ): number {
   return (
     right.metrics.unusedBytes - left.metrics.unusedBytes || left.path.localeCompare(right.path)
   );
 }
 
-export function sortModuleSources(files: SourceFileReport[]): SourceFileReport[] {
+export function sortModuleSources(files: SourceFileSummary[]): SourceFileSummary[] {
   return [...files].sort(compareByUnusedBytesAndPath);
-}
-
-function compareSources(
-  left: Pick<SourceFileReport, "path" | "metrics">,
-  right: Pick<SourceFileReport, "path" | "metrics">,
-  sort: SourceSort,
-): number {
-  if (sort === "name") return left.path.localeCompare(right.path);
-  if (sort === "coverage") {
-    return (
-      (left.metrics.usageRatio ?? -1) - (right.metrics.usageRatio ?? -1) ||
-      left.path.localeCompare(right.path)
-    );
-  }
-  if (sort === "size") {
-    return (
-      right.metrics.emittedBytes - left.metrics.emittedBytes || left.path.localeCompare(right.path)
-    );
-  }
-  return compareByUnusedBytesAndPath(left, right);
 }
 
 function matchesFilter(node: TreeNodeReport, category: string, search: string): boolean {
@@ -55,7 +34,6 @@ function flattenTree(
   expanded: Set<string>,
   category: string,
   search: string,
-  sort: SourceSort,
 ): FlatNode[] {
   const output: FlatNode[] = [];
   const visit = (node: TreeNodeReport, depth: number) => {
@@ -63,9 +41,7 @@ function flattenTree(
     if (node !== root) output.push({ node, depth });
     const open = node === root || expanded.has(node.id) || Boolean(search);
     if (open) {
-      for (const child of [...node.children].sort((left, right) =>
-        compareSources(left, right, sort),
-      )) {
+      for (const child of [...node.children].sort(compareByUnusedBytesAndPath)) {
         visit(child, node === root ? 0 : depth + 1);
       }
     }
@@ -74,14 +50,8 @@ function flattenTree(
   return output;
 }
 
-function moduleRows(
-  files: SourceFileReport[],
-  category: string,
-  search: string,
-  sort: SourceSort,
-): FlatNode[] {
-  return [...files]
-    .sort((left, right) => compareSources(left, right, sort))
+function moduleRows(files: SourceFileSummary[], category: string, search: string): FlatNode[] {
+  return sortModuleSources(files)
     .filter(
       (file) =>
         (category === "all" || file.category === category) &&
@@ -106,9 +76,9 @@ function moduleRows(
 
 export function SourceExplorer(props: {
   tree: TreeNodeReport;
-  files: SourceFileReport[];
+  files: SourceFileSummary[];
   selectedFileId: string | null;
-  onSelectFile: (file: SourceFileReport) => void;
+  onSelectFile: (file: SourceFileSummary) => void;
 }) {
   const [view, setView] = useState<SourceView>("modules");
   const [expanded, setExpanded] = useState(
@@ -116,15 +86,14 @@ export function SourceExplorer(props: {
   );
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState("all");
-  const [sort, setSort] = useState<SourceSort>("size");
   const scrollRef = useRef<HTMLDivElement>(null);
   const normalizedSearch = search.trim().toLowerCase();
   const rows = useMemo(
     () =>
       view === "modules"
-        ? moduleRows(props.files, category, normalizedSearch, sort)
-        : flattenTree(props.tree, expanded, category, normalizedSearch, sort),
-    [props.files, props.tree, view, expanded, category, normalizedSearch, sort],
+        ? moduleRows(props.files, category, normalizedSearch)
+        : flattenTree(props.tree, expanded, category, normalizedSearch),
+    [props.files, props.tree, view, expanded, category, normalizedSearch],
   );
   const virtualizer = useVirtualizer({
     count: rows.length,
@@ -185,16 +154,6 @@ export function SourceExplorer(props: {
               <option value="first-party">First-party</option>
               <option value="node_modules">node_modules</option>
               <option value="runtime">Rspack runtime</option>
-            </select>
-            <select
-              aria-label="Source sort"
-              value={sort}
-              onChange={(event) => setSort(event.target.value as SourceSort)}
-            >
-              <option value="name">Name</option>
-              <option value="coverage">Coverage</option>
-              <option value="size">Generated size</option>
-              <option value="unused">Unexecuted bytes</option>
             </select>
           </div>
         </div>
@@ -275,7 +234,7 @@ export function SourceExplorer(props: {
       </div>
       <div className="panel-footnote">
         {view === "modules"
-          ? "Each row is an original source-map source. Sort and coverage use generated-byte evidence."
+          ? "Each row is an original source-map source, ordered by unused generated bytes."
           : "Sizes are final generated UTF-8 bytes. Directory usage is byte-weighted."}
       </div>
     </section>

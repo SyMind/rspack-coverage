@@ -1,4 +1,4 @@
-import type { Opportunity, SourceFileReport } from "../../shared/types.js";
+import type { Opportunity, SourceFileSummary } from "../../shared/types.js";
 import { formatBytes, formatPercent } from "../lib/format.js";
 
 const LABELS: Record<Opportunity["kind"], string> = {
@@ -11,8 +11,8 @@ const LABELS: Record<Opportunity["kind"], string> = {
 
 export function OpportunitiesView(props: {
   opportunities: Opportunity[];
-  files: SourceFileReport[];
-  onSelectFile: (file: SourceFileReport) => void;
+  files: SourceFileSummary[];
+  onSelectFile: (file: SourceFileSummary) => void;
 }) {
   const files = new Map(props.files.map((file) => [file.id, file]));
   return (

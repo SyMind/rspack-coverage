@@ -6,12 +6,25 @@ import type { ResolvedRspackCoveragePluginOptions, RspackCoveragePluginOptions }
 
 const PLUGIN_NAME = "RspackCoveragePlugin";
 
+interface ConfigurationChange {
+  option: string;
+  before: string;
+  after: string;
+  purpose: string;
+}
+
 function resolveOptions(options: RspackCoveragePluginOptions): ResolvedRspackCoveragePluginOptions {
   return {
     port: options.port ?? 4868,
     open: options.open ?? true,
     historyApiFallback: options.historyApiFallback ?? true,
   };
+}
+
+function displayValue(value: unknown): string {
+  if (typeof value === "string") return JSON.stringify(value);
+  if (value === undefined) return "undefined";
+  return String(value);
 }
 
 function hasUsableFullSourceMap(devtool: unknown): boolean {
@@ -21,6 +34,86 @@ function hasUsableFullSourceMap(devtool: unknown): boolean {
     !devtool.includes("cheap") &&
     !devtool.includes("eval") &&
     !devtool.includes("nosources")
+  );
+}
+
+function enableRequiredConfiguration(compiler: Compiler): ConfigurationChange[] {
+  const changes: ConfigurationChange[] = [];
+  const usesProductionDefaults =
+    compiler.options.mode === "production" || compiler.options.mode === undefined;
+  const displayEffectiveValue = (value: unknown, defaultValue: unknown) =>
+    value === undefined ? `${displayValue(defaultValue)} (default)` : displayValue(value);
+  const setBooleanOption = (
+    option: "providedExports" | "innerGraph" | "minimize",
+    defaultValue: boolean,
+    purpose: string,
+  ) => {
+    const configured = compiler.options.optimization[option];
+    const effective = configured ?? defaultValue;
+    if (effective === true) return;
+    compiler.options.optimization[option] = true;
+    changes.push({
+      option: `optimization.${option}`,
+      before: displayEffectiveValue(configured, defaultValue),
+      after: "true",
+      purpose,
+    });
+  };
+
+  const configuredUsedExports = compiler.options.optimization.usedExports;
+  const effectiveUsedExports = configuredUsedExports ?? usesProductionDefaults;
+  if (effectiveUsedExports !== true && effectiveUsedExports !== "global") {
+    compiler.options.optimization.usedExports = true;
+    changes.push({
+      option: "optimization.usedExports",
+      before: displayEffectiveValue(configuredUsedExports, usesProductionDefaults),
+      after: "true",
+      purpose: "tree shaking",
+    });
+  }
+
+  const configuredSideEffects = compiler.options.optimization.sideEffects;
+  const defaultSideEffects = usesProductionDefaults ? true : "flag";
+  const effectiveSideEffects = configuredSideEffects ?? defaultSideEffects;
+  if (effectiveSideEffects !== true) {
+    compiler.options.optimization.sideEffects = true;
+    changes.push({
+      option: "optimization.sideEffects",
+      before: displayEffectiveValue(configuredSideEffects, defaultSideEffects),
+      after: "true",
+      purpose: "tree shaking",
+    });
+  }
+
+  setBooleanOption("providedExports", true, "tree shaking");
+  setBooleanOption("innerGraph", usesProductionDefaults, "tree shaking");
+  setBooleanOption("minimize", usesProductionDefaults, "minification");
+
+  if (compiler.options.optimization.minimizer?.length === 0) {
+    compiler.options.optimization.minimizer = [
+      new compiler.webpack.SwcJsMinimizerRspackPlugin(),
+      new compiler.webpack.LightningCssMinimizerRspackPlugin(),
+    ];
+    changes.push({
+      option: "optimization.minimizer",
+      before: "[]",
+      after: "Rspack default minimizers",
+      purpose: "minification",
+    });
+  }
+
+  return changes;
+}
+
+function printConfigurationChanges(changes: ConfigurationChange[]): void {
+  if (changes.length === 0) return;
+  const details = changes
+    .map(
+      ({ option, before, after, purpose }) => `  - ${option}: ${before} -> ${after} (${purpose})`,
+    )
+    .join("\n");
+  console.warn(
+    `\nRspack Coverage enabled required Rspack settings for accurate analysis:\n${details}\n`,
   );
 }
 
@@ -37,7 +130,9 @@ export class RspackCoveragePlugin {
   apply(compiler: Compiler): void {
     if (process.env.CI === "true") return;
 
+    const configurationChanges = enableRequiredConfiguration(compiler);
     if (!hasUsableFullSourceMap(compiler.options.devtool)) {
+      const before = compiler.options.devtool;
       compiler.options.devtool = false;
       new compiler.webpack.SourceMapDevToolPlugin({
         test: /\.(?:js|mjs|cjs)$/i,
@@ -84,7 +179,14 @@ export class RspackCoveragePlugin {
           },
         );
       });
+      configurationChanges.push({
+        option: "devtool",
+        before: displayValue(before),
+        after: "private full source maps",
+        purpose: "full source maps",
+      });
     }
+    printConfigurationChanges(configurationChanges);
 
     compiler.hooks.done.tapPromise(PLUGIN_NAME, async (stats: Stats) => {
       const snapshot = createBuildSnapshot(
@@ -99,8 +201,13 @@ export class RspackCoveragePlugin {
 
       if (!this.#opened) {
         this.#opened = true;
+        const exportUsage =
+          snapshot.manifest.capabilities.usedExports === "enabled"
+            ? "enabled"
+            : `limited (${snapshot.manifest.capabilities.usedExports})`;
+        const sourceLocations = snapshot.manifest.capabilities.originalLocations;
         console.log(
-          `\nRspack Coverage is ready\n\nApplication:\n${origin}/\n\nCoverage report:\n${origin}/__rspack_coverage__/\n\nPress Ctrl+C to stop.\n`,
+          `\nRspack Coverage is ready\n\nExport usage: ${exportUsage}\nSource locations: ${sourceLocations}\n\nApplication:\n${origin}/\n\nCoverage report:\n${origin}/__rspack_coverage__/\n\nPress Ctrl+C to stop.\n`,
         );
         if (this.#options.open) openBrowser(`${origin}/__rspack_coverage__/`);
       }

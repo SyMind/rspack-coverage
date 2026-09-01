@@ -86,6 +86,7 @@ export function ReferencePanel(props: {
   onDirectionChange: (direction: "in" | "out" | "both") => void;
   onSelectEdge: (edgeId: string) => void;
   onLoadMore: () => void;
+  onClose?: () => void;
   onCloseSnippet: () => void;
 }) {
   const references = props.references;
@@ -97,7 +98,19 @@ export function ReferencePanel(props: {
           <span className="eyebrow">Compilation references</span>
           <h3>Module reference chain</h3>
         </div>
-        <span className="reference-count">{references?.total.toLocaleString() ?? "—"}</span>
+        <div className="reference-toolbar-actions">
+          <span className="reference-count">{references?.total.toLocaleString() ?? "—"}</span>
+          {props.onClose ? (
+            <button
+              type="button"
+              className="reference-close-button"
+              aria-label="Back to source code"
+              onClick={props.onClose}
+            >
+              ×
+            </button>
+          ) : null}
+        </div>
       </div>
       <fieldset className="segmented reference-direction">
         <legend className="sr-only">Reference direction</legend>

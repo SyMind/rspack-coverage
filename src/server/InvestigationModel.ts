@@ -1,19 +1,10 @@
 import { extname, isAbsolute } from "node:path";
-import {
-  type CoverageLineEvidence,
-  type MatchedCoverage,
-  materializeSourceFile,
-} from "../analyzer/analyze.js";
-import { intersectRanges } from "../analyzer/ranges.js";
-import { buildGeneratedSpans, type GeneratedSpan } from "../analyzer/sourceMap.js";
-import { sourceFileCoverageSpans, sourceLineCoverageStatus } from "../shared/codeCoverage.js";
-import { addMetrics, emptyMetrics, finalizeMetrics } from "../shared/metrics.js";
+import { emptyMetrics, finalizeMetrics } from "../shared/metrics.js";
 import { normalizeSourcePath } from "../shared/path.js";
 import type {
   BuildModule,
   BuildReference,
   BuildSnapshot,
-  CodeCoverageSpan,
   CodeViewResponse,
   CoverageReport,
   ModuleInvestigationDetail,
@@ -21,6 +12,8 @@ import type {
   ReferenceLocation,
   ReferenceSnippetResponse,
   SourceFileReport,
+  SourceFileSummary,
+  SourceLineState,
   UsageMetrics,
 } from "../shared/types.js";
 
@@ -34,14 +27,6 @@ function normalizeBuildSourcePath(value: string, context: string): string {
   return source;
 }
 
-function lineStarts(content: string): number[] {
-  const starts = [0];
-  for (let index = 0; index < content.length; index += 1) {
-    if (content.charCodeAt(index) === 10) starts.push(index + 1);
-  }
-  return starts;
-}
-
 function locationFitsContent(content: string, location: ReferenceLocation | null): boolean {
   if (!location) return false;
   const lines = content.split("\n");
@@ -53,6 +38,14 @@ function locationFitsContent(content: string, location: ReferenceLocation | null
     location.start.column <= start.length &&
     location.end.column <= end.length + 1
   );
+}
+
+function lineStarts(content: string): number[] {
+  const starts = [0];
+  for (let index = 0; index < content.length; index += 1) {
+    if (content.charCodeAt(index) === 10) starts.push(index + 1);
+  }
+  return starts;
 }
 
 function positionForOffset(starts: number[], offset: number): ReferenceLocation["start"] {
@@ -71,12 +64,9 @@ function searchedReferenceLocation(
   edge: BuildReference,
   hint: ReferenceLocation | null,
 ): ReferenceLocation | null {
-  const terms = [
-    edge.request,
-    edge.request?.includes("!") ? edge.request.split("!").at(-1) : null,
-    ...(edge.exports ?? []),
-  ].filter((term, index, all): term is string => Boolean(term) && all.indexOf(term) === index);
-  if (!terms.length) return null;
+  const terms = [edge.request, ...(edge.exports ?? [])].filter(
+    (term, index, all): term is string => Boolean(term) && all.indexOf(term) === index,
+  );
   const starts = lineStarts(content);
   for (const term of terms) {
     let bestOffset = -1;
@@ -101,43 +91,6 @@ function searchedReferenceLocation(
   return null;
 }
 
-function mergeSpans(spans: CodeCoverageSpan[]): CodeCoverageSpan[] {
-  const sorted = spans
-    .filter((span) => span.end > span.start)
-    .sort((left, right) => left.start - right.start || left.end - right.end);
-  const merged: CodeCoverageSpan[] = [];
-  for (const span of sorted) {
-    const previous = merged.at(-1);
-    if (previous && span.start <= previous.end && previous.status === span.status) {
-      previous.end = Math.max(previous.end, span.end);
-    } else if (previous && span.start < previous.end) {
-      if (span.end > previous.end) merged.push({ ...span, start: previous.end });
-    } else {
-      merged.push({ ...span });
-    }
-  }
-  return merged;
-}
-
-function coverageParts(
-  start: number,
-  end: number,
-  matched: MatchedCoverage | undefined,
-): CodeCoverageSpan[] {
-  if (!matched) return [{ start, end, status: "unloaded" }];
-  const executed = intersectRanges(matched.ranges, start, end);
-  const parts: CodeCoverageSpan[] = [];
-  let cursor = start;
-  for (const range of executed) {
-    if (range.start > cursor) parts.push({ start: cursor, end: range.start, status: "unexecuted" });
-    if (range.end > range.start)
-      parts.push({ start: range.start, end: range.end, status: "executed" });
-    cursor = Math.max(cursor, range.end);
-  }
-  if (cursor < end) parts.push({ start: cursor, end, status: "unexecuted" });
-  return parts;
-}
-
 function sliceCode(
   response: Omit<
     CodeViewResponse,
@@ -150,18 +103,16 @@ function sliceCode(
   const offset = Math.max(0, Math.min(totalCharacters, Math.trunc(requestedOffset || 0)));
   const limit = Math.max(1, Math.min(500_000, Math.trunc(requestedLimit || DEFAULT_CODE_LIMIT)));
   const endOffset = Math.min(totalCharacters, offset + limit);
-  const content = response.content.slice(offset, endOffset);
-  const spans = response.spans
-    .filter((span) => span.end > offset && span.start < endOffset)
-    .map((span) => ({
-      ...span,
-      start: Math.max(0, span.start - offset),
-      end: Math.min(endOffset, span.end) - offset,
-    }));
   return {
     ...response,
-    content,
-    spans,
+    content: response.content.slice(offset, endOffset),
+    spans: response.spans
+      .filter((span) => span.end > offset && span.start < endOffset)
+      .map((span) => ({
+        ...span,
+        start: Math.max(0, span.start - offset),
+        end: Math.min(endOffset, span.end) - offset,
+      })),
     offset,
     endOffset,
     startLine: response.content.slice(0, offset).split("\n").length,
@@ -171,60 +122,55 @@ function sliceCode(
   };
 }
 
-function emptyCode(
-  view: "source" | "output",
-  filename: string,
-  sourceId: string | null,
-  gap: string,
-): CodeViewResponse {
-  return sliceCode(
-    {
-      view,
-      sourceId,
-      filename,
-      language: extname(filename).slice(1) || "javascript",
-      content: "",
-      spans: [],
-      provenance: "unavailable",
-      gap,
-    },
-    0,
-    DEFAULT_CODE_LIMIT,
-  );
+function unknownLines(content: string): SourceLineState[] {
+  return content.split(/\r?\n/).map((text, index) => ({
+    line: index + 1,
+    text,
+    buildState: "unknown",
+    runtimeState: "not-loaded",
+    emittedBytes: 0,
+    executedBytes: 0,
+    chunks: [],
+    ranges: [],
+  }));
 }
 
-function compactReport(report: CoverageReport): CoverageReport {
-  return {
-    ...report,
-    files: report.files.map((file) => ({ ...file, content: null, lines: [] })),
-  };
+function isDetailed(file: SourceFileSummary): file is SourceFileReport {
+  return "content" in file && "lines" in file;
+}
+
+function coverageStatus(
+  line: SourceLineState | undefined,
+): "executed" | "unexecuted" | "not-emitted" | "unloaded" | "unknown" {
+  if (!line) return "unknown";
+  if (line.buildState === "not-emitted") return "not-emitted";
+  if (line.runtimeState === "executed" || line.runtimeState === "partial") return "executed";
+  if (line.runtimeState === "not-executed") return "unexecuted";
+  if (line.runtimeState === "not-loaded") return "unloaded";
+  return "unknown";
 }
 
 export class InvestigationModel {
-  readonly report: CoverageReport;
-  readonly summary: CoverageReport;
+  readonly summary: CoverageReport | null;
   readonly #modules: Map<string, BuildModule>;
-  readonly #files: Map<string, SourceFileReport>;
-  readonly #filesByModule = new Map<string, SourceFileReport[]>();
+  readonly #files = new Map<string, SourceFileSummary>();
+  readonly #filesByModule = new Map<string, SourceFileSummary[]>();
   readonly #references: Map<string, BuildReference>;
   readonly #incoming = new Map<string, string[]>();
   readonly #outgoing = new Map<string, string[]>();
-  readonly #generatedSpans = new Map<string, GeneratedSpan[]>();
   readonly #entryPathCache = new Map<string, BuildModule[]>();
-  readonly #materializedFiles = new Map<string, SourceFileReport>();
 
   constructor(
     readonly snapshot: BuildSnapshot,
-    report: CoverageReport,
-    readonly matched: Map<string, MatchedCoverage>,
-    readonly lineEvidence: CoverageLineEvidence = new Map(),
-    readonly analyzedAssetIds: ReadonlySet<string> = new Set(),
+    report: CoverageReport | null = null,
+    _matched?: unknown,
+    _lineEvidence?: unknown,
+    _analyzedAssetIds?: ReadonlySet<string>,
   ) {
-    this.report = report;
-    this.summary = compactReport(report);
+    this.summary = report;
     this.#modules = new Map(snapshot.manifest.modules.map((module) => [module.id, module]));
-    this.#files = new Map(report.files.map((file) => [file.id, file]));
-    for (const file of report.files) {
+    for (const file of report?.files ?? []) {
+      this.#files.set(file.id, file);
       for (const moduleId of file.moduleIds) {
         const files = this.#filesByModule.get(moduleId) ?? [];
         files.push(file);
@@ -242,28 +188,37 @@ export class InvestigationModel {
     }
   }
 
-  source(fileId: string): SourceFileReport | null {
-    const cached = this.#materializedFiles.get(fileId);
-    if (cached) return cached;
-    const file = this.#files.get(fileId);
-    if (!file) return null;
-    const materialized = materializeSourceFile(
-      file,
-      this.lineEvidence.get(file.path),
-      this.snapshot.manifest,
-      this.analyzedAssetIds,
+  #sourceCandidates(path: string): Array<{ path: string; content: string }> {
+    const normalized = normalizeBuildSourcePath(path, this.snapshot.manifest.context);
+    const candidates: Array<{ path: string; content: string }> = [];
+    for (const [candidate, content] of this.snapshot.originalSources) {
+      const current = normalizeBuildSourcePath(candidate, this.snapshot.manifest.context);
+      if (
+        current === normalized ||
+        current.endsWith(`/${normalized}`) ||
+        normalized.endsWith(`/${current}`)
+      ) {
+        candidates.push({ path: current, content });
+      }
+    }
+    return candidates.sort(
+      (left, right) =>
+        Number(right.path === normalized) - Number(left.path === normalized) ||
+        left.path.length - right.path.length,
     );
-    this.#materializedFiles.set(fileId, materialized);
-    return materialized;
   }
 
-  #filesForModule(moduleId: string): SourceFileReport[] {
-    const module = this.#modules.get(moduleId);
-    if (!module) return [];
+  #sourceContent(path: string): string | null {
+    return this.#sourceCandidates(path)[0]?.content ?? null;
+  }
+
+  #filesForModule(moduleId: string): SourceFileSummary[] {
     const direct = this.#filesByModule.get(moduleId) ?? [];
-    if (direct.length || !module.resource) return direct;
+    if (direct.length) return direct;
+    const module = this.#modules.get(moduleId);
+    if (!module?.resource) return [];
     const resource = normalizeBuildSourcePath(module.resource, this.snapshot.manifest.context);
-    return this.report.files.filter(
+    return [...this.#files.values()].filter(
       (file) =>
         file.path === resource ||
         file.path.endsWith(`/${resource}`) ||
@@ -271,57 +226,36 @@ export class InvestigationModel {
     );
   }
 
-  #fileForSourcePath(
-    sourcePath: string,
-    location: BuildReference["sourceLocation"],
-    edge: BuildReference,
-  ): SourceFileReport | null {
-    const normalized = normalizeBuildSourcePath(sourcePath, this.snapshot.manifest.context);
-    const referenceLocation = location ?? null;
-    const candidates = this.report.files
-      .filter(
-        (file) =>
-          file.path === normalized ||
-          file.path.endsWith(`/${normalized}`) ||
-          normalized.endsWith(`/${file.path}`),
-      )
-      .sort((left, right) => {
-        const locationFits = (file: SourceFileReport): boolean =>
-          Boolean(file.content && locationFitsContent(file.content, referenceLocation));
-        const canSearch = (file: SourceFileReport): boolean =>
-          Boolean(file.content && searchedReferenceLocation(file.content, edge, referenceLocation));
-        return (
-          Number(locationFits(right)) - Number(locationFits(left)) ||
-          Number(canSearch(right)) - Number(canSearch(left)) ||
-          right.metrics.mappedBytes - left.metrics.mappedBytes ||
-          Number(Boolean(right.content)) - Number(Boolean(left.content))
-        );
-      });
-    return candidates[0] ?? null;
-  }
-
-  #moduleMetrics(moduleId: string): UsageMetrics {
+  #metrics(moduleId: string): UsageMetrics {
     const metrics = emptyMetrics();
-    for (const file of this.#filesForModule(moduleId)) addMetrics(metrics, file.metrics);
+    for (const file of this.#filesForModule(moduleId)) {
+      metrics.emittedBytes += file.metrics.emittedBytes;
+      metrics.loadedBytes += file.metrics.loadedBytes;
+      metrics.executedBytes += file.metrics.executedBytes;
+      metrics.mappedBytes += file.metrics.mappedBytes;
+      metrics.unmappedBytes += file.metrics.unmappedBytes;
+    }
     return finalizeMetrics(metrics);
   }
 
-  #codeGeneration(moduleId: string) {
-    const cached = this.snapshot.codeGeneration.get(moduleId);
-    if (cached) return cached;
-    return this.snapshot.loadCodeGeneration?.(moduleId) ?? [];
+  source(fileId: string): SourceFileReport | null {
+    const file = this.#files.get(fileId);
+    if (!file) return null;
+    if (isDetailed(file)) return file;
+    const content = this.#sourceContent(file.path);
+    return { ...file, content, lines: content === null ? [] : unknownLines(content) };
   }
 
   module(moduleId: string): ModuleInvestigationDetail | null {
     const module = this.#modules.get(moduleId);
     if (!module) return null;
     const files = this.#filesForModule(moduleId);
-    const metrics = this.#moduleMetrics(moduleId);
-    const source = files.some((file) => Boolean(file.content));
-    const codeGeneration = this.#codeGeneration(moduleId).length > 0;
+    const metrics = this.#metrics(moduleId);
+    const source = files.some((file) => this.#sourceContent(file.path) !== null);
+    const codeGeneration =
+      (this.snapshot.codeGeneration.get(moduleId)?.length ?? 0) > 0 ||
+      (this.snapshot.loadCodeGeneration?.(moduleId).length ?? 0) > 0;
     const hasMappedOutput = metrics.mappedBytes > 0;
-    const finalAsset = hasMappedOutput;
-    const output = finalAsset || codeGeneration;
     return {
       ...module,
       sources: files.map((file) => ({
@@ -336,12 +270,16 @@ export class InvestigationModel {
       outgoingReferences: this.#outgoing.get(moduleId)?.length ?? 0,
       views: {
         source,
-        output,
-        finalAsset,
+        output: hasMappedOutput || codeGeneration,
+        finalAsset: hasMappedOutput,
         codeGeneration,
         hasMappedOutput,
-        preferred: !hasMappedOutput && output ? "output" : source ? "source" : "output",
-        outputKind: finalAsset ? "final-asset" : codeGeneration ? "module-code-generation" : null,
+        preferred: !hasMappedOutput && codeGeneration ? "output" : source ? "source" : "output",
+        outputKind: hasMappedOutput
+          ? "final-asset"
+          : codeGeneration
+            ? "module-code-generation"
+            : null,
       },
     };
   }
@@ -355,126 +293,42 @@ export class InvestigationModel {
   ): CodeViewResponse | null {
     const module = this.#modules.get(moduleId);
     if (!module) return null;
-    if (view === "output") return this.#outputCode(module, offset, limit);
-    const files = this.#filesForModule(moduleId);
-    const selected = files.find((candidate) => candidate.id === sourceId) ?? files[0];
-    const file = selected ? this.source(selected.id) : null;
-    if (!file?.content) {
-      return emptyCode(
-        "source",
-        file?.path ?? module.name,
-        file?.id ?? null,
-        "Source content is unavailable",
+    if (view === "source") {
+      const files = this.#filesForModule(moduleId);
+      const selected = files.find((file) => file.id === sourceId) ?? files[0];
+      const detail = selected ? this.source(selected.id) : null;
+      const content = detail?.content ?? "";
+      return sliceCode(
+        {
+          view,
+          sourceId: detail?.id ?? null,
+          filename: detail?.path ?? module.name,
+          language: extname(detail?.path ?? module.name).slice(1) || "javascript",
+          content,
+          spans: content ? [{ start: 0, end: content.length, status: "unknown" }] : [],
+          provenance: content ? "captured-original-source" : "unavailable",
+          gap: content ? null : "Source content is unavailable",
+        },
+        offset,
+        limit,
       );
     }
+    const generated =
+      this.snapshot.codeGeneration.get(moduleId)?.[0] ??
+      this.snapshot.loadCodeGeneration?.(moduleId)[0];
+    const content = generated?.content ?? "";
     return sliceCode(
       {
-        view: "source",
-        sourceId: file.id,
-        filename: file.path,
-        language: extname(file.path).slice(1) || "javascript",
-        content: file.content,
-        spans: sourceFileCoverageSpans(file),
-        provenance: "final-source-map / captured-original-source",
-        gap: null,
-      },
-      offset,
-      limit,
-    );
-  }
-
-  #assetSpans(assetId: string, content: string): GeneratedSpan[] {
-    const cached = this.#generatedSpans.get(assetId);
-    if (cached) return cached;
-    const map = this.snapshot.maps.get(assetId);
-    const spans = map ? buildGeneratedSpans(content, map) : [];
-    this.#generatedSpans.set(assetId, spans);
-    return spans;
-  }
-
-  #outputCode(module: BuildModule, offset: number, limit: number): CodeViewResponse {
-    const files = this.#filesForModule(module.id);
-    const paths = new Set(files.map((file) => file.path));
-    const byAsset = new Map<string, Array<{ start: number; end: number }>>();
-    const assetCandidates = this.snapshot.manifest.assets.filter(
-      (asset) =>
-        module.chunks.length === 0 || asset.chunks.some((chunk) => module.chunks.includes(chunk)),
-    );
-    for (const asset of assetCandidates) {
-      const buffer = this.snapshot.assets.get(asset.id);
-      if (!buffer || !asset.mapAvailable) continue;
-      const content = buffer.toString("utf8");
-      for (const span of this.#assetSpans(asset.id, content)) {
-        if (!span.source) continue;
-        const source = normalizeBuildSourcePath(span.source, this.snapshot.manifest.context);
-        if (!paths.has(source)) continue;
-        const values = byAsset.get(asset.id) ?? [];
-        values.push({ start: span.start, end: span.end });
-        byAsset.set(asset.id, values);
-      }
-    }
-
-    let content = "";
-    const coverageSpans: CodeCoverageSpan[] = [];
-    for (const [assetId, segments] of byAsset) {
-      const asset = this.snapshot.manifest.assets.find((candidate) => candidate.id === assetId);
-      const generated = this.snapshot.assets.get(assetId)?.toString("utf8");
-      if (!asset || !generated) continue;
-      const groups: Array<{ start: number; end: number }> = [];
-      for (const segment of [...segments].sort(
-        (left, right) => left.start - right.start || left.end - right.end,
-      )) {
-        const previous = groups.at(-1);
-        if (previous && segment.start - previous.end <= 160)
-          previous.end = Math.max(previous.end, segment.end);
-        else groups.push({ ...segment });
-      }
-      for (const group of groups) {
-        const start = Math.max(0, group.start - 120);
-        const end = Math.min(generated.length, group.end + 120);
-        content += `${content ? "\n\n" : ""}// ── ${asset.name}:${start}-${end} ──\n`;
-        const base = content.length;
-        content += generated.slice(start, end);
-        for (const part of coverageParts(start, end, this.matched.get(assetId))) {
-          coverageSpans.push({
-            ...part,
-            start: base + part.start - start,
-            end: base + part.end - start,
-          });
-        }
-      }
-    }
-
-    let provenance = "final-generated-asset";
-    let gap: string | null = null;
-    if (!content) {
-      const codeGeneration = this.#codeGeneration(module.id)[0];
-      if (codeGeneration) {
-        content = codeGeneration.content;
-        coverageSpans.push({ start: 0, end: content.length, status: "unknown" });
-        provenance = "module-code-generation";
-        gap =
-          "No generated characters map back to this module. Showing Rspack module code generation; runtime execution cannot be joined to an exact final-asset interval.";
-      }
-    }
-    if (!content) {
-      return emptyCode(
-        "output",
-        `${module.name} · generated output`,
-        null,
-        "No final-asset mapping or module code-generation source is available",
-      );
-    }
-    return sliceCode(
-      {
-        view: "output",
+        view,
         sourceId: null,
-        filename: `${module.name} · ${provenance === "final-generated-asset" ? "final asset" : "code generation"}`,
+        filename: `${module.name} · generated output`,
         language: "javascript",
         content,
-        spans: mergeSpans(coverageSpans),
-        provenance,
-        gap,
+        spans: content ? [{ start: 0, end: content.length, status: "unknown" }] : [],
+        provenance: generated ? "module-code-generation" : "unavailable",
+        gap: generated
+          ? "Exact final-asset runtime coverage is unavailable for this module view."
+          : "No module code-generation source is available",
       },
       offset,
       limit,
@@ -505,7 +359,6 @@ export class InvestigationModel {
         visited.add(consumer);
         queue.push([...path, consumer]);
       }
-      if (visited.size > 100_000) break;
     }
     this.#entryPathCache.set(moduleId, []);
     return [];
@@ -541,10 +394,9 @@ export class InvestigationModel {
       nextCursor: safeCursor + page.length < ids.length ? safeCursor + page.length : null,
       edges: page.flatMap((id) => {
         const edge = this.#references.get(id);
-        if (!edge) return [];
-        const origin = this.#modules.get(edge.originId);
-        const target = this.#modules.get(edge.targetId);
-        return origin && target ? [{ ...edge, origin, target }] : [];
+        const origin = edge ? this.#modules.get(edge.originId) : null;
+        const target = edge ? this.#modules.get(edge.targetId) : null;
+        return edge && origin && target ? [{ ...edge, origin, target }] : [];
       }),
       entryPath: this.entryPath(moduleId),
     };
@@ -554,59 +406,59 @@ export class InvestigationModel {
     const edge = this.#references.get(referenceId);
     if (!edge) return null;
     const origin = this.#modules.get(edge.originId);
-    const tracedFile = edge.sourcePath
-      ? this.#fileForSourcePath(edge.sourcePath, edge.sourceLocation ?? edge.location, edge)
-      : null;
-    const rawFile =
-      tracedFile ??
-      (origin ? this.#filesForModule(origin.id).find((candidate) => candidate.content) : null);
-    const file = rawFile ? this.source(rawFile.id) : null;
-    const compilerLocation =
-      tracedFile && edge.sourceLocation ? edge.sourceLocation : edge.location;
-    const location =
-      file?.content && locationFitsContent(file.content, compilerLocation)
+    const requestedPath = edge.sourcePath ?? origin?.resource ?? null;
+    const compilerLocation = edge.sourceLocation ?? edge.location;
+    const candidates = requestedPath ? this.#sourceCandidates(requestedPath) : [];
+    const selected =
+      candidates.find((candidate) => locationFitsContent(candidate.content, compilerLocation)) ??
+      candidates.find((candidate) =>
+        searchedReferenceLocation(candidate.content, edge, compilerLocation),
+      ) ??
+      candidates[0];
+    const content = selected?.content ?? null;
+    const location = content
+      ? locationFitsContent(content, compilerLocation)
         ? compilerLocation
-        : file?.content
-          ? searchedReferenceLocation(file.content, edge, compilerLocation)
-          : null;
-    if (!origin || !file?.content || !location) {
+        : searchedReferenceLocation(content, edge, compilerLocation)
+      : null;
+    if (!selected || !content || !location) {
       return {
         edge,
         available: false,
-        gap: !file?.content
-          ? "Consumer source is unavailable"
-          : compilerLocation
-            ? "Reference location does not fit the captured consumer source"
-            : "Reference location is unavailable and the dependency request was not found",
+        gap: content
+          ? "Reference location is unavailable and the dependency request was not found"
+          : "Consumer source is unavailable",
       };
     }
-    const sourceLines = file.content.split("\n");
+    const lines = content.split("\n");
     const startLine = Math.max(1, location.start.line - Math.max(0, contextLines));
-    const endLine = Math.min(sourceLines.length, location.end.line + Math.max(0, contextLines));
-    const content = sourceLines.slice(startLine - 1, endLine).join("\n");
-    const starts = lineStarts(content);
-    const relativeStartLine = location.start.line - startLine;
-    const relativeEndLine = location.end.line - startLine;
-    const highlightStart = (starts[relativeStartLine] ?? 0) + location.start.column;
-    const highlightEnd = Math.max(
-      highlightStart + 1,
-      (starts[relativeEndLine] ?? highlightStart) + location.end.column,
+    const endLine = Math.min(lines.length, location.end.line + Math.max(0, contextLines));
+    const excerpt = lines.slice(startLine - 1, endLine).join("\n");
+    const starts = lineStarts(excerpt);
+    const start = (starts[location.start.line - startLine] ?? 0) + location.start.column;
+    const end = Math.max(
+      start + 1,
+      (starts[location.end.line - startLine] ?? start) + location.end.column,
     );
-    const sourceLine = file.lines[location.start.line - 1];
+    const detailedOrigin = origin
+      ? this.#filesForModule(origin.id).find(
+          (file): file is SourceFileReport => isDetailed(file) && file.content === content,
+        )
+      : null;
     return {
       edge,
       available: true,
       gap: null,
-      filename: file.path,
+      filename: normalizeBuildSourcePath(selected.path, this.snapshot.manifest.context),
       startLine,
       endLine,
-      content,
+      content: excerpt,
       highlight: {
-        start: Math.min(content.length, highlightStart),
-        end: Math.min(content.length, highlightEnd),
-        coverageStatus: sourceLine ? sourceLineCoverageStatus(sourceLine) : "unknown",
+        start: Math.min(excerpt.length, start),
+        end: Math.min(excerpt.length, end),
+        coverageStatus: coverageStatus(detailedOrigin?.lines[location.start.line - 1]),
       },
-      coverage: this.#moduleMetrics(origin.id),
+      coverage: origin ? this.#metrics(origin.id) : emptyMetrics(),
       location,
     };
   }
@@ -617,63 +469,26 @@ export class InvestigationModel {
     return {
       schemaVersion: 1,
       kind: "rspack-module-coverage-ai-context",
-      evidenceBoundary:
-        "Runtime coverage describes only this imported recording and does not prove that code is removable.",
-      build: {
-        hash: this.snapshot.manifest.hash,
-        mode: this.snapshot.manifest.mode,
-        counts: this.snapshot.manifest.counts,
-      },
+      build: { hash: this.snapshot.manifest.hash, mode: this.snapshot.manifest.mode },
       module,
       references: this.references(moduleId, "both", 0, 30),
-      sourceExcerpt: this.code(moduleId, "source", module.sources[0]?.id ?? null, 0, 12_000),
-      outputExcerpt: this.code(moduleId, "output", null, 0, 12_000),
       evidenceGaps: this.evidenceGaps(),
     };
   }
 
   evidenceGaps(): Array<{ kind: string; message: string }> {
-    const gaps: Array<{ kind: string; message: string }> = this.snapshot.manifest.diagnostics.map(
-      (diagnostic) => ({
-        kind: diagnostic.severity,
-        message: diagnostic.message,
-      }),
-    );
-    const missingMaps = this.snapshot.manifest.assets.filter((asset) => !asset.mapAvailable);
-    if (missingMaps.length) {
-      gaps.push({
-        kind: "source-map",
-        message: `${missingMaps.length} JavaScript asset(s) have no usable column-level source map. Their source attribution remains unknown.`,
-      });
-    }
-    const deferredMaps = this.snapshot.manifest.assets.filter(
-      (asset) => asset.mapAvailable && !this.analyzedAssetIds.has(asset.id),
-    );
-    if (deferredMaps.length) {
-      gaps.push({
-        kind: "deferred-source-attribution",
-        message: `${deferredMaps.length} emitted JavaScript asset(s) were not present in this recording. Their not-loaded byte total is exact, while source/module attribution remains unknown in the initial report so unloaded maps are not decoded eagerly.`,
-      });
-    }
-    if (this.report.importSummary.precision !== "per-block") {
-      gaps.push({
-        kind: "coverage-precision",
-        message: `Coverage precision is ${this.report.importSummary.precision}; record JavaScript Per block for code-range decisions.`,
-      });
-    }
-    for (const ignored of this.report.importSummary.ignoredEntries.slice(0, 25)) {
-      gaps.push({ kind: "ignored-coverage-entry", message: `${ignored.url}: ${ignored.reason}` });
-    }
-    return gaps;
+    return this.snapshot.manifest.diagnostics.map((diagnostic) => ({
+      kind: diagnostic.severity,
+      message: diagnostic.message,
+    }));
   }
 
   editorTarget(moduleId: string, sourceId: string | null, line = 1, column = 1) {
     const module = this.#modules.get(moduleId);
     if (!module) return null;
     const selected = sourceId ? this.#files.get(sourceId) : null;
-    const selectedPath = selected?.path ?? "";
-    const resource = isAbsolute(selectedPath)
-      ? selectedPath
+    const resource = isAbsolute(selected?.path ?? "")
+      ? selected?.path
       : String(module.resource ?? "").split("?", 1)[0];
     if (!resource || !isAbsolute(resource)) return null;
     return {

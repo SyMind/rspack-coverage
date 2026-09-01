@@ -53,6 +53,7 @@ export interface BuildModule {
   resource: string | null;
   /** Original source-map sources owned by this Rspack module after loaders. */
   sourcePaths?: string[];
+  moduleType: string;
   chunks: string[];
   issuer: string | null;
   type?: string | null;
@@ -62,7 +63,14 @@ export interface BuildModule {
   size: number;
   usedExports: boolean | string[] | null;
   providedExports: string[] | null;
+  optimizationBailout: string[];
   nested: boolean;
+}
+
+export interface AnalysisCapabilities {
+  usedExports: "enabled" | "disabled" | "unknown";
+  sourceMap: "full" | "line-only" | "none";
+  originalLocations: "exact" | "line-only" | "unavailable";
 }
 
 export interface ReferenceLocation {
@@ -117,6 +125,7 @@ export interface BuildManifest {
   modules: BuildModule[];
   entrypoints: BuildEntrypoint[];
   diagnostics: BuildDiagnostic[];
+  capabilities: AnalysisCapabilities;
   counts: {
     assets: number;
     javascriptAssets: number;
@@ -146,6 +155,7 @@ export interface BuildSnapshot {
   assets: ReadonlyMap<string, Buffer>;
   maps: ReadonlyMap<string, RawSourceMapPayload>;
   originalSources: Map<string, string>;
+  exportGraph: ExportGraphSnapshot;
   references: BuildReference[];
   codeGeneration: Map<string, ModuleCodeGeneration[]>;
   loadCodeGeneration?: (moduleId: string) => ModuleCodeGeneration[];
@@ -241,6 +251,125 @@ export interface ReferenceSnippetResponse {
   location?: ReferenceLocation;
 }
 
+export interface SourcePosition {
+  line: number;
+  column: number;
+}
+
+export interface SourceRange {
+  start: SourcePosition;
+  end: SourcePosition;
+}
+
+export interface ExportGraphModule {
+  id: string;
+  identifier: string;
+  resource: string | null;
+  moduleType: string;
+  chunks: string[];
+  providedExports: string[] | null;
+  usedExports: boolean | string[] | null;
+  optimizationBailout: string[];
+  originalSources: string[];
+  transformedSource: string | null;
+  sourceMap: RawSourceMapPayload | null;
+}
+
+export interface ExportReferenceEdge {
+  originModuleId: string;
+  targetModuleId: string;
+  resolvedModuleId: string | null;
+  dependencyType: string;
+  request: string | null;
+  referencedPath: string[] | null;
+  location: SourceRange | null;
+  active: boolean;
+}
+
+export interface ExportGraphSnapshot {
+  modules: ExportGraphModule[];
+  edges: ExportReferenceEdge[];
+  sourceToModuleIds: Record<string, string[]>;
+}
+
+export type ExportUsageState = "used" | "unused" | "unknown" | "type-only";
+
+export type ExportUsagePrecision = "exact" | "conservative" | "unavailable";
+
+export interface ExportModuleInstance {
+  moduleId: string;
+  identifier: string;
+  resource: string | null;
+  chunks: string[];
+  state: ExportUsageState;
+  precision: ExportUsagePrecision;
+  optimizationBailout: string[];
+}
+
+export interface ExportReference {
+  moduleId: string;
+  path: string;
+  line: number | null;
+  column: number | null;
+  snippet: string | null;
+  dependencyType: string;
+  request: string | null;
+  referencedPath: string[] | null;
+  locationPrecision: "exact" | "line-only" | "unavailable";
+}
+
+export interface SourceExportUsage {
+  id: string;
+  exportedName: string;
+  localName: string | null;
+  range: SourceRange;
+  state: ExportUsageState;
+  precision: ExportUsagePrecision;
+  moduleInstances: ExportModuleInstance[];
+  referenceCount: number;
+  references: ExportReference[];
+  truncated: boolean;
+}
+
+export interface SourceExportUsageReport {
+  buildHash: string;
+  source: string;
+  exports: SourceExportUsage[];
+  diagnostics: string[];
+  directReferencesOnly: true;
+  summary: {
+    total: number;
+    used: number;
+    unused: number;
+    unknown: number;
+    typeOnly: number;
+  };
+}
+
+export type SourceExportAnalysisStatus =
+  | {
+      status: "pending";
+      phase: string;
+      completed: number;
+      total: number;
+    }
+  | { status: "complete"; report: SourceExportUsageReport }
+  | { status: "error"; message: string };
+
+export interface ExportAnalysisInput {
+  buildHash: string;
+  context: string;
+  source: string;
+  content: string;
+  modules: ExportGraphModule[];
+  references: Array<{
+    edge: ExportReferenceEdge;
+    origin: ExportGraphModule | null;
+  }>;
+  usedExportsEnabled: boolean;
+  originalLocations: AnalysisCapabilities["originalLocations"];
+}
+
 export interface SourceLineState {
   line: number;
   text: string;
@@ -256,7 +385,7 @@ export interface SourceLineState {
   }>;
 }
 
-export interface SourceFileReport {
+export interface SourceFileSummary {
   id: string;
   path: string;
   displayPath: string;
@@ -266,7 +395,15 @@ export interface SourceFileReport {
   loadedChunks: string[];
   moduleIds: string[];
   duplicated: boolean;
+}
+
+export interface SourceFileReport extends SourceFileSummary {
   content: string | null;
+  lines: SourceLineState[];
+}
+
+export interface SourceFileDetail {
+  id: string;
   lines: SourceLineState[];
 }
 
@@ -309,28 +446,36 @@ export interface CoverageImportSummary {
 }
 
 export interface CoverageReport {
-  version: 1;
+  version: 2;
   buildHash: string;
   createdAt: number;
   metrics: UsageMetrics;
   importSummary: CoverageImportSummary;
   tree: TreeNodeReport;
-  files: SourceFileReport[];
+  files: SourceFileSummary[];
   chunks: ChunkReport[];
   opportunities: Opportunity[];
 }
 
-export type WorkerRequest = {
-  type: "analyze";
-  build: BuildManifest;
-  coverage: ChromeCoverageEntry[];
-  maps: Record<string, RawSourceMapPayload>;
-  generatedAssets: Record<string, string>;
-  originalSources: Record<string, string>;
-  precision: CoverageImportSummary["precision"];
-};
-
-export type WorkerResponse =
-  | { type: "progress"; phase: string; completed: number; total: number }
-  | { type: "complete"; report: CoverageReport }
-  | { type: "error"; message: string };
+export type CoverageAnalysisStatus =
+  | { status: "idle"; recentAvailable: boolean }
+  | {
+      status: "pending";
+      id: string;
+      phase: string;
+      completed: number;
+      total: number;
+      recentAvailable: boolean;
+    }
+  | {
+      status: "complete";
+      id: string;
+      report: CoverageReport;
+      recentAvailable: boolean;
+    }
+  | {
+      status: "error";
+      id: string;
+      message: string;
+      recentAvailable: boolean;
+    };

@@ -1,13 +1,11 @@
 import type {
   BuildManifest,
-  ChromeCoverageEntry,
-  CodeViewResponse,
+  CoverageAnalysisStatus,
   CoverageImportSummary,
-  CoverageReport,
-  ModuleInvestigationDetail,
   ModuleReferencesResponse,
   ReferenceSnippetResponse,
-  SourceFileReport,
+  SourceExportAnalysisStatus,
+  SourceFileDetail,
 } from "../../shared/types.js";
 
 const PREFIX = "/__rspack_coverage__/api";
@@ -19,83 +17,76 @@ function token(): string {
 }
 
 async function request(path: string, init: RequestInit = {}): Promise<Response> {
-  const response = await fetch(`${PREFIX}${path}`, {
+  const headers = new Headers(init.headers);
+  headers.set("X-Rspack-Coverage-Token", token());
+  const requestInit: RequestInit = {
     ...init,
-    headers: {
-      "X-Rspack-Coverage-Token": token(),
-      ...(init.body ? { "Content-Type": "application/json" } : {}),
-      ...init.headers,
-    },
+    headers,
     cache: "no-store",
-  });
+  };
+  const response = await fetch(`${PREFIX}${path}`, requestInit);
   if (!response.ok) {
     const body = await response.text();
-    let message = body;
-    try {
-      message = (JSON.parse(body) as { error?: string }).error ?? body;
-    } catch {
-      // Preserve plain-text server errors.
-    }
-    throw new Error(`Coverage API ${response.status}: ${message}`);
+    throw new Error(`Coverage API ${response.status}: ${body}`);
   }
   return response;
+}
+
+export async function loadSourceExportStatus(
+  buildHash: string,
+  source: string,
+  signal?: AbortSignal,
+  attempt = 0,
+): Promise<SourceExportAnalysisStatus> {
+  return (await request(
+    `/source-exports?buildHash=${encodeURIComponent(buildHash)}&source=${encodeURIComponent(source)}&attempt=${attempt}`,
+    signal ? { signal } : {},
+  ).then((response) => response.json())) as SourceExportAnalysisStatus;
 }
 
 export async function loadBuild(): Promise<BuildManifest> {
   return (await request("/build")).json() as Promise<BuildManifest>;
 }
 
-export async function analyzeOnServer(
-  coverage: ChromeCoverageEntry[],
+export async function loadCoverageAnalysisStatus(
+  buildHash: string,
+): Promise<CoverageAnalysisStatus> {
+  return (await request(`/coverage-analysis?buildHash=${encodeURIComponent(buildHash)}`).then(
+    (response) => response.json(),
+  )) as CoverageAnalysisStatus;
+}
+
+export async function loadCoverageSource(
+  buildHash: string,
+  fileId: string,
+  signal?: AbortSignal,
+  attempt = 0,
+): Promise<SourceFileDetail> {
+  return (await request(
+    `/coverage-analysis/source?buildHash=${encodeURIComponent(buildHash)}&fileId=${encodeURIComponent(fileId)}&attempt=${attempt}`,
+    signal ? { signal } : {},
+  ).then((response) => response.json())) as SourceFileDetail;
+}
+
+export async function startCoverageAnalysis(
+  buildHash: string,
   precision: CoverageImportSummary["precision"],
-): Promise<CoverageReport> {
-  return (
-    await request("/analyze", {
-      method: "POST",
-      body: JSON.stringify({ coverage, precision }),
-    })
-  ).json() as Promise<CoverageReport>;
+  file: File,
+): Promise<CoverageAnalysisStatus> {
+  return (await request(
+    `/coverage-analysis?buildHash=${encodeURIComponent(buildHash)}&precision=${encodeURIComponent(precision)}`,
+    { method: "POST", body: file },
+  ).then((response) => response.json())) as CoverageAnalysisStatus;
 }
 
-export async function loadCurrentReport(): Promise<CoverageReport | null> {
-  try {
-    return (await request("/report")).json() as Promise<CoverageReport>;
-  } catch (error) {
-    if (error instanceof Error && error.message.includes("Coverage API 404")) return null;
-    throw error;
-  }
-}
-
-export async function loadSource(fileId: string): Promise<SourceFileReport> {
-  return (
-    await request(`/source?id=${encodeURIComponent(fileId)}`)
-  ).json() as Promise<SourceFileReport>;
-}
-
-export async function loadModule(moduleId: string): Promise<ModuleInvestigationDetail> {
-  return (
-    await request(`/modules/${encodeURIComponent(moduleId)}`)
-  ).json() as Promise<ModuleInvestigationDetail>;
-}
-
-export async function loadCode(
-  moduleId: string,
-  input: {
-    view: "source" | "output";
-    sourceId?: string | null;
-    offset?: number;
-    limit?: number;
-  },
-): Promise<CodeViewResponse> {
-  const search = new URLSearchParams({
-    view: input.view,
-    offset: String(input.offset ?? 0),
-    limit: String(input.limit ?? 240_000),
-  });
-  if (input.sourceId) search.set("source", input.sourceId);
-  return (
-    await request(`/modules/${encodeURIComponent(moduleId)}/code?${search}`)
-  ).json() as Promise<CodeViewResponse>;
+export async function reuseCoverageAnalysis(
+  buildHash: string,
+  precision: CoverageImportSummary["precision"],
+): Promise<CoverageAnalysisStatus> {
+  return (await request(
+    `/coverage-analysis/reuse?buildHash=${encodeURIComponent(buildHash)}&precision=${encodeURIComponent(precision)}`,
+    { method: "POST" },
+  ).then((response) => response.json())) as CoverageAnalysisStatus;
 }
 
 export async function loadReferences(
@@ -105,37 +96,13 @@ export async function loadReferences(
   limit = 80,
 ): Promise<ModuleReferencesResponse> {
   const search = new URLSearchParams({ direction, cursor: String(cursor), limit: String(limit) });
-  return (
-    await request(`/modules/${encodeURIComponent(moduleId)}/references?${search}`)
-  ).json() as Promise<ModuleReferencesResponse>;
+  return (await request(`/modules/${encodeURIComponent(moduleId)}/references?${search}`).then(
+    (response) => response.json(),
+  )) as ModuleReferencesResponse;
 }
 
 export async function loadReferenceSnippet(referenceId: string): Promise<ReferenceSnippetResponse> {
-  return (
-    await request(`/references/${encodeURIComponent(referenceId)}/snippet`)
-  ).json() as Promise<ReferenceSnippetResponse>;
-}
-
-export async function loadEvidenceGaps(): Promise<Array<{ kind: string; message: string }>> {
-  return (await request("/evidence-gaps")).json() as Promise<
-    Array<{ kind: string; message: string }>
-  >;
-}
-
-export async function loadAiContext(moduleId: string): Promise<unknown> {
-  return (await request(`/modules/${encodeURIComponent(moduleId)}/context`)).json();
-}
-
-export async function openInEditor(input: {
-  moduleId: string;
-  sourceId: string | null;
-  line?: number;
-  column?: number;
-}): Promise<{ opened: boolean; url: string }> {
-  return (
-    await request("/open-in-editor", {
-      method: "POST",
-      body: JSON.stringify(input),
-    })
-  ).json() as Promise<{ opened: boolean; url: string }>;
+  return (await request(`/references/${encodeURIComponent(referenceId)}/snippet`).then((response) =>
+    response.json(),
+  )) as ReferenceSnippetResponse;
 }

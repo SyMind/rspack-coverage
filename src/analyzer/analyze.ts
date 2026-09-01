@@ -1,5 +1,5 @@
 import { addMetrics, emptyMetrics, finalizeMetrics, metricsFromBytes } from "../shared/metrics.js";
-import { normalizeSourcePath, normalizeUrlPath, sourceCategory } from "../shared/path.js";
+import { normalizeSourcePathForContext, normalizeUrlPath, sourceCategory } from "../shared/path.js";
 import type {
   BuildAsset,
   BuildManifest,
@@ -11,7 +11,8 @@ import type {
   Opportunity,
   RawSourceMapPayload,
   RuntimeState,
-  SourceFileReport,
+  SourceFileDetail,
+  SourceFileSummary,
   SourceLineState,
   TreeNodeReport,
   UsageMetrics,
@@ -20,58 +21,10 @@ import { intersectRanges, mergeRanges } from "./ranges.js";
 import { buildGeneratedSpans } from "./sourceMap.js";
 import { buildUtf8Prefix, splitSourceLines, utf8BytesBetween } from "./utf.js";
 
-export interface MatchedCoverage {
+interface MatchedCoverage {
   asset: BuildAsset;
   text: string;
   ranges: ChromeCoverageRange[];
-}
-
-export type AnalysisCollection<T> = Record<string, T> | ReadonlyMap<string, T>;
-
-export interface CoverageAnalysisInput {
-  build: BuildManifest;
-  coverage: ChromeCoverageEntry[];
-  maps: AnalysisCollection<RawSourceMapPayload>;
-  generatedAssets: AnalysisCollection<string | Uint8Array>;
-  originalSources: AnalysisCollection<string>;
-  precision: CoverageImportSummary["precision"];
-  onProgress?: (phase: string, completed: number, total: number) => void;
-}
-
-export interface CoverageAnalysisResult {
-  report: CoverageReport;
-  matched: Map<string, MatchedCoverage>;
-  lineEvidence: CoverageLineEvidence;
-  analyzedAssetIds: ReadonlySet<string>;
-}
-
-export interface CoverageLineEvidenceItem {
-  emittedBytes: number;
-  loadedBytes: number;
-  executedBytes: number;
-  chunks: ReadonlySet<string>;
-}
-
-export type CoverageLineEvidence = ReadonlyMap<
-  string,
-  ReadonlyMap<number, CoverageLineEvidenceItem>
->;
-
-function collectionGet<T>(collection: AnalysisCollection<T>, key: string): T | undefined {
-  return typeof (collection as ReadonlyMap<string, T>).get === "function"
-    ? (collection as ReadonlyMap<string, T>).get(key)
-    : (collection as Record<string, T>)[key];
-}
-
-function collectionEntries<T>(collection: AnalysisCollection<T>): Array<[string, T]> {
-  return typeof (collection as ReadonlyMap<string, T>).entries === "function"
-    ? [...(collection as ReadonlyMap<string, T>).entries()]
-    : Object.entries(collection as Record<string, T>);
-}
-
-function generatedText(value: string | Uint8Array | undefined): string | undefined {
-  if (typeof value === "string") return value;
-  return value ? new TextDecoder().decode(value) : undefined;
 }
 
 interface MutableLine {
@@ -79,6 +32,7 @@ interface MutableLine {
   loadedBytes: number;
   executedBytes: number;
   chunks: Set<string>;
+  ranges: SourceLineState["ranges"];
 }
 
 interface MutableFile {
@@ -88,6 +42,40 @@ interface MutableFile {
   chunks: Set<string>;
   loadedChunks: Set<string>;
   lines: Map<number, MutableLine>;
+}
+
+interface IndexedSourceModule {
+  id: string;
+  chunks: string[];
+  order: number;
+  reversedResource: string;
+}
+
+interface SourceModuleIndex {
+  byResource: Map<string, IndexedSourceModule[]>;
+  byReversedResource: IndexedSourceModule[];
+}
+
+interface CapturedSourceContentIndex {
+  exact: Map<string, string>;
+  suffix: Map<string, string | null>;
+}
+
+interface StoredSourceLine {
+  lineIndex: number;
+  emittedBytes: number;
+  loadedBytes: number;
+  executedBytes: number;
+  chunks: string[];
+  ranges: SourceLineState["ranges"];
+}
+
+export interface StoredSourceFileDetail {
+  id: string;
+  content: string | null;
+  sourceMapAvailable: boolean;
+  chunks: string[];
+  mappedLines: StoredSourceLine[];
 }
 
 async function contentHash(text: string): Promise<string> {
@@ -106,7 +94,7 @@ function pathMatches(entryUrl: string, asset: BuildAsset): boolean {
   return entryPath === assetPath || entryPath === plainName || entryPath.endsWith(plainName);
 }
 
-export async function matchCoverage(
+async function matchCoverage(
   build: BuildManifest,
   coverage: ChromeCoverageEntry[],
 ): Promise<{
@@ -155,9 +143,47 @@ export async function matchCoverage(
   return { matched, ignored };
 }
 
-function runtimeState(line: { loadedBytes: number; executedBytes: number }): RuntimeState {
+function runtimeState(line: Pick<MutableLine, "loadedBytes" | "executedBytes">): RuntimeState {
   if (line.loadedBytes === 0) return "not-loaded";
   return line.executedBytes > 0 ? "executed" : "not-executed";
+}
+
+export function materializeSourceFileDetail(input: StoredSourceFileDetail): SourceFileDetail {
+  const sourceLines = input.content === null ? [] : splitSourceLines(input.content);
+  let maxMappedLine = -1;
+  const mappedLines = new Map<number, StoredSourceLine>();
+  for (const line of input.mappedLines) {
+    maxMappedLine = Math.max(maxMappedLine, line.lineIndex);
+    mappedLines.set(line.lineIndex, line);
+  }
+  // sourcesContent is authoritative for the source drawer. A malformed or
+  // incompatible map must not manufacture thousands of empty source rows.
+  const lineCount = input.content === null ? maxMappedLine + 1 : sourceLines.length;
+  const lines: SourceLineState[] = [];
+  for (let index = 0; index < lineCount; index += 1) {
+    const mapped = mappedLines.get(index);
+    const text = sourceLines[index] ?? "";
+    const lineRuntimeState = mapped ? runtimeState(mapped) : "not-loaded";
+    lines.push({
+      line: index + 1,
+      text,
+      buildState: mapped?.emittedBytes
+        ? "retained"
+        : text.trim() && input.sourceMapAvailable
+          ? "not-emitted"
+          : "unknown",
+      runtimeState: lineRuntimeState,
+      emittedBytes: mapped?.emittedBytes ?? 0,
+      executedBytes: mapped?.executedBytes ?? 0,
+      chunks: mapped?.chunks ?? input.chunks,
+      ranges:
+        mapped?.ranges.map((range) => ({
+          ...range,
+          executed: lineRuntimeState === "executed",
+        })) ?? [],
+    });
+  }
+  return { id: input.id, lines };
 }
 
 function mutableFile(
@@ -167,10 +193,8 @@ function mutableFile(
 ): MutableFile {
   const existing = files.get(path);
   if (existing) {
-    // Sources captured from the compilation are seeded before emitted maps are
-    // decoded. Keep that source text: loader/output maps may carry a compacted
-    // `sourcesContent` for the same path even though dependency locations use
-    // the original resource coordinates.
+    // Compilation-captured source is seeded before source maps are decoded.
+    // Keep it instead of replacing it with compacted loader `sourcesContent`.
     if (existing.content === null && content !== null) existing.content = content;
     return existing;
   }
@@ -186,19 +210,6 @@ function mutableFile(
   return created;
 }
 
-function normalizeBuildSourcePath(value: string, context: string): string {
-  const source = normalizeSourcePath(value);
-  const normalizedContext = normalizeSourcePath(context);
-  if (source === normalizedContext) return source.split("/").at(-1) ?? source;
-  if (source.startsWith(`${normalizedContext}/`)) return source.slice(normalizedContext.length + 1);
-  return source;
-}
-
-interface CapturedSourceContentIndex {
-  exact: Map<string, string>;
-  suffix: Map<string, string | null>;
-}
-
 function indexCapturedSourceContent(
   index: CapturedSourceContentIndex,
   path: string,
@@ -206,8 +217,8 @@ function indexCapturedSourceContent(
 ): void {
   index.exact.set(path, content);
   const parts = path.split("/").filter(Boolean);
-  // A basename alone is not a stable source identity. Index suffixes with at
-  // least two path segments and mark conflicting suffixes as ambiguous.
+  // A basename alone is not a stable source identity. Keep suffixes with at
+  // least two path segments, and reject suffixes that resolve ambiguously.
   for (let offset = 0; offset < parts.length - 1; offset += 1) {
     const suffix = parts.slice(offset).join("/");
     const existing = index.suffix.get(suffix);
@@ -237,6 +248,8 @@ function addLineBytes(
     loaded: number;
     executed: number;
     chunks: string[];
+    startColumn: number;
+    endColumn: number;
   },
 ): void {
   const line = file.lines.get(lineNumber) ?? {
@@ -244,143 +257,186 @@ function addLineBytes(
     loadedBytes: 0,
     executedBytes: 0,
     chunks: new Set<string>(),
+    ranges: [],
   };
   line.emittedBytes += input.emitted;
   line.loadedBytes += input.loaded;
   line.executedBytes += input.executed;
   for (const chunk of input.chunks) line.chunks.add(chunk);
+  if (input.loaded > 0) {
+    line.ranges.push({
+      startColumn: input.startColumn,
+      endColumn: input.endColumn,
+      executed: input.executed > 0,
+    });
+  }
   file.lines.set(lineNumber, line);
 }
 
-interface ModuleSourceIndex {
-  exact: Map<string, string[]>;
-  suffix: Map<string, string[]>;
+function pathSuffixes(path: string): string[] {
+  const suffixes = [path];
+  let separator = path.indexOf("/");
+  while (separator !== -1) {
+    const suffix = path.slice(separator + 1);
+    if (suffix) suffixes.push(suffix);
+    separator = path.indexOf("/", separator + 1);
+  }
+  return suffixes;
 }
 
-function appendModuleIndex(index: Map<string, string[]>, key: string, moduleId: string): void {
-  const ids = index.get(key) ?? [];
-  if (!ids.includes(moduleId)) ids.push(moduleId);
-  index.set(key, ids);
+function appendIndexedModule(
+  index: Map<string, IndexedSourceModule[]>,
+  path: string,
+  module: IndexedSourceModule,
+): void {
+  const modules = index.get(path);
+  if (modules) modules.push(module);
+  else index.set(path, [module]);
 }
 
-function buildModuleSourceIndex(build: BuildManifest): ModuleSourceIndex {
-  const exact = new Map<string, string[]>();
-  const suffix = new Map<string, string[]>();
-  for (const module of build.modules) {
-    const paths = new Set([
-      ...(module.resource ? [module.resource] : []),
-      ...(module.sourcePaths ?? []),
-    ]);
-    for (const path of paths) {
-      const resource = normalizeBuildSourcePath(path, build.context);
-      appendModuleIndex(exact, resource, module.id);
-      const parts = resource.split("/").filter(Boolean);
-      for (let index = 0; index < parts.length; index += 1) {
-        appendModuleIndex(suffix, parts.slice(index).join("/"), module.id);
-      }
+function reversePath(path: string): string {
+  return path.split("/").reverse().join("/");
+}
+
+function compareText(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function lowerBoundByReversedResource(modules: IndexedSourceModule[], value: string): number {
+  let lower = 0;
+  let upper = modules.length;
+  while (lower < upper) {
+    const middle = lower + Math.floor((upper - lower) / 2);
+    const module = modules[middle] as IndexedSourceModule;
+    if (compareText(module.reversedResource, value) < 0) lower = middle + 1;
+    else upper = middle;
+  }
+  return lower;
+}
+
+function buildSourceModuleIndex(
+  build: BuildManifest,
+  onProgress?: (phase: string, completed: number, total: number) => void,
+): SourceModuleIndex {
+  const byResource = new Map<string, IndexedSourceModule[]>();
+  const byReversedResource: IndexedSourceModule[] = [];
+  let lastProgressAt = Date.now();
+  onProgress?.("Indexing modules", 0, build.modules.length);
+
+  for (let order = 0; order < build.modules.length; order += 1) {
+    const module = build.modules[order];
+    if (module?.resource) {
+      const resource = normalizeSourcePathForContext(module.resource, build.context);
+      const indexed = {
+        id: module.id,
+        chunks: module.chunks,
+        order,
+        reversedResource: reversePath(resource),
+      };
+      appendIndexedModule(byResource, resource, indexed);
+      byReversedResource.push(indexed);
+    }
+
+    const now = Date.now();
+    if (order === build.modules.length - 1 || now - lastProgressAt >= 100) {
+      onProgress?.("Indexing modules", order + 1, build.modules.length);
+      lastProgressAt = now;
     }
   }
-  return { exact, suffix };
-}
 
-function moduleIdsForSource(
-  build: BuildManifest,
-  sourceIndex: ModuleSourceIndex,
-  sourcePath: string,
-): string[] {
-  const normalizedSource = normalizeBuildSourcePath(sourcePath, build.context);
-  const matches = new Set([
-    ...(sourceIndex.exact.get(normalizedSource) ?? []),
-    ...(sourceIndex.suffix.get(normalizedSource) ?? []),
-  ]);
-  const parts = normalizedSource.split("/").filter(Boolean);
-  for (let index = 1; index < parts.length; index += 1) {
-    for (const moduleId of sourceIndex.exact.get(parts.slice(index).join("/")) ?? []) {
-      matches.add(moduleId);
-    }
-  }
-  return [...matches];
-}
-
-function toFileReports(files: Map<string, MutableFile>, build: BuildManifest): SourceFileReport[] {
-  const sourceIndex = buildModuleSourceIndex(build);
-  const chunksByModule = new Map(build.modules.map((module) => [module.id, module.chunks]));
-  return [...files.values()]
-    .map((file) => {
-      finalizeMetrics(file.metrics);
-      const moduleIds = moduleIdsForSource(build, sourceIndex, file.path);
-      const moduleChunks = moduleIds.flatMap((moduleId) => chunksByModule.get(moduleId) ?? []);
-      const chunks = [...new Set([...file.chunks, ...moduleChunks])];
-      const loadedChunks = [...file.loadedChunks];
-      return {
-        id: file.path,
-        path: file.path,
-        displayPath: file.path,
-        category: sourceCategory(file.path),
-        metrics: file.metrics,
-        chunks,
-        loadedChunks,
-        moduleIds,
-        duplicated: new Set(loadedChunks).size > 1,
-        content: file.content,
-        lines: [],
-      } satisfies SourceFileReport;
-    })
-    .sort((a, b) => b.metrics.unusedBytes - a.metrics.unusedBytes || a.path.localeCompare(b.path));
-}
-
-export function materializeSourceFile(
-  file: SourceFileReport,
-  evidence: ReadonlyMap<number, CoverageLineEvidenceItem> | undefined,
-  build: BuildManifest,
-  analyzedAssetIds: ReadonlySet<string>,
-): SourceFileReport {
-  if (file.lines.length > 0 || file.content === null) return file;
-  const sourceLines = splitSourceLines(file.content);
-  const maxMappedLine = Math.max(-1, ...(evidence?.keys() ?? []));
-  // sourcesContent is authoritative. A malformed map must not manufacture
-  // thousands of empty rows beyond the actual captured source.
-  const lineCount = file.content === null ? maxMappedLine + 1 : sourceLines.length;
-  const relevantAssets = build.assets.filter(
-    (asset) =>
-      file.chunks.length === 0 || asset.chunks.some((chunk) => file.chunks.includes(chunk)),
+  byReversedResource.sort(
+    (a, b) => compareText(a.reversedResource, b.reversedResource) || a.order - b.order,
   );
-  const canProveAbsence =
-    relevantAssets.length > 0 &&
-    relevantAssets.every((asset) => asset.mapAvailable && analyzedAssetIds.has(asset.id));
-  const lines: SourceLineState[] = [];
-  for (let index = 0; index < lineCount; index += 1) {
-    const mapped = evidence?.get(index);
-    const text = sourceLines[index] ?? "";
-    const lineRuntimeState = mapped ? runtimeState(mapped) : "not-loaded";
-    lines.push({
-      line: index + 1,
-      text,
-      buildState: mapped?.emittedBytes
-        ? "retained"
-        : text.trim() && canProveAbsence
-          ? "not-emitted"
-          : "unknown",
-      runtimeState: lineRuntimeState,
-      emittedBytes: mapped?.emittedBytes ?? 0,
-      executedBytes: mapped?.executedBytes ?? 0,
-      chunks: mapped ? [...mapped.chunks] : file.chunks,
-      ranges:
-        mapped?.loadedBytes && text.length
-          ? [
-              {
-                startColumn: 0,
-                endColumn: text.length,
-                executed: lineRuntimeState === "executed" || lineRuntimeState === "partial",
-              },
-            ]
-          : [],
-    });
-  }
-  return { ...file, lines };
+  return { byResource, byReversedResource };
 }
 
-function buildTree(files: SourceFileReport[]): TreeNodeReport {
+function modulesForSource(index: SourceModuleIndex, sourcePath: string): IndexedSourceModule[] {
+  const matches = new Map<number, IndexedSourceModule>();
+  const suffixes = pathSuffixes(sourcePath);
+  for (const suffix of suffixes) {
+    for (const module of index.byResource.get(suffix) ?? []) {
+      matches.set(module.order, module);
+    }
+  }
+
+  const reversedPrefix = `${reversePath(sourcePath)}/`;
+  for (
+    let moduleIndex = lowerBoundByReversedResource(index.byReversedResource, reversedPrefix);
+    moduleIndex < index.byReversedResource.length;
+    moduleIndex += 1
+  ) {
+    const module = index.byReversedResource[moduleIndex] as IndexedSourceModule;
+    if (!module.reversedResource.startsWith(reversedPrefix)) break;
+    matches.set(module.order, module);
+  }
+
+  return [...matches.values()].sort((a, b) => a.order - b.order);
+}
+
+async function toFileReports(
+  files: Map<string, MutableFile>,
+  build: BuildManifest,
+  onProgress?: (phase: string, completed: number, total: number) => void,
+  onFileDetail?: (file: StoredSourceFileDetail) => void | Promise<void>,
+): Promise<SourceFileSummary[]> {
+  const sourceFiles = [...files.values()];
+  const reports: SourceFileSummary[] = [];
+  const moduleIndex = buildSourceModuleIndex(build, onProgress);
+  let lastProgressAt = Date.now();
+  onProgress?.("Building file reports", 0, sourceFiles.length);
+
+  for (let index = 0; index < sourceFiles.length; index += 1) {
+    const file = sourceFiles[index] as MutableFile;
+    finalizeMetrics(file.metrics);
+    const modules = modulesForSource(moduleIndex, file.path);
+    const moduleIds: string[] = [];
+    const chunks = new Set(file.chunks);
+    for (const module of modules) {
+      moduleIds.push(module.id);
+      for (const chunk of module.chunks) chunks.add(chunk);
+    }
+    const fileChunks = [...chunks];
+    const loadedChunks = [...file.loadedChunks];
+    const summary: SourceFileSummary = {
+      id: file.path,
+      path: file.path,
+      displayPath: file.path,
+      category: sourceCategory(file.path),
+      metrics: file.metrics,
+      chunks: fileChunks,
+      loadedChunks,
+      moduleIds,
+      duplicated: new Set(loadedChunks).size > 1,
+    };
+    await onFileDetail?.({
+      id: file.path,
+      content: file.content,
+      sourceMapAvailable: build.capabilities.sourceMap !== "none",
+      chunks: fileChunks,
+      mappedLines: [...file.lines].map(([lineIndex, line]) => ({
+        lineIndex,
+        emittedBytes: line.emittedBytes,
+        loadedBytes: line.loadedBytes,
+        executedBytes: line.executedBytes,
+        chunks: [...line.chunks],
+        ranges: line.ranges,
+      })),
+    });
+    reports.push(summary);
+
+    const now = Date.now();
+    if (index === sourceFiles.length - 1 || now - lastProgressAt >= 100) {
+      onProgress?.("Building file reports", index + 1, sourceFiles.length);
+      lastProgressAt = now;
+    }
+  }
+
+  return reports.sort(
+    (a, b) => b.metrics.unusedBytes - a.metrics.unusedBytes || a.path.localeCompare(b.path),
+  );
+}
+
+function buildTree(files: SourceFileSummary[]): TreeNodeReport {
   const root: TreeNodeReport = {
     id: "root",
     name: "Sources",
@@ -392,6 +448,7 @@ function buildTree(files: SourceFileReport[]): TreeNodeReport {
     duplicated: false,
     children: [],
   };
+  const directories = new Map<string, TreeNodeReport>();
 
   for (const file of files) {
     const parts = file.path.split("/").filter(Boolean);
@@ -400,7 +457,7 @@ function buildTree(files: SourceFileReport[]): TreeNodeReport {
     for (let index = 0; index < parts.length - 1; index += 1) {
       const part = parts[index] ?? "[unknown]";
       currentPath = currentPath ? `${currentPath}/${part}` : part;
-      let child = parent.children.find((item) => item.kind === "directory" && item.name === part);
+      let child = directories.get(currentPath);
       if (!child) {
         child = {
           id: `dir:${currentPath}`,
@@ -413,6 +470,7 @@ function buildTree(files: SourceFileReport[]): TreeNodeReport {
           duplicated: false,
           children: [],
         };
+        directories.set(currentPath, child);
         parent.children.push(child);
       } else if (child.category !== file.category) {
         child.category = "mixed";
@@ -470,7 +528,7 @@ function buildTree(files: SourceFileReport[]): TreeNodeReport {
   return root;
 }
 
-function buildOpportunities(files: SourceFileReport[], chunks: ChunkReport[]): Opportunity[] {
+function buildOpportunities(files: SourceFileSummary[], chunks: ChunkReport[]): Opportunity[] {
   const opportunities: Opportunity[] = [];
   for (const file of files) {
     if (file.metrics.loadedBytes === 0) continue;
@@ -551,9 +609,20 @@ function buildOpportunities(files: SourceFileReport[], chunks: ChunkReport[]): O
   return opportunities.sort((a, b) => b.metrics.unusedBytes - a.metrics.unusedBytes).slice(0, 100);
 }
 
-export async function analyzeCoverageWithMatches(
-  input: CoverageAnalysisInput,
-): Promise<CoverageAnalysisResult> {
+export async function analyzeCoverage(input: {
+  build: BuildManifest;
+  coverage: ChromeCoverageEntry[];
+  maps?: Record<string, RawSourceMapPayload>;
+  generatedAssets?: Record<string, string>;
+  originalSources: Record<string, string>;
+  precision: CoverageImportSummary["precision"];
+  onProgress?: (phase: string, completed: number, total: number) => void;
+  onFileDetail?: (file: StoredSourceFileDetail) => void | Promise<void>;
+  loadAsset?: (
+    assetId: string,
+    needsGeneratedSource: boolean,
+  ) => Promise<{ generated?: string; map?: RawSourceMapPayload }>;
+}): Promise<CoverageReport> {
   if (!Array.isArray(input.coverage)) throw new Error("Chrome Coverage JSON must be an array.");
   const { matched, ignored } = await matchCoverage(input.build, input.coverage);
   if (matched.size === 0) {
@@ -565,8 +634,8 @@ export async function analyzeCoverageWithMatches(
     exact: new Map(),
     suffix: new Map(),
   };
-  for (const [source, content] of collectionEntries(input.originalSources)) {
-    const path = normalizeBuildSourcePath(source, input.build.context);
+  for (const [source, content] of Object.entries(input.originalSources)) {
+    const path = normalizeSourcePathForContext(source, input.build.context);
     mutableFile(files, path, content);
     indexCapturedSourceContent(capturedContentIndex, path, content);
   }
@@ -579,19 +648,10 @@ export async function analyzeCoverageWithMatches(
     input.onProgress?.("Mapping generated code", index, input.build.assets.length);
     const coverage = matched.get(asset.id);
     const loaded = Boolean(coverage);
-    if (!loaded) {
-      // Keep the not-loaded byte total exact without claiming source attribution.
-      // Decoding every unloaded source map makes large builds unusable; mapped and
-      // unmapped evidence for those assets stays unknown until selected on demand.
-      const metrics = finalizeMetrics({ ...emptyMetrics(), emittedBytes: asset.size });
-      assetMetrics.set(asset.id, metrics);
-      addMetrics(globalMetrics, metrics);
-      continue;
-    }
-    const generated =
-      coverage?.text ?? generatedText(collectionGet(input.generatedAssets, asset.id));
+    const loadedAsset = input.loadAsset ? await input.loadAsset(asset.id, !coverage) : undefined;
+    const generated = coverage?.text ?? loadedAsset?.generated ?? input.generatedAssets?.[asset.id];
     const ranges = coverage?.ranges ?? [];
-    const map = collectionGet(input.maps, asset.id);
+    const map = loadedAsset?.map ?? input.maps?.[asset.id];
     if (!generated) {
       const metrics = metricsFromBytes({
         emittedBytes: asset.size,
@@ -637,7 +697,7 @@ export async function analyzeCoverageWithMatches(
       addMetrics(currentAssetMetrics, metrics);
 
       const path = span.source
-        ? normalizeBuildSourcePath(span.source, input.build.context)
+        ? normalizeSourcePathForContext(span.source, input.build.context)
         : `[rspack runtime / unmapped]/${asset.name}`;
       const file = mutableFile(
         files,
@@ -650,39 +710,57 @@ export async function analyzeCoverageWithMatches(
         if (loaded) file.loadedChunks.add(chunk);
       }
       if (span.originalLine !== null) {
+        const startColumn = Math.max(0, span.originalColumn ?? 0);
+        const endColumn = Math.max(startColumn + 1, span.originalEndColumn ?? startColumn + 1);
         addLineBytes(file, span.originalLine, {
           emitted: emittedBytes,
           loaded: loaded ? emittedBytes : 0,
           executed: executedBytes,
           chunks: asset.chunks,
+          startColumn,
+          endColumn,
         });
       }
     }
     assetMetrics.set(asset.id, finalizeMetrics(currentAssetMetrics));
     addMetrics(globalMetrics, currentAssetMetrics);
   }
-  input.onProgress?.("Aggregating sources", input.build.assets.length, input.build.assets.length);
+  input.onProgress?.(
+    "Mapping generated code",
+    input.build.assets.length,
+    input.build.assets.length,
+  );
 
-  const fileReports = toFileReports(files, input.build);
+  const fileReports = await toFileReports(files, input.build, input.onProgress, input.onFileDetail);
+  input.onProgress?.("Aggregating report", 0, 1);
   const tree = buildTree(fileReports);
+  const assetsByName = new Map<string, BuildAsset>();
+  for (const asset of input.build.assets) {
+    if (!assetsByName.has(asset.name)) assetsByName.set(asset.name, asset);
+  }
+  const duplicatedSourcesByChunk = new Map<string, number>();
+  for (const file of fileReports) {
+    if (!file.duplicated) continue;
+    for (const chunk of file.chunks) {
+      duplicatedSourcesByChunk.set(chunk, (duplicatedSourcesByChunk.get(chunk) ?? 0) + 1);
+    }
+  }
   const chunks: ChunkReport[] = input.build.chunks.map((chunk) => {
     const metrics = emptyMetrics();
     for (const file of chunk.files) {
-      const asset = input.build.assets.find((candidate) => candidate.name === file);
+      const asset = assetsByName.get(file);
       if (asset) addMetrics(metrics, assetMetrics.get(asset.id) ?? emptyMetrics());
     }
     return {
       ...chunk,
       loaded: loadedChunkIds.has(chunk.id),
       metrics: finalizeMetrics(metrics),
-      duplicatedSources: fileReports.filter(
-        (file) => file.duplicated && file.chunks.includes(chunk.id),
-      ).length,
+      duplicatedSources: duplicatedSourcesByChunk.get(chunk.id) ?? 0,
     };
   });
 
   const report: CoverageReport = {
-    version: 1,
+    version: 2,
     buildHash: input.build.hash,
     createdAt: Date.now(),
     metrics: finalizeMetrics(globalMetrics),
@@ -697,23 +775,6 @@ export async function analyzeCoverageWithMatches(
     chunks,
     opportunities: buildOpportunities(fileReports, chunks),
   };
-  return {
-    report,
-    matched,
-    lineEvidence: new Map([...files].map(([path, file]) => [path, file.lines] as const)),
-    analyzedAssetIds: new Set(matched.keys()),
-  };
-}
-
-export async function analyzeCoverage(input: CoverageAnalysisInput): Promise<CoverageReport> {
-  const result = await analyzeCoverageWithMatches(input);
-  result.report.files = result.report.files.map((file) =>
-    materializeSourceFile(
-      file,
-      result.lineEvidence.get(file.path),
-      input.build,
-      result.analyzedAssetIds,
-    ),
-  );
-  return result.report;
+  input.onProgress?.("Aggregating report", 1, 1);
+  return report;
 }

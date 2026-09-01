@@ -31,6 +31,10 @@ function syntaxNodes(text: string, keyPrefix: string): ReactNode[] {
   return nodes;
 }
 
+export function SyntaxText(props: { text: string; keyPrefix: string }) {
+  return <>{syntaxNodes(props.text, props.keyPrefix)}</>;
+}
+
 function segmentsForLine(
   spans: CodeCoverageSpan[],
   lineStart: number,
@@ -76,10 +80,10 @@ export function CoverageCode(props: { code: CodeViewResponse }) {
                   className={`coverage-segment coverage-${segment.status}`}
                   key={`${start}:${segment.start}:${segment.end}:${segment.status}`}
                 >
-                  {syntaxNodes(
-                    props.code.content.slice(segment.start, segment.end) || " ",
-                    `${start}:${segment.start}`,
-                  )}
+                  <SyntaxText
+                    text={props.code.content.slice(segment.start, segment.end) || " "}
+                    keyPrefix={`${start}:${segment.start}`}
+                  />
                 </span>
               ))}
             </code>

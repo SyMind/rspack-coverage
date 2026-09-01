@@ -3,7 +3,7 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { SourceFileReport, TreeNodeReport, UsageMetrics } from "../../src/shared/types.js";
+import type { SourceFileSummary, TreeNodeReport, UsageMetrics } from "../../src/shared/types.js";
 import { SourceExplorer, sortModuleSources } from "../../src/ui/components/SourceExplorer.js";
 
 vi.mock("@tanstack/react-virtual", () => ({
@@ -37,9 +37,9 @@ function metrics(unusedBytes: number, loadedBytes = unusedBytes + 100): UsageMet
 function source(
   path: string,
   unusedBytes: number,
-  category: SourceFileReport["category"] = "first-party",
+  category: SourceFileSummary["category"] = "first-party",
   duplicated = false,
-): SourceFileReport {
+): SourceFileSummary {
   return {
     id: path,
     path,
@@ -50,12 +50,10 @@ function source(
     loadedChunks: duplicated ? ["main", "lazy"] : ["main"],
     moduleIds: [],
     duplicated,
-    content: "export {};",
-    lines: [],
   };
 }
 
-function fileNode(file: SourceFileReport): TreeNodeReport {
+function fileNode(file: SourceFileSummary): TreeNodeReport {
   return {
     id: `file:${file.id}`,
     name: file.path.split("/").at(-1) ?? file.path,

@@ -9,6 +9,7 @@ export default {
   mode: "production",
   context: directory,
   entry: "./src/index.js",
+  devtool: "hidden-source-map",
   output: {
     path: join(directory, "dist"),
     filename: "static/[name].[contenthash:8].js",

@@ -38,12 +38,14 @@ function manifest(): BuildManifest {
         readableIdentifier: "./src/consumer.js",
         name: "./src/consumer.js",
         resource: "/project/src/consumer.js",
+        moduleType: "javascript/auto",
         chunks: [],
         issuer: null,
         entry: true,
         size: 20,
         usedExports: true,
         providedExports: null,
+        optimizationBailout: [],
         nested: false,
       },
       {
@@ -52,17 +54,24 @@ function manifest(): BuildManifest {
         readableIdentifier: "./src/target.js",
         name: "./src/target.js",
         resource: "/project/src/target.js",
+        moduleType: "javascript/auto",
         chunks: [],
         issuer: "./src/consumer.js",
         entry: false,
         size: 20,
         usedExports: ["value"],
         providedExports: ["value"],
+        optimizationBailout: [],
         nested: false,
       },
     ],
     entrypoints: [],
     diagnostics: [],
+    capabilities: {
+      usedExports: "enabled",
+      sourceMap: "full",
+      originalLocations: "exact",
+    },
     counts: {
       assets: 0,
       javascriptAssets: 0,
@@ -118,7 +127,7 @@ function source(
 
 function report(files: SourceFileReport[]): CoverageReport {
   return {
-    version: 1,
+    version: 2,
     buildHash: "build",
     createdAt: 1,
     metrics: metrics(),
@@ -153,6 +162,7 @@ function snapshot(files: SourceFileReport[]): BuildSnapshot {
     originalSources: new Map(
       files.flatMap((file) => (file.content ? [[file.path, file.content]] : [])),
     ),
+    exportGraph: { modules: [], edges: [], sourceToModuleIds: {} },
     references: [
       {
         id: "edge",

@@ -1,20 +1,23 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   BuildManifest,
-  ChromeCoverageEntry,
+  CoverageAnalysisStatus,
   CoverageImportSummary,
   CoverageReport,
-  SourceFileReport,
+  SourceFileSummary,
 } from "../shared/types.js";
 import { ChunksView } from "./components/ChunksView.js";
-import { EvidenceGapsDialog } from "./components/EvidenceGapsDialog.js";
 import { MetricCard } from "./components/MetricCard.js";
 import { OpportunitiesView } from "./components/OpportunitiesView.js";
 import { SetupGuide } from "./components/SetupGuide.js";
 import { SourceDrawer } from "./components/SourceDrawer.js";
 import { SourceExplorer } from "./components/SourceExplorer.js";
-import { analyzeOnServer, loadBuild, loadCurrentReport, loadEvidenceGaps } from "./lib/api.js";
-import { loadRecording, saveRecording, saveReport } from "./lib/storage.js";
+import {
+  loadBuild,
+  loadCoverageAnalysisStatus,
+  reuseCoverageAnalysis,
+  startCoverageAnalysis,
+} from "./lib/api.js";
 
 type Tab = "sources" | "chunks" | "opportunities";
 
@@ -22,48 +25,76 @@ export function App() {
   const [build, setBuild] = useState<BuildManifest | null>(null);
   const [report, setReport] = useState<CoverageReport | null>(null);
   const [tab, setTab] = useState<Tab>("sources");
-  const [selectedFile, setSelectedFile] = useState<SourceFileReport | null>(null);
+  const [selectedFile, setSelectedFile] = useState<SourceFileSummary | null>(null);
   const [precision, setPrecision] = useState<CoverageImportSummary["precision"]>("per-block");
   const [recentAvailable, setRecentAvailable] = useState(false);
   const [progress, setProgress] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [evidenceGaps, setEvidenceGaps] = useState<Array<{ kind: string; message: string }>>([]);
-  const [evidenceOpen, setEvidenceOpen] = useState(false);
+  const pollingGeneration = useRef(0);
+
+  const followAnalysis = useCallback(
+    async (
+      buildHash: string,
+      initialStatus: CoverageAnalysisStatus,
+      generation = ++pollingGeneration.current,
+    ) => {
+      let status = initialStatus;
+      while (generation === pollingGeneration.current) {
+        setRecentAvailable(status.recentAvailable);
+        if (status.status === "idle") {
+          setProgress(null);
+          return;
+        }
+        if (status.status === "error") {
+          setProgress(null);
+          setError(status.message);
+          return;
+        }
+        if (status.status === "complete") {
+          setReport(status.report);
+          setPrecision(status.report.importSummary.precision);
+          setProgress(null);
+          setTab("sources");
+          return;
+        }
+        setProgress(`${status.phase} · ${status.completed}/${status.total}`);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        if (generation !== pollingGeneration.current) return;
+        status = await loadCoverageAnalysisStatus(buildHash);
+      }
+    },
+    [],
+  );
+
+  const followSafely = useCallback(
+    (buildHash: string, status: CoverageAnalysisStatus) => {
+      void followAnalysis(buildHash, status).catch((cause) => {
+        setProgress(null);
+        setError(cause instanceof Error ? cause.message : String(cause));
+      });
+    },
+    [followAnalysis],
+  );
 
   useEffect(() => {
     void loadBuild()
       .then(async (nextBuild) => {
         setBuild(nextBuild);
-        const [recording, currentReport] = await Promise.all([
-          loadRecording(nextBuild.hash),
-          loadCurrentReport(),
-        ]);
-        setRecentAvailable(Boolean(recording));
-        if (recording) setPrecision(recording.precision);
-        if (currentReport?.buildHash === nextBuild.hash) setReport(currentReport);
+        const status = await loadCoverageAnalysisStatus(nextBuild.hash);
+        followSafely(nextBuild.hash, status);
       })
       .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
-  }, []);
+    return () => {
+      pollingGeneration.current += 1;
+    };
+  }, [followSafely]);
 
-  useEffect(() => {
-    if (!report) return;
-    void loadEvidenceGaps()
-      .then(setEvidenceGaps)
-      .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
-    const moduleId = new URL(location.href).searchParams.get("module");
-    if (moduleId && !selectedFile) {
-      const file = report.files.find((candidate) => candidate.moduleIds.includes(moduleId));
-      if (file) setSelectedFile(file);
-    }
-  }, [report, selectedFile]);
-
-  const runAnalysis = async (coverage: ChromeCoverageEntry[], fileName: string) => {
+  const runAnalysis = async (file: File) => {
     if (!build) return;
+    pollingGeneration.current += 1;
     setError(null);
     try {
-      if (!Array.isArray(coverage))
-        throw new Error("Chrome Coverage JSON must contain an array of entries.");
-      setProgress(`Validating ${fileName} against build ${build.hash.slice(0, 10)}…`);
+      setProgress(`Uploading ${file.name} to the local Node process…`);
       const currentBuild = await loadBuild();
       if (currentBuild.hash !== build.hash) {
         setBuild(currentBuild);
@@ -72,19 +103,9 @@ export function App() {
           "The build changed while this page was open. Import Coverage recorded from the updated preview.",
         );
       }
-      await saveRecording({
-        buildHash: currentBuild.hash,
-        coverage,
-        precision,
-        savedAt: Date.now(),
-      });
+      const status = await startCoverageAnalysis(currentBuild.hash, precision, file);
       setRecentAvailable(true);
-      setProgress("Mapping generated ranges to modules and original sources on the local server…");
-      const nextReport = await analyzeOnServer(coverage, precision);
-      setReport(nextReport);
-      setProgress(null);
-      setTab("sources");
-      await saveReport(nextReport);
+      followSafely(currentBuild.hash, status);
     } catch (cause) {
       setProgress(null);
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -93,8 +114,16 @@ export function App() {
 
   const reuseRecent = async () => {
     if (!build) return;
-    const recording = await loadRecording(build.hash);
-    if (recording) void runAnalysis(recording.coverage, "saved recording");
+    pollingGeneration.current += 1;
+    setError(null);
+    setProgress("Starting Node analysis from the recent recording…");
+    try {
+      const status = await reuseCoverageAnalysis(build.hash, precision);
+      followSafely(build.hash, status);
+    } catch (cause) {
+      setProgress(null);
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
   };
 
   const loadedChunkCount = useMemo(
@@ -117,36 +146,22 @@ export function App() {
         <a className="brand" href="/__rspack_coverage__/">
           <span className="brand-mark">R</span>
           <span>
-            Rspack Coverage<small>runtime-to-module investigation</small>
+            Rspack Coverage<small>runtime-to-source analysis</small>
           </span>
         </a>
         <div className="build-status">
           <span className="status-light" /> Build {build.hash.slice(0, 10)}
           <small>{build.mode}</small>
         </div>
-        <div className="topbar-actions">
-          {report ? (
-            <>
-              <button
-                type="button"
-                className="button button--secondary"
-                onClick={() => setEvidenceOpen(true)}
-              >
-                Evidence gaps <span className="button-count">{evidenceGaps.length}</span>
-              </button>
-              <button
-                type="button"
-                className="button button--secondary"
-                onClick={() => {
-                  setSelectedFile(null);
-                  setReport(null);
-                }}
-              >
-                Import another recording
-              </button>
-            </>
-          ) : null}
-        </div>
+        {report ? (
+          <button
+            type="button"
+            className="button button--secondary"
+            onClick={() => setReport(null)}
+          >
+            Import another recording
+          </button>
+        ) : null}
       </header>
 
       {!report ? (
@@ -154,7 +169,7 @@ export function App() {
           build={build}
           precision={precision}
           onPrecisionChange={setPrecision}
-          onImport={(coverage, fileName) => void runAnalysis(coverage, fileName)}
+          onImport={(file) => void runAnalysis(file)}
           recentAvailable={recentAvailable}
           onReuseRecent={() => void reuseRecent()}
           error={error}
@@ -165,17 +180,16 @@ export function App() {
           <section className="report-heading">
             <div>
               <span className="eyebrow">Imported user journey</span>
-              <h1>Module coverage, source evidence, and reference paths</h1>
+              <h1>What loaded, what ran, what remained</h1>
               <p>
                 {report.importSummary.matchedAssets} matched assets ·{" "}
-                {build.counts.modules.toLocaleString()} modules ·{" "}
-                {(build.counts.references ?? 0).toLocaleString()} references ·{" "}
+                {report.importSummary.ignoredEntries.length} ignored ·{" "}
                 {report.importSummary.precision.replace("-", " ")} precision
               </p>
             </div>
             {report.importSummary.precision !== "per-block" ? (
               <div className="precision-warning">
-                Low/unknown precision: record with JavaScript Per block for code-range decisions.
+                Low/unknown precision: record with JavaScript Per block for line-level decisions.
               </div>
             ) : null}
           </section>
@@ -187,7 +201,7 @@ export function App() {
             />
             <MetricCard label="Executed" value={report.metrics.executedBytes} tone="green" />
             <MetricCard
-              label="Unexecuted"
+              label="Unused"
               value={report.metrics.unusedBytes}
               tone="orange"
               note="loaded, not executed"
@@ -247,22 +261,16 @@ export function App() {
         </main>
       )}
       <SourceDrawer
-        key={selectedFile?.id ?? "closed"}
+        key={`${build.hash}:${selectedFile?.id ?? "closed"}`}
+        buildHash={build.hash}
         file={selectedFile}
-        modules={build.modules}
         onClose={() => {
           setSelectedFile(null);
           const url = new URL(location.href);
           url.searchParams.delete("module");
-          url.searchParams.delete("view");
-          url.searchParams.delete("source");
+          url.searchParams.delete("export");
           history.replaceState(null, "", url);
         }}
-      />
-      <EvidenceGapsDialog
-        open={evidenceOpen}
-        gaps={evidenceGaps}
-        onClose={() => setEvidenceOpen(false)}
       />
     </div>
   );

@@ -5,6 +5,7 @@ import { GREATEST_LOWER_BOUND, originalPositionFor, TraceMap } from "@jridgewell
 import type { Compiler, Stats } from "@rspack/core";
 import { assetUrlPath, normalizeSourcePath } from "../shared/path.js";
 import type {
+  AnalysisCapabilities,
   BuildAsset,
   BuildChunk,
   BuildDiagnostic,
@@ -17,6 +18,7 @@ import type {
   RawSourceMapPayload,
   ReferenceLocation,
 } from "../shared/types.js";
+import { collectExportGraph } from "./exportGraph.js";
 
 const JAVASCRIPT_ASSET_RE = /\.(?:js|mjs|cjs)$/i;
 const NON_JAVASCRIPT_SOURCE_RE =
@@ -390,6 +392,7 @@ function collectModules(rawModules: any[], entryIdentifiers: Set<string>): Build
       readableIdentifier,
       name: readableIdentifier,
       resource,
+      moduleType: String(raw.moduleType ?? raw.type ?? "unknown"),
       chunks,
       issuer: raw.issuerName ? String(raw.issuerName) : null,
       type: raw.moduleType ? String(raw.moduleType) : null,
@@ -403,6 +406,9 @@ function collectModules(rawModules: any[], entryIdentifiers: Set<string>): Build
             ? raw.usedExports.map(String)
             : null,
       providedExports: Array.isArray(raw.providedExports) ? raw.providedExports.map(String) : null,
+      optimizationBailout: Array.isArray(raw.optimizationBailout)
+        ? raw.optimizationBailout.map(String)
+        : [],
       nested,
     });
 
@@ -491,6 +497,7 @@ function addMissingNestedModules(
       readableIdentifier,
       name: readableIdentifier,
       resource: resource ? String(resource) : null,
+      moduleType: type || "unknown",
       chunks: rawChunks.length ? rawChunks : (parent?.chunks ?? []),
       issuer: issuerModule ? moduleIdentifier(issuerModule) : null,
       type: type || null,
@@ -499,6 +506,7 @@ function addMissingNestedModules(
       size: Number(safeCall(() => record.module.size?.(), 0) ?? 0),
       usedExports: null,
       providedExports: Array.isArray(providedExports) ? providedExports.map(String) : null,
+      optimizationBailout: [],
       nested: record.nested,
     };
     modules.push(created);
@@ -790,6 +798,28 @@ function createCodeGenerationStore(
   };
 }
 
+function capabilities(compiler: Compiler, sourceMapCount: number): AnalysisCapabilities {
+  const usedExports = compiler.options.optimization?.usedExports;
+  const devtool = compiler.options.devtool;
+  const sourceMap =
+    sourceMapCount === 0
+      ? "none"
+      : typeof devtool === "string" && devtool.includes("cheap")
+        ? "line-only"
+        : "full";
+  return {
+    usedExports:
+      usedExports === true || usedExports === "global"
+        ? "enabled"
+        : usedExports === false
+          ? "disabled"
+          : "unknown",
+    sourceMap,
+    originalLocations:
+      sourceMap === "full" ? "exact" : sourceMap === "line-only" ? "line-only" : "unavailable",
+  };
+}
+
 function collectEntrypoints(raw: Record<string, any> | undefined): BuildEntrypoint[] {
   if (!raw) return [];
   return Object.entries(raw).map(([name, value]) => ({
@@ -890,6 +920,10 @@ export function createBuildSnapshot(
   addMissingNestedModules(compilation, rawModuleRecords, modules, entryIdentifiers);
   const modulesByIdentifier = moduleLookup(modules);
   const originalSources = collectOriginalSources(rawModuleRecords, modulesByIdentifier);
+  const exportData = collectExportGraph(compilation, modules, compiler.context);
+  for (const [source, content] of exportData.originalSources) {
+    if (!originalSources.sources.has(source)) originalSources.sources.set(source, content);
+  }
   const references = collectReferences(
     compilation,
     rawModuleRecords,
@@ -963,6 +997,7 @@ export function createBuildSnapshot(
     modules,
     entrypoints: collectEntrypoints(json.entrypoints),
     diagnostics,
+    capabilities: capabilities(compiler, maps.size),
     counts: {
       assets: compilation.getAssets().length,
       javascriptAssets: manifestAssets.length,
@@ -983,6 +1018,7 @@ export function createBuildSnapshot(
     assets,
     maps,
     originalSources: originalSources.sources,
+    exportGraph: exportData.graph,
     references,
     codeGeneration: codeGenerationStore.cache,
     loadCodeGeneration: codeGenerationStore.load,

@@ -43,6 +43,7 @@
     "verify": "pnpm format:check && pnpm typecheck && pnpm test && pnpm build"
   },
   "dependencies": {
+    "@babel/parser": "7.28.4",
     "@jridgewell/trace-mapping": "0.3.31",
     "@tanstack/react-virtual": "3.14.10",
     "react": "19.2.8",

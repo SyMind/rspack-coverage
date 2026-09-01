@@ -1,12 +1,21 @@
-import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dirname, extname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { analyzeCoverageWithMatches } from "../analyzer/analyze.js";
 import type { ResolvedRspackCoveragePluginOptions } from "../plugin/types.js";
-import type { BuildSnapshot, ChromeCoverageEntry, CoverageImportSummary } from "../shared/types.js";
+import type { BuildSnapshot } from "../shared/types.js";
+import {
+  CoverageAnalysisService,
+  type CoverageAnalysisView,
+  CoverageBuildChangedError,
+  CoverageReportNotReadyError,
+  CoverageUploadTooLargeError,
+  MissingCoverageRecordingError,
+  MissingCoverageSourceError,
+  parseCoveragePrecision,
+} from "./CoverageAnalysisService.js";
+import { ExportAnalysisService } from "./ExportAnalysisService.js";
 import { InvestigationModel } from "./InvestigationModel.js";
 
 const ANALYSIS_PREFIX = "/__rspack_coverage__/";
@@ -48,62 +57,15 @@ function safeDecode(value: string): string {
   }
 }
 
-async function requestJson(request: IncomingMessage, maximumBytes = 1024 * 1024 * 1024) {
-  const chunks: Buffer[] = [];
-  let bytes = 0;
-  for await (const chunk of request) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    bytes += buffer.byteLength;
-    if (bytes > maximumBytes)
-      throw new Error("Request body exceeds the 1 GiB local analysis limit");
-    chunks.push(buffer);
-  }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
-}
-
-function vscodeUrl(target: { path: string; line: number; column: number }): string {
-  const normalized = target.path.replace(/\\/g, "/");
-  const encoded = normalized
-    .split("/")
-    .map((part) => encodeURIComponent(part))
-    .join("/");
-  return `vscode://file${encoded.startsWith("/") ? encoded : `/${encoded}`}:${target.line}:${target.column}`;
-}
-
-function openEditor(target: { path: string; line: number; column: number }) {
-  const goto = `${target.path}:${target.line}:${target.column}`;
-  const editor = process.env.RSPACK_COVERAGE_EDITOR || "code";
-  const result = spawnSync(editor, ["--goto", goto], { stdio: "ignore", timeout: 5_000 });
-  if (result.status === 0) return { opened: true, method: editor, url: vscodeUrl(target) };
-  if (process.platform === "darwin") {
-    const fallback = spawnSync("open", [vscodeUrl(target)], { stdio: "ignore", timeout: 5_000 });
-    return { opened: fallback.status === 0, method: "vscode-url", url: vscodeUrl(target) };
-  }
-  return { opened: false, method: null, url: vscodeUrl(target) };
-}
-
 export class AnalysisServer {
   readonly token = randomBytes(24).toString("base64url");
   #snapshot: BuildSnapshot | null = null;
-  #investigation: InvestigationModel | null = null;
-  #server = createServer((request, response) => {
-    void this.#handle(request, response).catch((error: unknown) => {
-      if (response.headersSent) {
-        response.destroy();
-        return;
-      }
-      const message = error instanceof Error ? error.message : "Coverage analysis failed";
-      const invalidInput =
-        error instanceof SyntaxError ||
-        message.startsWith("Chrome Coverage") ||
-        message.startsWith("No JavaScript assets") ||
-        message.startsWith("Request body exceeds") ||
-        message.includes("does not match build");
-      sendJson(response, invalidInput ? 400 : 500, { error: message });
-    });
-  });
+  #server = createServer((request, response) => void this.#handle(request, response));
   #port: number | null = null;
   #uiDirectory: string;
+  #coverageAnalysis = new CoverageAnalysisService();
+  #exportAnalysis = new ExportAnalysisService();
+  #investigation: InvestigationModel | null = null;
 
   constructor(private readonly options: ResolvedRspackCoveragePluginOptions) {
     const moduleDirectory = dirname(fileURLToPath(import.meta.url));
@@ -126,8 +88,12 @@ export class AnalysisServer {
   }
 
   update(snapshot: BuildSnapshot): void {
+    if (this.#snapshot?.manifest.hash !== snapshot.manifest.hash) {
+      this.#coverageAnalysis.update(snapshot);
+      this.#exportAnalysis.reset();
+    }
     this.#snapshot = snapshot;
-    this.#investigation = null;
+    this.#investigation = new InvestigationModel(snapshot);
   }
 
   async start(): Promise<number> {
@@ -159,6 +125,7 @@ export class AnalysisServer {
   }
 
   async close(): Promise<void> {
+    await Promise.all([this.#coverageAnalysis.close(), this.#exportAnalysis.close()]);
     if (!this.#server.listening) return;
     await new Promise<void>((resolvePromise, reject) => {
       this.#server.close((error) => (error ? reject(error) : resolvePromise()));
@@ -183,12 +150,6 @@ export class AnalysisServer {
       sendJson(response, 403, { error: "Invalid host" });
       return;
     }
-    if (request.method !== "GET" && request.method !== "HEAD" && request.method !== "POST") {
-      response.writeHead(405, { Allow: "GET, HEAD, POST" });
-      response.end();
-      return;
-    }
-
     const url = new URL(request.url ?? "/", this.origin ?? "http://127.0.0.1");
     const pathname = safeDecode(url.pathname);
 
@@ -197,7 +158,17 @@ export class AnalysisServer {
         sendJson(response, 401, { error: "Missing or invalid analysis token" });
         return;
       }
-      await this.#serveApi(request, pathname, url, response);
+      try {
+        await this.#serveApi(request, pathname, url, response);
+      } catch (error) {
+        this.#serveApiError(error, response);
+      }
+      return;
+    }
+
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      response.writeHead(405, { Allow: "GET, HEAD" });
+      response.end();
       return;
     }
 
@@ -220,6 +191,68 @@ export class AnalysisServer {
       sendJson(response, 503, { error: "Build data is not ready" });
       return;
     }
+    if (pathname === `${ANALYSIS_PREFIX}api/coverage-analysis`) {
+      const buildHash = url.searchParams.get("buildHash");
+      if (!buildHash) {
+        sendJson(response, 400, { error: "buildHash is required" });
+        return;
+      }
+      if (request.method === "POST") {
+        const status = await this.#coverageAnalysis.submit(
+          buildHash,
+          request,
+          parseCoveragePrecision(url.searchParams.get("precision")),
+        );
+        sendJson(response, 202, status);
+        return;
+      }
+      if (request.method === "GET" || request.method === "HEAD") {
+        this.#serveCoverageAnalysis(this.#coverageAnalysis.view(buildHash), response);
+        return;
+      }
+      response.writeHead(405, { Allow: "GET, HEAD, POST" });
+      response.end();
+      return;
+    }
+    if (pathname === `${ANALYSIS_PREFIX}api/coverage-analysis/reuse`) {
+      if (request.method !== "POST") {
+        response.writeHead(405, { Allow: "POST" });
+        response.end();
+        return;
+      }
+      const buildHash = url.searchParams.get("buildHash");
+      if (!buildHash) {
+        sendJson(response, 400, { error: "buildHash is required" });
+        return;
+      }
+      const status = await this.#coverageAnalysis.reuse(
+        buildHash,
+        parseCoveragePrecision(url.searchParams.get("precision")),
+      );
+      sendJson(response, 202, status);
+      return;
+    }
+    if (pathname === `${ANALYSIS_PREFIX}api/coverage-analysis/source`) {
+      if (request.method !== "GET") {
+        response.writeHead(405, { Allow: "GET" });
+        response.end();
+        return;
+      }
+      const buildHash = url.searchParams.get("buildHash");
+      const fileId = url.searchParams.get("fileId");
+      if (!buildHash || !fileId) {
+        sendJson(response, 400, { error: "buildHash and fileId are required" });
+        return;
+      }
+      const source = await this.#coverageAnalysis.source(buildHash, fileId);
+      sendJson(response, 200, source);
+      return;
+    }
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      response.writeHead(405, { Allow: "GET, HEAD" });
+      response.end();
+      return;
+    }
     if (pathname === `${ANALYSIS_PREFIX}api/build`) {
       sendJson(response, 200, snapshot.manifest);
       return;
@@ -228,62 +261,23 @@ export class AnalysisServer {
       sendJson(response, 200, snapshot.manifest.chunks);
       return;
     }
-    if (pathname === `${ANALYSIS_PREFIX}api/sources`) {
-      sendJson(
-        response,
-        200,
-        [...snapshot.originalSources].map(([path, content]) => ({
-          path,
-          characters: content.length,
-        })),
-      );
-      return;
-    }
-    if (pathname === `${ANALYSIS_PREFIX}api/analyze` && request.method === "POST") {
-      const body = (await requestJson(request)) as {
-        coverage?: ChromeCoverageEntry[];
-        precision?: CoverageImportSummary["precision"];
-      };
-      if (!Array.isArray(body.coverage)) {
-        sendJson(response, 400, { error: "Chrome Coverage JSON must contain an array of entries" });
+    if (pathname === `${ANALYSIS_PREFIX}api/source-exports`) {
+      const buildHash = url.searchParams.get("buildHash");
+      const source = url.searchParams.get("source");
+      if (!buildHash || !source) {
+        sendJson(response, 400, { error: "buildHash and source are required" });
         return;
       }
-      const precision = ["per-block", "per-function", "unknown"].includes(String(body.precision))
-        ? (body.precision as CoverageImportSummary["precision"])
-        : "unknown";
-      const result = await analyzeCoverageWithMatches({
-        build: snapshot.manifest,
-        coverage: body.coverage,
-        maps: snapshot.maps,
-        generatedAssets: snapshot.assets,
-        originalSources: snapshot.originalSources,
-        precision,
-      });
-      this.#investigation = new InvestigationModel(
-        snapshot,
-        result.report,
-        result.matched,
-        result.lineEvidence,
-        result.analyzedAssetIds,
-      );
-      sendJson(response, 200, this.#investigation.summary);
-      return;
-    }
-    if (pathname === `${ANALYSIS_PREFIX}api/report`) {
-      if (!this.#investigation) {
-        sendJson(response, 404, { error: "No recording has been analyzed by this server" });
+      if (buildHash !== snapshot.manifest.hash) {
+        sendJson(response, 409, {
+          error: "The build changed. Refresh the report and import Coverage for the latest build.",
+        });
         return;
       }
-      sendJson(response, 200, this.#investigation.summary);
-      return;
-    }
-    if (pathname === `${ANALYSIS_PREFIX}api/source`) {
-      if (!this.#investigation) {
-        sendJson(response, 409, { error: "Analyze a recording before loading source details" });
-        return;
-      }
-      const source = this.#investigation.source(url.searchParams.get("id") ?? "");
-      sendJson(response, source ? 200 : 404, source ?? { error: "Unknown source" });
+      const status = this.#exportAnalysis.request(snapshot, source);
+      if (status.status === "pending") sendJson(response, 202, status);
+      else if (status.status === "error") sendJson(response, 500, status);
+      else sendJson(response, 200, status);
       return;
     }
     if (pathname === `${ANALYSIS_PREFIX}api/evidence-gaps`) {
@@ -292,26 +286,23 @@ export class AnalysisServer {
     }
     const moduleMatch = pathname.match(/\/api\/modules\/([^/]+)(?:\/(code|references|context))?$/);
     if (moduleMatch) {
-      if (!this.#investigation) {
-        sendJson(response, 409, { error: "Analyze a recording before investigating modules" });
-        return;
-      }
       const moduleId = moduleMatch[1] ?? "";
       const action = moduleMatch[2] ?? "detail";
       if (action === "detail") {
-        const detail = this.#investigation.module(moduleId);
+        const detail = this.#investigation?.module(moduleId) ?? null;
         sendJson(response, detail ? 200 : 404, detail ?? { error: "Unknown module" });
         return;
       }
       if (action === "code") {
         const view = url.searchParams.get("view") === "output" ? "output" : "source";
-        const code = this.#investigation.code(
-          moduleId,
-          view,
-          url.searchParams.get("source"),
-          Number(url.searchParams.get("offset") ?? 0),
-          Number(url.searchParams.get("limit") ?? 240_000),
-        );
+        const code =
+          this.#investigation?.code(
+            moduleId,
+            view,
+            url.searchParams.get("source"),
+            Number(url.searchParams.get("offset") ?? 0),
+            Number(url.searchParams.get("limit") ?? 240_000),
+          ) ?? null;
         sendJson(response, code ? 200 : 404, code ?? { error: "Unknown module" });
         return;
       }
@@ -319,77 +310,75 @@ export class AnalysisServer {
         const requestedDirection = url.searchParams.get("direction");
         const direction =
           requestedDirection === "in" || requestedDirection === "out" ? requestedDirection : "both";
-        const references = this.#investigation.references(
-          moduleId,
-          direction,
-          Number(url.searchParams.get("cursor") ?? 0),
-          Number(url.searchParams.get("limit") ?? 80),
-        );
+        const references =
+          this.#investigation?.references(
+            moduleId,
+            direction,
+            Number(url.searchParams.get("cursor") ?? 0),
+            Number(url.searchParams.get("limit") ?? 80),
+          ) ?? null;
         sendJson(response, references ? 200 : 404, references ?? { error: "Unknown module" });
         return;
       }
-      const context = this.#investigation.aiContext(moduleId);
+      const context = this.#investigation?.aiContext(moduleId) ?? null;
       sendJson(response, context ? 200 : 404, context ?? { error: "Unknown module" });
       return;
     }
     const snippetMatch = pathname.match(/\/api\/references\/([^/]+)\/snippet$/);
     if (snippetMatch) {
-      if (!this.#investigation) {
-        sendJson(response, 409, { error: "Analyze a recording before loading references" });
-        return;
-      }
-      const snippet = this.#investigation.snippet(
-        snippetMatch[1] ?? "",
-        Number(url.searchParams.get("context") ?? 3),
-      );
+      const snippet =
+        this.#investigation?.snippet(
+          snippetMatch[1] ?? "",
+          Number(url.searchParams.get("context") ?? 3),
+        ) ?? null;
       sendJson(response, snippet ? 200 : 404, snippet ?? { error: "Unknown reference" });
       return;
     }
-    if (pathname === `${ANALYSIS_PREFIX}api/open-in-editor` && request.method === "POST") {
-      if (!this.#investigation) {
-        sendJson(response, 409, { error: "Analyze a recording before opening source" });
-        return;
-      }
-      const body = (await requestJson(request, 64 * 1024)) as {
-        moduleId?: string;
-        sourceId?: string | null;
-        line?: number;
-        column?: number;
-      };
-      const target = this.#investigation.editorTarget(
-        String(body.moduleId ?? ""),
-        body.sourceId ?? null,
-        Number(body.line ?? 1),
-        Number(body.column ?? 1),
-      );
-      if (!target) {
-        sendJson(response, 400, { error: "The selected module has no local absolute source path" });
-        return;
-      }
-      sendJson(response, 200, { target, ...openEditor(target) });
-      return;
-    }
-    const assetMatch = pathname.match(/\/api\/asset\/([^/]+)$/);
-    if (assetMatch) {
-      const content = snapshot.assets.get(assetMatch[1] ?? "");
-      if (!content) return void sendJson(response, 404, { error: "Unknown asset" });
-      response.writeHead(200, {
-        "Content-Type": "text/javascript; charset=utf-8",
-        "Content-Length": content.byteLength,
-        "Cache-Control": "no-store",
-        "X-Content-Type-Options": "nosniff",
-      });
-      response.end(content);
-      return;
-    }
-    const mapMatch = pathname.match(/\/api\/map\/([^/]+)$/);
-    if (mapMatch) {
-      const map = snapshot.maps.get(mapMatch[1] ?? "");
-      if (!map) return void sendJson(response, 404, { error: "Source map unavailable" });
-      sendJson(response, 200, map);
-      return;
-    }
     sendJson(response, 404, { error: "Unknown API route" });
+  }
+
+  #serveCoverageAnalysis(status: CoverageAnalysisView, response: ServerResponse): void {
+    if (status.status !== "complete-file") {
+      sendJson(response, status.status === "pending" ? 202 : 200, status);
+      return;
+    }
+    if (!existsSync(status.reportFile)) {
+      sendJson(response, 500, { error: "Coverage report file is unavailable" });
+      return;
+    }
+    response.writeHead(200, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Content-Length": statSync(status.reportFile).size,
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    });
+    createReadStream(status.reportFile).pipe(response);
+  }
+
+  #serveApiError(error: unknown, response: ServerResponse): void {
+    if (response.headersSent) {
+      response.destroy(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+    if (error instanceof CoverageUploadTooLargeError) {
+      sendJson(response, 413, { error: error.message });
+    } else if (error instanceof CoverageBuildChangedError) {
+      sendJson(response, 409, { error: error.message });
+    } else if (error instanceof MissingCoverageRecordingError) {
+      sendJson(response, 404, { error: error.message });
+    } else if (error instanceof CoverageReportNotReadyError) {
+      sendJson(response, 409, { error: error.message });
+    } else if (error instanceof MissingCoverageSourceError) {
+      sendJson(response, 404, { error: error.message });
+    } else if (error instanceof SyntaxError || error instanceof TypeError) {
+      sendJson(response, 400, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } else {
+      sendJson(response, 500, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   #serveAnalysisUi(pathname: string, response: ServerResponse): void {
@@ -418,7 +407,7 @@ export class AnalysisServer {
       "X-Content-Type-Options": "nosniff",
       "Cross-Origin-Opener-Policy": "same-origin",
       "Content-Security-Policy":
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; worker-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
     };
     if (file.endsWith("index.html")) {
       const html = readFileSync(file, "utf8").replace(
