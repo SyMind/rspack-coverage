@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { type Compiler, HtmlRspackPlugin, rspack, type Stats } from "@rspack/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RspackCoveragePlugin } from "../../src/plugin/RspackCoveragePlugin.js";
+import type { AnalysisServer } from "../../src/server/AnalysisServer.js";
+import { startStoredCoverage } from "../../src/server/startStoredCoverage.js";
 import type { CoverageAnalysisStatus } from "../../src/shared/types.js";
 
 async function waitForCoverageAnalysis(
@@ -25,12 +27,15 @@ async function waitForCoverageAnalysis(
 
 describe("RspackCoveragePlugin", () => {
   let compiler: Compiler | null = null;
+  let standaloneServer: AnalysisServer | null = null;
   let temporaryDirectory: string | null = null;
   const originalTestFlag = process.env.RSPACK_COVERAGE_TEST;
 
   afterEach(async () => {
     if (compiler) await new Promise<void>((resolve) => compiler?.close(() => resolve()));
     compiler = null;
+    await standaloneServer?.close();
+    standaloneServer = null;
     if (temporaryDirectory) await rm(temporaryDirectory, { recursive: true, force: true });
     temporaryDirectory = null;
     if (originalTestFlag === undefined) delete process.env.RSPACK_COVERAGE_TEST;
@@ -200,10 +205,13 @@ describe("RspackCoveragePlugin", () => {
       { headers },
     ).then((response) => response.json())) as {
       total: number;
+      counts: { in: number; out: number; both: number };
       edges: Array<{ id: string; exports: string[] | null }>;
       entryPath: Array<{ entry: boolean }>;
     };
     expect(references.total).toBeGreaterThan(0);
+    expect(references.counts.in).toBe(references.total);
+    expect(references.counts.both).toBeGreaterThanOrEqual(references.counts.in);
     expect(references.entryPath.at(-1)?.entry).toBe(true);
     const liveReference = references.edges.find((edge) => edge.exports?.includes("live"));
     expect(liveReference).toBeTruthy();
@@ -212,11 +220,18 @@ describe("RspackCoveragePlugin", () => {
       { headers },
     ).then((response) => response.json())) as {
       available: boolean;
-      content: string;
+      code: {
+        content: string;
+        spans: Array<{ status: string }>;
+      };
       highlight: { start: number; end: number };
     };
     expect(snippet.available).toBe(true);
-    expect(snippet.content.slice(snippet.highlight.start, snippet.highlight.end)).toContain("live");
+    expect(snippet.code.content).toContain("document.body");
+    expect(snippet.code.content.slice(snippet.highlight.start, snippet.highlight.end)).toContain(
+      "live",
+    );
+    expect(snippet.code.spans.some((span) => span.status !== "unknown")).toBe(true);
 
     const reuse = await fetch(
       `${origin}/__rspack_coverage__/api/coverage-analysis/reuse?buildHash=${encodeURIComponent(manifest.hash)}&precision=per-function`,
@@ -249,6 +264,152 @@ describe("RspackCoveragePlugin", () => {
     expect(compiler.options.optimization.minimize).toBe(true);
     expect(warn).not.toHaveBeenCalled();
     temporaryDirectory = null;
+  });
+
+  it("reopens the latest build and Coverage report after the compiler closes", async () => {
+    process.env.RSPACK_COVERAGE_TEST = "true";
+    temporaryDirectory = await mkdtemp(join(tmpdir(), "rspack-coverage-reopen-"));
+    const entry = join(temporaryDirectory, "index.js");
+    const output = join(temporaryDirectory, "dist");
+    const dataDirectory = join(temporaryDirectory, "coverage-data");
+    await writeFile(entry, "document.body.textContent = 'restored';\n");
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    compiler = rspack({
+      mode: "production",
+      context: temporaryDirectory,
+      entry,
+      devtool: false,
+      output: { path: output, filename: "main.js", publicPath: "auto", clean: true },
+      plugins: [
+        new HtmlRspackPlugin(),
+        new RspackCoveragePlugin({
+          port: 49880,
+          open: false,
+          dataDir: dataDirectory,
+        }),
+      ],
+    });
+    const stats = await new Promise<Stats>((resolve, reject) => {
+      compiler?.run((error, result) =>
+        error ? reject(error) : result ? resolve(result) : reject(new Error("Missing stats")),
+      );
+    });
+    expect(stats.hasErrors()).toBe(false);
+    const firstOrigin = log.mock.calls
+      .flat()
+      .join("\n")
+      .match(/http:\/\/127\.0\.0\.1:\d+/)?.[0];
+    expect(firstOrigin).toBeTruthy();
+    const firstHtml = await fetch(`${firstOrigin}/__rspack_coverage__/`).then((response) =>
+      response.text(),
+    );
+    const firstToken = firstHtml.match(/name="rspack-coverage-token" content="([^"]+)"/)?.[1];
+    const firstHeaders = { "X-Rspack-Coverage-Token": firstToken ?? "" };
+    const manifest = (await fetch(`${firstOrigin}/__rspack_coverage__/api/build`, {
+      headers: firstHeaders,
+    }).then((response) => response.json())) as { hash: string };
+    const generated = await readFile(join(output, "main.js"), "utf8");
+    await fetch(
+      `${firstOrigin}/__rspack_coverage__/api/coverage-analysis?buildHash=${encodeURIComponent(manifest.hash)}&precision=per-block`,
+      {
+        method: "POST",
+        headers: firstHeaders,
+        body: JSON.stringify([
+          {
+            url: `${firstOrigin}/main.js`,
+            text: generated,
+            ranges: [{ start: 0, end: generated.length }],
+          },
+        ]),
+      },
+    );
+    const completed = await waitForCoverageAnalysis(
+      firstOrigin as string,
+      firstHeaders,
+      manifest.hash,
+    );
+    expect(completed.status).toBe("complete");
+    const snapshotDownload = await fetch(`${firstOrigin}/__rspack_coverage__/api/snapshot`, {
+      headers: firstHeaders,
+    });
+    expect(snapshotDownload.status).toBe(200);
+    expect(snapshotDownload.headers.get("content-disposition")).toContain(".rspack-coverage");
+    const portableSnapshot = Buffer.from(await snapshotDownload.arrayBuffer());
+    expect(portableSnapshot.byteLength).toBeGreaterThan(0);
+
+    await new Promise<void>((resolve) => compiler?.close(() => resolve()));
+    compiler = null;
+    await rm(output, { recursive: true, force: true });
+    await rm(entry, { force: true });
+
+    const restored = await startStoredCoverage({
+      cwd: temporaryDirectory,
+      dataDir: dataDirectory,
+      port: 49920,
+      open: false,
+    });
+    standaloneServer = restored.server;
+    expect(restored.snapshot?.manifest.hash).toBe(manifest.hash);
+    expect(await fetch(`${restored.origin}/`).then((response) => response.text())).toContain(
+      "<script",
+    );
+    expect(await fetch(`${restored.origin}/main.js`).then((response) => response.text())).toBe(
+      generated,
+    );
+    const restoredHtml = await fetch(`${restored.origin}/__rspack_coverage__/`).then((response) =>
+      response.text(),
+    );
+    const restoredToken = restoredHtml.match(/name="rspack-coverage-token" content="([^"]+)"/)?.[1];
+    const restoredHeaders = { "X-Rspack-Coverage-Token": restoredToken ?? "" };
+    const snapshotUpload = await fetch(`${restored.origin}/__rspack_coverage__/api/snapshot`, {
+      method: "POST",
+      headers: restoredHeaders,
+      body: portableSnapshot,
+    });
+    expect(snapshotUpload.status).toBe(200);
+    expect(await snapshotUpload.json()).toMatchObject({
+      bytes: portableSnapshot.byteLength,
+      build: { hash: manifest.hash },
+    });
+    const restoredStatus = (await fetch(
+      `${restored.origin}/__rspack_coverage__/api/coverage-analysis?buildHash=${encodeURIComponent(manifest.hash)}`,
+      { headers: restoredHeaders },
+    ).then((response) => response.json())) as CoverageAnalysisStatus;
+    expect(restoredStatus.status).toBe("complete");
+    if (restoredStatus.status === "complete") {
+      expect(restoredStatus.report.importSummary.matchedAssets).toBe(1);
+    }
+  });
+
+  it("opens an upload-ready workbench when no saved snapshot exists", async () => {
+    temporaryDirectory = await mkdtemp(join(tmpdir(), "rspack-coverage-empty-"));
+    const running = await startStoredCoverage({
+      cwd: temporaryDirectory,
+      dataDir: join(temporaryDirectory, "empty-data"),
+      port: 49940,
+      open: false,
+    });
+    standaloneServer = running.server;
+    expect(running.snapshot).toBeNull();
+    const html = await fetch(`${running.origin}/__rspack_coverage__/`).then((response) =>
+      response.text(),
+    );
+    const token = html.match(/name="rspack-coverage-token" content="([^"]+)"/)?.[1];
+    expect(token).toBeTruthy();
+    expect(
+      await fetch(`${running.origin}/__rspack_coverage__/api/build`, {
+        headers: { "X-Rspack-Coverage-Token": token ?? "" },
+      }).then((response) => response.status),
+    ).toBe(503);
+    expect(
+      await fetch(`${running.origin}/__rspack_coverage__/api/snapshot`, {
+        method: "POST",
+        headers: { "X-Rspack-Coverage-Token": token ?? "" },
+        body: "not a snapshot",
+      }).then((response) => response.status),
+    ).toBe(400);
   });
 
   it("serves on-demand export usage from Stats and the direct ModuleGraph", async () => {

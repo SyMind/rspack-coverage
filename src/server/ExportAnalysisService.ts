@@ -7,10 +7,14 @@ import { normalizeSourcePathForContext } from "../shared/path.js";
 import type {
   BuildSnapshot,
   ExportAnalysisInput,
+  ExportGraphModule,
+  ExportReferenceEdge,
   SourceExportAnalysisStatus,
   SourceExportUsageReport,
 } from "../shared/types.js";
 import { analyzeSourceExports } from "./exportAnalysis.js";
+
+const MAX_EXPORT_ANALYSIS_REFERENCES = 25_000;
 
 interface Job {
   id: string;
@@ -27,10 +31,13 @@ type WorkerMessage =
 function sourceKey(snapshot: BuildSnapshot, requested: string): string | null {
   const normalized = normalizeSourcePathForContext(requested, snapshot.manifest.context);
   if (snapshot.originalSources.has(normalized)) return normalized;
-  const matches = [...snapshot.originalSources.keys()].filter(
-    (source) => source.endsWith(`/${normalized}`) || normalized.endsWith(`/${source}`),
-  );
-  return matches.length === 1 ? (matches[0] ?? null) : null;
+  let match: string | null = null;
+  for (const source of snapshot.originalSources.keys()) {
+    if (!source.endsWith(`/${normalized}`) && !normalized.endsWith(`/${source}`)) continue;
+    if (match !== null) return null;
+    match = source;
+  }
+  return match;
 }
 
 function matchesSource(snapshot: BuildSnapshot, candidate: string, source: string): boolean {
@@ -45,9 +52,12 @@ function prepareInput(snapshot: BuildSnapshot, requested: string): ExportAnalysi
     sourceKey(snapshot, requested) ??
     normalizeSourcePathForContext(requested, snapshot.manifest.context);
   let content = snapshot.originalSources.get(source) ?? "";
-  const directIds = snapshot.exportGraph.sourceToModuleIds[source] ?? [];
+  const directIds =
+    snapshot.exportGraphStore?.moduleIdsForSource(source) ??
+    snapshot.exportGraph.sourceToModuleIds[source] ??
+    [];
   const moduleIds = new Set(directIds);
-  if (moduleIds.size === 0) {
+  if (moduleIds.size === 0 && !snapshot.exportGraphStore) {
     for (const [candidate, ids] of Object.entries(snapshot.exportGraph.sourceToModuleIds)) {
       if (candidate.endsWith(`/${source}`) || source.endsWith(`/${candidate}`)) {
         for (const id of ids) moduleIds.add(id);
@@ -65,15 +75,21 @@ function prepareInput(snapshot: BuildSnapshot, requested: string): ExportAnalysi
       }
     }
   }
-  const graphModulesById = new Map(
+  const manifestModules = new Map(snapshot.manifest.modules.map((module) => [module.id, module]));
+  const inMemoryGraphModules = new Map(
     snapshot.exportGraph.modules.map((module) => [module.id, module]),
   );
-  const modulesById = new Map(
-    snapshot.manifest.modules.map((module) => {
-      const captured = graphModulesById.get(module.id);
-      return [
-        module.id,
-        captured ?? {
+  const moduleCache = new Map<string, ExportGraphModule | undefined>();
+  const moduleForId = (id: string) => {
+    if (moduleCache.has(id)) return moduleCache.get(id);
+    const captured = snapshot.exportGraphStore?.getModule(id) ?? inMemoryGraphModules.get(id);
+    if (captured) {
+      moduleCache.set(id, captured);
+      return captured;
+    }
+    const module = manifestModules.get(id);
+    const resolved = module
+      ? {
           id: module.id,
           identifier: module.identifier,
           resource: module.resource,
@@ -85,38 +101,88 @@ function prepareInput(snapshot: BuildSnapshot, requested: string): ExportAnalysi
           originalSources: module.sourcePaths ?? (module.resource ? [module.resource] : []),
           transformedSource: null,
           sourceMap: null,
-        },
-      ] as const;
-    }),
-  );
-  for (const [id, module] of graphModulesById) modulesById.set(id, module);
+        }
+      : undefined;
+    moduleCache.set(id, resolved);
+    return resolved;
+  };
+  const inferredOriginCache = new Map<string, ExportGraphModule>();
+  const originForEdge = (edge: ExportReferenceEdge): ExportGraphModule | null => {
+    const origin = moduleForId(edge.originModuleId);
+    if (
+      !origin ||
+      origin.transformedSource ||
+      edge.referencedPath !== null ||
+      !edge.dependencyType.toLowerCase().includes("cjs")
+    ) {
+      return origin ?? null;
+    }
+    const cached = inferredOriginCache.get(origin.id);
+    if (cached) return cached;
+    const manifestModule = manifestModules.get(origin.id);
+    const candidates = manifestModule
+      ? [manifestModule.resource, ...(manifestModule.sourcePaths ?? [])]
+      : [origin.resource, ...origin.originalSources];
+    let transformedSource: string | null = null;
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      const key = sourceKey(snapshot, candidate);
+      if (!key) continue;
+      const content = snapshot.originalSources.get(key);
+      if (content === undefined) continue;
+      transformedSource = content;
+      break;
+    }
+    if (transformedSource === null) return origin;
+    const inferredOrigin = { ...origin, transformedSource };
+    inferredOriginCache.set(origin.id, inferredOrigin);
+    return inferredOrigin;
+  };
   const modules = [...moduleIds].flatMap((id) => {
-    const module = modulesById.get(id);
+    const module = moduleForId(id);
     return module ? [module] : [];
   });
-  const references = snapshot.exportGraph.edges
-    .filter((edge) => moduleIds.has(edge.targetModuleId))
-    .map((edge) => ({ edge, origin: modulesById.get(edge.originModuleId) ?? null }));
+  const buildReferenceCount =
+    snapshot.referenceStore?.countTargets(moduleIds) ??
+    snapshot.references.reduce(
+      (total, reference) => total + Number(moduleIds.has(reference.targetId)),
+      0,
+    );
+  if (buildReferenceCount > MAX_EXPORT_ANALYSIS_REFERENCES) {
+    throw new Error(
+      `Export analysis for ${source} has ${buildReferenceCount} direct references; the safe in-memory limit is ${MAX_EXPORT_ANALYSIS_REFERENCES}. Use the paged module reference view for the complete edge ledger.`,
+    );
+  }
+  const graphEdges = snapshot.exportGraphStore
+    ? snapshot.exportGraphStore.edgesForTargets(moduleIds)
+    : snapshot.exportGraph.edges.filter((edge) => moduleIds.has(edge.targetModuleId));
+  const references = graphEdges.map((edge) => ({
+    edge,
+    origin: originForEdge(edge),
+  }));
   const referenceKeys = new Set(
     references.map(({ edge }) => `${edge.originModuleId}\0${edge.targetModuleId}\0${edge.request}`),
   );
-  for (const reference of snapshot.references) {
+  const buildReferences =
+    snapshot.referenceStore?.forTargets(moduleIds) ??
+    snapshot.references.filter((reference) => moduleIds.has(reference.targetId));
+  for (const reference of buildReferences) {
     if (!moduleIds.has(reference.targetId)) continue;
     const key = `${reference.originId}\0${reference.targetId}\0${reference.request}`;
     if (referenceKeys.has(key)) continue;
-    references.push({
-      edge: {
-        originModuleId: reference.originId,
-        targetModuleId: reference.targetId,
-        resolvedModuleId: reference.targetId,
-        dependencyType: reference.dependencyType ?? "unknown",
-        request: reference.request,
-        referencedPath: reference.exports,
-        location: reference.sourceLocation ?? reference.location,
-        active: reference.active !== false,
-      },
-      origin: modulesById.get(reference.originId) ?? null,
-    });
+    const edge: ExportReferenceEdge = {
+      originModuleId: reference.originId,
+      targetModuleId: reference.targetId,
+      resolvedModuleId: reference.targetId,
+      dependencyType: reference.dependencyType ?? "unknown",
+      request: reference.request,
+      referencedPath: reference.exports,
+      location: reference.sourceLocation ?? reference.location,
+      active: reference.active !== false,
+      sourcePath: reference.sourcePath ?? null,
+      originalLocation: Boolean(reference.sourcePath && reference.sourceLocation),
+    };
+    references.push({ edge, origin: originForEdge(edge) });
   }
   return {
     buildHash: snapshot.manifest.hash,
@@ -160,7 +226,14 @@ export class ExportAnalysisService {
     };
     this.#jobsByKey.set(key, job);
     this.#jobsById.set(job.id, job);
-    this.#run(job, prepareInput(snapshot, normalized));
+    try {
+      this.#run(job, prepareInput(snapshot, normalized));
+    } catch (error) {
+      job.status = {
+        status: "error",
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
     return job.status;
   }
 

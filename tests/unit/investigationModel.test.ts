@@ -240,12 +240,23 @@ describe("InvestigationModel", () => {
 
     const references = model.references("target", "in", 0, 1);
     expect(references?.total).toBe(1);
+    expect(references?.counts).toEqual({ in: 1, out: 0, both: 1 });
     expect(references?.entryPath.map((module) => module.id)).toEqual(["target", "consumer"]);
-    expect(model.snippet("edge")).toMatchObject({
+    const snippet = model.snippet("edge");
+    expect(snippet).toMatchObject({
       available: true,
       filename: "src/consumer.js",
       highlight: { coverageStatus: "executed" },
+      code: {
+        content: 'import { value } from "./target.js";',
+        spans: [{ status: "executed" }],
+        hasPrevious: false,
+        hasNext: false,
+      },
     });
+    expect(snippet?.code?.content.slice(snippet.highlight?.start, snippet.highlight?.end)).toBe(
+      "value",
+    );
   });
 
   it("finds the dependency request when Rspack does not expose a usable location", () => {
@@ -270,7 +281,7 @@ describe("InvestigationModel", () => {
         end: { line: 2 },
       },
     });
-    expect(snippet?.content?.slice(snippet.highlight?.start, snippet.highlight?.end)).toBe(
+    expect(snippet?.code?.content.slice(snippet.highlight?.start, snippet.highlight?.end)).toBe(
       "./target.js",
     );
   });
@@ -300,7 +311,7 @@ describe("InvestigationModel", () => {
       filename: "src/internal.ts",
       location: edge.sourceLocation,
     });
-    expect(snippet?.content?.slice(snippet.highlight?.start, snippet.highlight?.end)).toBe(
+    expect(snippet?.code?.content.slice(snippet.highlight?.start, snippet.highlight?.end)).toBe(
       "TARGET",
     );
   });

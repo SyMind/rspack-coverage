@@ -1,9 +1,11 @@
 import { extname, isAbsolute } from "node:path";
+import { sourceFileCoverageSpans } from "../shared/codeCoverage.js";
 import { emptyMetrics, finalizeMetrics, metricsForModuleInstance } from "../shared/metrics.js";
 import { normalizeSourcePath } from "../shared/path.js";
 import type {
   BuildModule,
   BuildReference,
+  BuildReferenceStore,
   BuildSnapshot,
   CodeViewResponse,
   CoverageReport,
@@ -16,6 +18,7 @@ import type {
   SourceLineState,
   UsageMetrics,
 } from "../shared/types.js";
+import { createInMemoryReferenceStore } from "./referenceStore.js";
 
 const DEFAULT_CODE_LIMIT = 240_000;
 
@@ -156,10 +159,18 @@ export class InvestigationModel {
   readonly #modules: Map<string, BuildModule>;
   readonly #files = new Map<string, SourceFileSummary>();
   readonly #filesByModule = new Map<string, SourceFileSummary[]>();
-  readonly #references: Map<string, BuildReference>;
-  readonly #incoming = new Map<string, string[]>();
-  readonly #outgoing = new Map<string, string[]>();
+  readonly #referenceStore: BuildReferenceStore;
   readonly #entryPathCache = new Map<string, BuildModule[]>();
+
+  #cacheEntryPath(moduleId: string, path: BuildModule[]): void {
+    this.#entryPathCache.delete(moduleId);
+    this.#entryPathCache.set(moduleId, path);
+    while (this.#entryPathCache.size > 128) {
+      const oldest = this.#entryPathCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.#entryPathCache.delete(oldest);
+    }
+  }
 
   constructor(
     readonly snapshot: BuildSnapshot,
@@ -178,28 +189,21 @@ export class InvestigationModel {
         this.#filesByModule.set(moduleId, files);
       }
     }
-    this.#references = new Map(snapshot.references.map((reference) => [reference.id, reference]));
-    for (const reference of snapshot.references) {
-      const incoming = this.#incoming.get(reference.targetId) ?? [];
-      incoming.push(reference.id);
-      this.#incoming.set(reference.targetId, incoming);
-      const outgoing = this.#outgoing.get(reference.originId) ?? [];
-      outgoing.push(reference.id);
-      this.#outgoing.set(reference.originId, outgoing);
-    }
+    this.#referenceStore =
+      snapshot.referenceStore ?? createInMemoryReferenceStore(snapshot.references);
   }
 
-  #sourceCandidates(path: string): Array<{ path: string; content: string }> {
+  #sourceCandidates(path: string): Array<{ key: string; path: string }> {
     const normalized = normalizeBuildSourcePath(path, this.snapshot.manifest.context);
-    const candidates: Array<{ path: string; content: string }> = [];
-    for (const [candidate, content] of this.snapshot.originalSources) {
+    const candidates: Array<{ key: string; path: string }> = [];
+    for (const candidate of this.snapshot.originalSources.keys()) {
       const current = normalizeBuildSourcePath(candidate, this.snapshot.manifest.context);
       if (
         current === normalized ||
         current.endsWith(`/${normalized}`) ||
         normalized.endsWith(`/${current}`)
       ) {
-        candidates.push({ path: current, content });
+        candidates.push({ key: candidate, path: current });
       }
     }
     return candidates.sort(
@@ -210,7 +214,8 @@ export class InvestigationModel {
   }
 
   #sourceContent(path: string): string | null {
-    return this.#sourceCandidates(path)[0]?.content ?? null;
+    const candidate = this.#sourceCandidates(path)[0];
+    return candidate ? (this.snapshot.originalSources.get(candidate.key) ?? null) : null;
   }
 
   #filesForModule(moduleId: string): SourceFileSummary[] {
@@ -272,8 +277,8 @@ export class InvestigationModel {
         };
       }),
       metrics,
-      incomingReferences: this.#incoming.get(moduleId)?.length ?? 0,
-      outgoingReferences: this.#outgoing.get(moduleId)?.length ?? 0,
+      incomingReferences: this.#referenceStore.count(moduleId, "in"),
+      outgoingReferences: this.#referenceStore.count(moduleId, "out"),
       views: {
         source,
         output: hasMappedOutput || codeGeneration,
@@ -311,7 +316,7 @@ export class InvestigationModel {
           filename: detail?.path ?? module.name,
           language: extname(detail?.path ?? module.name).slice(1) || "javascript",
           content,
-          spans: content ? [{ start: 0, end: content.length, status: "unknown" }] : [],
+          spans: detail ? sourceFileCoverageSpans(detail) : [],
           provenance: content ? "captured-original-source" : "unavailable",
           gap: content ? null : "Source content is unavailable",
         },
@@ -355,18 +360,17 @@ export class InvestigationModel {
           const module = this.#modules.get(id);
           return module ? [module] : [];
         });
-        this.#entryPathCache.set(moduleId, result);
+        this.#cacheEntryPath(moduleId, result);
         return result;
       }
       if (!currentId) continue;
-      for (const referenceId of this.#incoming.get(currentId) ?? []) {
-        const consumer = this.#references.get(referenceId)?.originId;
+      for (const consumer of this.#referenceStore.incomingOrigins(currentId)) {
         if (!consumer || visited.has(consumer)) continue;
         visited.add(consumer);
         queue.push([...path, consumer]);
       }
     }
-    this.#entryPathCache.set(moduleId, []);
+    this.#cacheEntryPath(moduleId, []);
     return [];
   }
 
@@ -378,28 +382,23 @@ export class InvestigationModel {
   ): ModuleReferencesResponse | null {
     const module = this.#modules.get(moduleId);
     if (!module) return null;
-    const ids =
-      direction === "in"
-        ? (this.#incoming.get(moduleId) ?? [])
-        : direction === "out"
-          ? (this.#outgoing.get(moduleId) ?? [])
-          : [
-              ...new Set([
-                ...(this.#incoming.get(moduleId) ?? []),
-                ...(this.#outgoing.get(moduleId) ?? []),
-              ]),
-            ];
     const safeCursor = Math.max(0, Math.trunc(cursor || 0));
     const safeLimit = Math.max(1, Math.min(250, Math.trunc(limit || 80)));
-    const page = ids.slice(safeCursor, safeCursor + safeLimit);
+    const counts = {
+      in: this.#referenceStore.count(moduleId, "in"),
+      out: this.#referenceStore.count(moduleId, "out"),
+      both: this.#referenceStore.count(moduleId, "both"),
+    };
+    const total = counts[direction];
+    const page = this.#referenceStore.page(moduleId, direction, safeCursor, safeLimit);
     return {
       module,
       direction,
-      total: ids.length,
+      counts,
+      total,
       cursor: safeCursor,
-      nextCursor: safeCursor + page.length < ids.length ? safeCursor + page.length : null,
-      edges: page.flatMap((id) => {
-        const edge = this.#references.get(id);
+      nextCursor: safeCursor + page.length < total ? safeCursor + page.length : null,
+      edges: page.flatMap((edge) => {
         const origin = edge ? this.#modules.get(edge.originId) : null;
         const target = edge ? this.#modules.get(edge.targetId) : null;
         return edge && origin && target ? [{ ...edge, origin, target }] : [];
@@ -408,60 +407,88 @@ export class InvestigationModel {
     };
   }
 
-  snippet(referenceId: string, contextLines = 3): ReferenceSnippetResponse | null {
-    const edge = this.#references.get(referenceId);
+  snippet(referenceId: string, _contextLines = 3): ReferenceSnippetResponse | null {
+    const edge = this.#referenceStore.get(referenceId);
     if (!edge) return null;
     const origin = this.#modules.get(edge.originId);
     const requestedPath = edge.sourcePath ?? origin?.resource ?? null;
     const compilerLocation = edge.sourceLocation ?? edge.location;
     const candidates = requestedPath ? this.#sourceCandidates(requestedPath) : [];
-    const selected =
-      candidates.find((candidate) => locationFitsContent(candidate.content, compilerLocation)) ??
-      candidates.find((candidate) =>
-        searchedReferenceLocation(candidate.content, edge, compilerLocation),
-      ) ??
-      candidates[0];
+    let selected: { path: string; content: string; location: ReferenceLocation } | null = null;
+    for (const candidate of candidates) {
+      const content = this.snapshot.originalSources.get(candidate.key);
+      if (content !== undefined && locationFitsContent(content, compilerLocation)) {
+        selected = {
+          path: candidate.path,
+          content,
+          location: compilerLocation as ReferenceLocation,
+        };
+        break;
+      }
+    }
+    if (!selected) {
+      for (const candidate of candidates) {
+        const content = this.snapshot.originalSources.get(candidate.key);
+        const location = content
+          ? searchedReferenceLocation(content, edge, compilerLocation)
+          : null;
+        if (content !== undefined && location) {
+          selected = { path: candidate.path, content, location };
+          break;
+        }
+      }
+    }
     const content = selected?.content ?? null;
-    const location = content
-      ? locationFitsContent(content, compilerLocation)
-        ? compilerLocation
-        : searchedReferenceLocation(content, edge, compilerLocation)
-      : null;
+    const location = selected?.location ?? null;
     if (!selected || !content || !location) {
       return {
         edge,
         available: false,
-        gap: content
-          ? "Reference location is unavailable and the dependency request was not found"
-          : "Consumer source is unavailable",
+        gap:
+          candidates.length > 0
+            ? "Reference location is unavailable and the dependency request was not found"
+            : "Consumer source is unavailable",
       };
     }
     const lines = content.split("\n");
-    const startLine = Math.max(1, location.start.line - Math.max(0, contextLines));
-    const endLine = Math.min(lines.length, location.end.line + Math.max(0, contextLines));
-    const excerpt = lines.slice(startLine - 1, endLine).join("\n");
-    const starts = lineStarts(excerpt);
-    const start = (starts[location.start.line - startLine] ?? 0) + location.start.column;
-    const end = Math.max(
-      start + 1,
-      (starts[location.end.line - startLine] ?? start) + location.end.column,
-    );
+    const starts = lineStarts(content);
+    const start = (starts[location.start.line - 1] ?? 0) + location.start.column;
+    const end = Math.max(start + 1, (starts[location.end.line - 1] ?? start) + location.end.column);
     const detailedOrigin = origin
-      ? this.#filesForModule(origin.id).find(
-          (file): file is SourceFileReport => isDetailed(file) && file.content === content,
-        )
+      ? (this.#filesForModule(origin.id)
+          .map((file) => this.source(file.id))
+          .find((file) => file?.content === content) ?? null)
       : null;
+    const filename = normalizeBuildSourcePath(selected.path, this.snapshot.manifest.context);
+    const code: CodeViewResponse = {
+      view: "source",
+      sourceId: detailedOrigin?.id ?? null,
+      filename,
+      language: extname(filename).slice(1) || "javascript",
+      content,
+      spans: detailedOrigin
+        ? sourceFileCoverageSpans(detailedOrigin)
+        : [{ start: 0, end: content.length, status: "unknown" }],
+      offset: 0,
+      endOffset: content.length,
+      startLine: 1,
+      totalCharacters: content.length,
+      hasPrevious: false,
+      hasNext: false,
+      provenance: detailedOrigin ? "coverage-analysis" : "captured-original-source",
+      gap: null,
+    };
     return {
       edge,
       available: true,
       gap: null,
-      filename: normalizeBuildSourcePath(selected.path, this.snapshot.manifest.context),
-      startLine,
-      endLine,
-      content: excerpt,
+      code,
+      filename,
+      startLine: 1,
+      endLine: lines.length,
       highlight: {
-        start: Math.min(excerpt.length, start),
-        end: Math.min(excerpt.length, end),
+        start: Math.min(content.length, start),
+        end: Math.min(content.length, end),
         coverageStatus: coverageStatus(detailedOrigin?.lines[location.start.line - 1]),
       },
       coverage: origin ? this.#metrics(origin.id) : emptyMetrics(),

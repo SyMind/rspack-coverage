@@ -1,7 +1,13 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Compiler, Stats } from "@rspack/core";
 import { AnalysisServer } from "../server/AnalysisServer.js";
 import { openBrowser } from "../server/openBrowser.js";
-import { createBuildSnapshot } from "./snapshot.js";
+import { persistBuildSnapshot, resolveCoverageDataDirectory } from "../server/snapshotStorage.js";
+import { assertSnapshotRecordSize } from "../shared/snapshotLimits.js";
+import type { BuildSnapshot } from "../shared/types.js";
+import { createBuildSnapshot, type PrivateSourceMapCapture } from "./snapshot.js";
 import type { ResolvedRspackCoveragePluginOptions, RspackCoveragePluginOptions } from "./types.js";
 
 const PLUGIN_NAME = "RspackCoveragePlugin";
@@ -119,16 +125,19 @@ function printConfigurationChanges(changes: ConfigurationChange[]): void {
 
 export class RspackCoveragePlugin {
   readonly #options: ResolvedRspackCoveragePluginOptions;
+  readonly #dataDir: string | false | undefined;
   #server: AnalysisServer | null = null;
   #opened = false;
-  #privateMaps = new WeakMap<object, Map<string, Buffer>>();
+  #privateMaps = new WeakMap<object, PrivateSourceMapCapture>();
 
   constructor(options: RspackCoveragePluginOptions = {}) {
     this.#options = resolveOptions(options);
+    this.#dataDir = options.dataDir;
   }
 
   apply(compiler: Compiler): void {
     if (process.env.CI === "true") return;
+    const dataDirectory = resolveCoverageDataDirectory(compiler.context, this.#dataDir);
 
     const configurationChanges = enableRequiredConfiguration(compiler);
     if (!hasUsableFullSourceMap(compiler.options.devtool)) {
@@ -144,8 +153,19 @@ export class RspackCoveragePlugin {
       }).apply(compiler);
 
       compiler.hooks.thisCompilation.tap(PLUGIN_NAME, (compilation) => {
-        const maps = new Map<string, Buffer>();
-        this.#privateMaps.set(compilation, maps);
+        const directory = mkdtempSync(join(tmpdir(), "rspack-coverage-maps-"));
+        const maps: PrivateSourceMapCapture["maps"] = new Map();
+        let disposed = false;
+        const capture: PrivateSourceMapCapture = {
+          maps,
+          dispose() {
+            if (disposed) return;
+            disposed = true;
+            rmSync(directory, { recursive: true, force: true });
+          },
+        };
+        this.#privateMaps.set(compilation, capture);
+        let mapIndex = 0;
         compilation.hooks.processAssets.tap(
           {
             name: PLUGIN_NAME,
@@ -166,7 +186,11 @@ export class RspackCoveragePlugin {
                     ? Buffer.from(raw)
                     : Buffer.from(String(raw));
                 const generatedName = asset.name.slice("__rspack_coverage_maps__/".length, -4);
-                maps.set(generatedName, content);
+                assertSnapshotRecordSize("source map", generatedName, content.byteLength);
+                const file = join(directory, `${mapIndex}.map`);
+                mapIndex += 1;
+                writeFileSync(file, content, { flag: "wx" });
+                maps.set(generatedName, { kind: "file", path: file });
               } catch (error) {
                 compilation.warnings.push(
                   new Error(
@@ -189,12 +213,27 @@ export class RspackCoveragePlugin {
     printConfigurationChanges(configurationChanges);
 
     compiler.hooks.done.tapPromise(PLUGIN_NAME, async (stats: Stats) => {
-      const snapshot = createBuildSnapshot(
-        stats,
-        compiler,
-        this.#privateMaps.get(stats.compilation),
-      );
-      if (!this.#server) this.#server = new AnalysisServer(this.#options);
+      const privateMaps = this.#privateMaps.get(stats.compilation);
+      let capturedSnapshot: BuildSnapshot;
+      try {
+        capturedSnapshot = createBuildSnapshot(stats, compiler, privateMaps);
+      } catch (error) {
+        privateMaps?.dispose();
+        throw error;
+      } finally {
+        this.#privateMaps.delete(stats.compilation);
+      }
+      let snapshot = capturedSnapshot;
+      if (dataDirectory && !stats.hasErrors()) {
+        try {
+          snapshot = await persistBuildSnapshot(capturedSnapshot, dataDirectory);
+        } catch (error) {
+          console.warn(
+            `Rspack Coverage could not persist reusable build data in ${dataDirectory}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      if (!this.#server) this.#server = new AnalysisServer(this.#options, dataDirectory);
       this.#server.update(snapshot);
       const port = await this.#server.start();
       const origin = `http://127.0.0.1:${port}`;
@@ -206,8 +245,11 @@ export class RspackCoveragePlugin {
             ? "enabled"
             : `limited (${snapshot.manifest.capabilities.usedExports})`;
         const sourceLocations = snapshot.manifest.capabilities.originalLocations;
+        const reopen = snapshot.storage
+          ? `\nReusable data:\n${dataDirectory}\n\nReopen without building:\nrspack-coverage serve${this.#dataDir ? ` --data-dir ${JSON.stringify(dataDirectory)}` : ""}\n`
+          : "";
         console.log(
-          `\nRspack Coverage is ready\n\nExport usage: ${exportUsage}\nSource locations: ${sourceLocations}\n\nApplication:\n${origin}/\n\nCoverage report:\n${origin}/__rspack_coverage__/\n\nPress Ctrl+C to stop.\n`,
+          `\nRspack Coverage is ready\n\nExport usage: ${exportUsage}\nSource locations: ${sourceLocations}\n${reopen}\nApplication:\n${origin}/\n\nCoverage report:\n${origin}/__rspack_coverage__/\n\nPress Ctrl+C to stop.\n`,
         );
         if (this.#options.open) openBrowser(`${origin}/__rspack_coverage__/`);
       }

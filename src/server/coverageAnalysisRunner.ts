@@ -1,6 +1,8 @@
-import { type FileHandle, open, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { type FileHandle, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { analyzeCoverage, type StoredSourceFileDetail } from "../analyzer/analyze.js";
+import { assertSnapshotRecordSize, MAX_COVERAGE_ANALYSIS_BYTES } from "../shared/snapshotLimits.js";
 import type {
   BuildManifest,
   ChromeCoverageEntry,
@@ -11,7 +13,6 @@ import type {
 } from "../shared/types.js";
 
 const DETAIL_BUFFER_BYTES = 4 * 1024 * 1024;
-
 export interface CoverageFileDetailLocation {
   offset: number;
   length: number;
@@ -111,6 +112,8 @@ export interface StagedCoverageSnapshot {
   build: BuildManifest;
   assets: Record<string, StagedCoverageAsset>;
   sources: StagedCoverageSource[];
+  /** SQLite payload store from a persisted v2 build snapshot. */
+  sourceDatabaseFile?: string;
 }
 
 export interface CoverageAnalysisWorkerData {
@@ -123,6 +126,21 @@ export interface CoverageAnalysisWorkerData {
   precision: CoverageImportSummary["precision"];
 }
 
+function stagedFile(directory: string, value: string): string {
+  if (!value || isAbsolute(value)) throw new Error(`Invalid staged snapshot path: ${value}`);
+  const file = resolve(directory, value);
+  const relativeFile = relative(directory, file);
+  if (
+    !relativeFile ||
+    relativeFile === ".." ||
+    relativeFile.startsWith(`..${sep}`) ||
+    isAbsolute(relativeFile)
+  ) {
+    throw new Error(`Staged snapshot path escapes its directory: ${value}`);
+  }
+  return file;
+}
+
 export async function runCoverageAnalysisJob(
   input: CoverageAnalysisWorkerData,
   onProgress?: (phase: string, completed: number, total: number) => void,
@@ -131,29 +149,93 @@ export async function runCoverageAnalysisJob(
   const staged = JSON.parse(
     await readFile(join(input.stageDirectory, "snapshot.json"), "utf8"),
   ) as StagedCoverageSnapshot;
+  if ((await stat(input.recordingFile)).size > MAX_COVERAGE_ANALYSIS_BYTES) {
+    throw new Error("Coverage JSON exceeds the 128 MiB in-memory analysis guard.");
+  }
   const coverage = JSON.parse(await readFile(input.recordingFile, "utf8")) as unknown;
   if (!Array.isArray(coverage)) throw new Error("Chrome Coverage JSON must contain an array.");
 
-  const originalSources: Record<string, string> = {};
-  for (let index = 0; index < staged.sources.length; index += 1) {
-    const source = staged.sources[index];
-    if (!source) continue;
-    onProgress?.("Loading original sources", index, staged.sources.length);
-    originalSources[source.path] = await readFile(
-      join(input.stageDirectory, source.contentFile),
-      "utf8",
-    );
-  }
-
   const temporaryDetails = `${input.detailsFile}.tmp`;
   const temporaryDetailsIndex = `${input.detailsIndexFile}.tmp`;
+  const discoveredSourcesFile = `${temporaryDetails}.sources.sqlite`;
+  await Promise.all([
+    rm(temporaryDetails, { force: true }),
+    rm(temporaryDetailsIndex, { force: true }),
+    rm(discoveredSourcesFile, { force: true }),
+  ]);
+  const stagedSources = new Map(
+    staged.sources.map((source) => [source.path, source.contentFile] as const),
+  );
+  const sourceDatabase = staged.sourceDatabaseFile
+    ? new DatabaseSync(stagedFile(input.stageDirectory, staged.sourceDatabaseFile), {
+        readOnly: true,
+      })
+    : null;
+  sourceDatabase?.exec(`
+    PRAGMA query_only = ON;
+    PRAGMA temp_store = FILE;
+    PRAGMA cache_size = -32768;
+    PRAGMA mmap_size = 0;
+  `);
+  const storedSource = sourceDatabase?.prepare("SELECT payload FROM sources WHERE key = ?");
+  const storedSourceKeys = sourceDatabase?.prepare("SELECT key FROM sources ORDER BY key");
+  let discoveredDatabase: DatabaseSync | null = null;
+  let discoveredSource: StatementSync | null = null;
+  let insertDiscoveredSource: StatementSync | null = null;
+  const ensureDiscoveredDatabase = () => {
+    if (discoveredDatabase) return;
+    discoveredDatabase = new DatabaseSync(discoveredSourcesFile);
+    discoveredDatabase.exec(`
+      PRAGMA journal_mode = OFF;
+      PRAGMA synchronous = OFF;
+      PRAGMA temp_store = FILE;
+      PRAGMA cache_size = -8192;
+      PRAGMA mmap_size = 0;
+      CREATE TABLE sources (
+        key TEXT PRIMARY KEY,
+        payload BLOB NOT NULL
+      ) WITHOUT ROWID;
+    `);
+    discoveredSource = discoveredDatabase.prepare("SELECT payload FROM sources WHERE key = ?");
+    insertDiscoveredSource = discoveredDatabase.prepare(
+      "INSERT OR IGNORE INTO sources (key, payload) VALUES (?, ?)",
+    );
+  };
+  const closeDiscoveredDatabase = () => {
+    discoveredDatabase?.close();
+    discoveredDatabase = null;
+  };
+  const originalSourcePaths: Iterable<string> = {
+    *[Symbol.iterator]() {
+      yield* stagedSources.keys();
+      if (storedSourceKeys) {
+        for (const row of storedSourceKeys.iterate()) yield String(row.key);
+      }
+    },
+  };
+  const loadOriginalSource = async (sourceKey: string): Promise<string | null> => {
+    const sourceFile = stagedSources.get(sourceKey);
+    if (sourceFile) {
+      return readFile(stagedFile(input.stageDirectory, sourceFile), "utf8");
+    }
+    const stored = storedSource?.get(sourceKey)?.payload;
+    if (stored instanceof Uint8Array) return Buffer.from(stored).toString("utf8");
+    const discovered = discoveredSource?.get(sourceKey)?.payload;
+    return discovered instanceof Uint8Array ? Buffer.from(discovered).toString("utf8") : null;
+  };
   const detailWriter = await CoverageFileDetailWriter.create(temporaryDetails);
   let report: CoverageReport;
   try {
     report = await analyzeCoverage({
       build: staged.build,
       coverage: coverage as ChromeCoverageEntry[],
-      originalSources,
+      originalSourcePaths,
+      loadOriginalSource,
+      storeDiscoveredSource: async (sourceKey, content) => {
+        ensureDiscoveredDatabase();
+        assertSnapshotRecordSize("source-map source", sourceKey, Buffer.byteLength(content));
+        insertDiscoveredSource?.run(sourceKey, Buffer.from(content));
+      },
       precision: input.precision,
       ...(onProgress ? { onProgress } : {}),
       onFileDetail: (file) => detailWriter.write(file),
@@ -161,11 +243,11 @@ export async function runCoverageAnalysisJob(
         const asset = staged.assets[assetId];
         if (!asset) return {};
         const generated = needsGeneratedSource
-          ? await readFile(join(input.stageDirectory, asset.contentFile), "utf8")
+          ? await readFile(stagedFile(input.stageDirectory, asset.contentFile), "utf8")
           : undefined;
         const map = asset.mapFile
           ? (JSON.parse(
-              await readFile(join(input.stageDirectory, asset.mapFile), "utf8"),
+              await readFile(stagedFile(input.stageDirectory, asset.mapFile), "utf8"),
             ) as RawSourceMapPayload)
           : undefined;
         return {
@@ -188,6 +270,10 @@ export async function runCoverageAnalysisJob(
       rm(input.detailsIndexFile, { force: true }),
     ]);
     throw error;
+  } finally {
+    sourceDatabase?.close();
+    closeDiscoveredDatabase();
+    await rm(discoveredSourcesFile, { force: true });
   }
 
   const complete: CoverageAnalysisStatus = {

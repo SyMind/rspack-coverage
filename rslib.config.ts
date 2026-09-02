@@ -4,6 +4,7 @@ export default defineConfig({
   source: {
     entry: {
       index: "./src/index.ts",
+      cli: "./src/cli.ts",
       "coverage-analysis-worker": "./src/server/coverageAnalysis.worker.ts",
       "export-analysis-worker": "./src/server/exportAnalysis.worker.ts",
     },

@@ -1,9 +1,13 @@
 import { randomBytes } from "node:crypto";
 import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { tmpdir } from "node:os";
 import { dirname, extname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ResolvedRspackCoveragePluginOptions } from "../plugin/types.js";
+import { sourceLineCoverageStatus, sourceLinesCoverageSpans } from "../shared/codeCoverage.js";
+import { MAX_PORTABLE_SNAPSHOT_BYTES } from "../shared/snapshotLimits.js";
 import type { BuildSnapshot } from "../shared/types.js";
 import {
   CoverageAnalysisService,
@@ -17,6 +21,12 @@ import {
 } from "./CoverageAnalysisService.js";
 import { ExportAnalysisService } from "./ExportAnalysisService.js";
 import { InvestigationModel } from "./InvestigationModel.js";
+import {
+  createPortableSnapshotArchive,
+  importPortableSnapshot,
+  PortableSnapshotFormatError,
+  PortableSnapshotTooLargeError,
+} from "./portableSnapshot.js";
 
 const ANALYSIS_PREFIX = "/__rspack_coverage__/";
 
@@ -66,8 +76,13 @@ export class AnalysisServer {
   #coverageAnalysis = new CoverageAnalysisService();
   #exportAnalysis = new ExportAnalysisService();
   #investigation: InvestigationModel | null = null;
+  #temporaryDataDirectory: Promise<string> | null = null;
+  #snapshotImporting = false;
 
-  constructor(private readonly options: ResolvedRspackCoveragePluginOptions) {
+  constructor(
+    private readonly options: ResolvedRspackCoveragePluginOptions,
+    private readonly dataDirectory: string | null = null,
+  ) {
     const moduleDirectory = dirname(fileURLToPath(import.meta.url));
     const candidates = [
       resolve(moduleDirectory, "ui"),
@@ -87,13 +102,23 @@ export class AnalysisServer {
     return this.#port ? `http://127.0.0.1:${this.#port}` : null;
   }
 
-  update(snapshot: BuildSnapshot): void {
-    if (this.#snapshot?.manifest.hash !== snapshot.manifest.hash) {
-      this.#coverageAnalysis.update(snapshot);
+  update(snapshot: BuildSnapshot, force = false): void {
+    const previousIdentity =
+      this.#snapshot?.storage?.snapshotId ??
+      (this.#snapshot
+        ? `memory:${this.#snapshot.manifest.hash}:${this.#snapshot.manifest.builtAt}`
+        : null);
+    const nextIdentity =
+      snapshot.storage?.snapshotId ??
+      `memory:${snapshot.manifest.hash}:${snapshot.manifest.builtAt}`;
+    if (force || previousIdentity !== nextIdentity) {
+      this.#coverageAnalysis.update(snapshot, force);
       this.#exportAnalysis.reset();
     }
+    const previousSnapshot = this.#snapshot;
     this.#snapshot = snapshot;
     this.#investigation = new InvestigationModel(snapshot);
+    if (previousSnapshot && previousSnapshot !== snapshot) previousSnapshot.dispose?.();
   }
 
   async start(): Promise<number> {
@@ -126,11 +151,28 @@ export class AnalysisServer {
 
   async close(): Promise<void> {
     await Promise.all([this.#coverageAnalysis.close(), this.#exportAnalysis.close()]);
+    this.#snapshot?.dispose?.();
+    this.#snapshot = null;
+    this.#investigation = null;
+    const temporaryDataDirectory = this.#temporaryDataDirectory;
+    this.#temporaryDataDirectory = null;
+    if (temporaryDataDirectory) {
+      await temporaryDataDirectory
+        .then((directory) => rm(directory, { recursive: true, force: true }))
+        .catch(() => undefined);
+    }
     if (!this.#server.listening) return;
     await new Promise<void>((resolvePromise, reject) => {
       this.#server.close((error) => (error ? reject(error) : resolvePromise()));
+      this.#server.closeIdleConnections();
     });
     this.#port = null;
+  }
+
+  async #snapshotDataDirectory(): Promise<string> {
+    if (this.dataDirectory) return this.dataDirectory;
+    this.#temporaryDataDirectory ??= mkdtemp(join(tmpdir(), "rspack-coverage-imports-"));
+    return this.#temporaryDataDirectory;
   }
 
   #validHost(request: IncomingMessage): boolean {
@@ -187,8 +229,63 @@ export class AnalysisServer {
     response: ServerResponse,
   ): Promise<void> {
     const snapshot = this.#snapshot;
+    if (pathname === `${ANALYSIS_PREFIX}api/snapshot` && request.method === "POST") {
+      if (this.#snapshotImporting) {
+        sendJson(response, 409, { error: "Another snapshot import is already in progress." });
+        return;
+      }
+      const contentLength = request.headers["content-length"];
+      if (
+        typeof contentLength === "string" &&
+        Number.isFinite(Number(contentLength)) &&
+        Number(contentLength) > MAX_PORTABLE_SNAPSHOT_BYTES
+      ) {
+        request.resume();
+        throw new PortableSnapshotTooLargeError(
+          "Portable snapshot exceeds the 32 GiB streamed upload guard.",
+        );
+      }
+      this.#snapshotImporting = true;
+      try {
+        const imported = await importPortableSnapshot(
+          request,
+          await this.#snapshotDataDirectory(),
+          snapshot?.storage?.snapshotId,
+        );
+        this.update(imported.snapshot, true);
+        sendJson(response, 200, {
+          snapshotId: imported.snapshot.storage?.snapshotId,
+          bytes: imported.bytes,
+          build: imported.snapshot.manifest,
+        });
+      } finally {
+        this.#snapshotImporting = false;
+      }
+      return;
+    }
     if (!snapshot) {
       sendJson(response, 503, { error: "Build data is not ready" });
+      return;
+    }
+    if (pathname === `${ANALYSIS_PREFIX}api/snapshot`) {
+      if (request.method === "GET" || request.method === "HEAD") {
+        const archive = await createPortableSnapshotArchive(snapshot);
+        response.writeHead(200, {
+          "Content-Type": "application/vnd.rspack.coverage-snapshot",
+          "Content-Length": archive.bytes,
+          "Content-Disposition": `attachment; filename="${archive.filename}"`,
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff",
+        });
+        if (request.method === "HEAD") response.end();
+        else {
+          archive.content.on("error", (error) => response.destroy(error));
+          archive.content.pipe(response);
+        }
+        return;
+      }
+      response.writeHead(405, { Allow: "GET, HEAD, POST" });
+      response.end();
       return;
     }
     if (pathname === `${ANALYSIS_PREFIX}api/coverage-analysis`) {
@@ -335,6 +432,25 @@ export class AnalysisServer {
           snippetMatch[1] ?? "",
           Number(url.searchParams.get("context") ?? 3),
         ) ?? null;
+      if (snippet?.available && snippet.code) {
+        const fileId = snippet.code.sourceId ?? snippet.code.filename;
+        try {
+          const detail = await this.#coverageAnalysis.source(snapshot.manifest.hash, fileId);
+          snippet.code.spans = sourceLinesCoverageSpans(snippet.code.content, detail.lines);
+          const usageLine = snippet.location?.start.line;
+          if (snippet.highlight && usageLine) {
+            const line = detail.lines[usageLine - 1];
+            if (line) snippet.highlight.coverageStatus = sourceLineCoverageStatus(line);
+          }
+        } catch (error) {
+          if (
+            !(error instanceof CoverageReportNotReadyError) &&
+            !(error instanceof MissingCoverageSourceError)
+          ) {
+            throw error;
+          }
+        }
+      }
       sendJson(response, snippet ? 200 : 404, snippet ?? { error: "Unknown reference" });
       return;
     }
@@ -364,8 +480,13 @@ export class AnalysisServer {
       response.destroy(error instanceof Error ? error : new Error(String(error)));
       return;
     }
-    if (error instanceof CoverageUploadTooLargeError) {
+    if (
+      error instanceof CoverageUploadTooLargeError ||
+      error instanceof PortableSnapshotTooLargeError
+    ) {
       sendJson(response, 413, { error: error.message });
+    } else if (error instanceof PortableSnapshotFormatError) {
+      sendJson(response, 400, { error: error.message });
     } else if (error instanceof CoverageBuildChangedError) {
       sendJson(response, 409, { error: error.message });
     } else if (error instanceof MissingCoverageRecordingError) {

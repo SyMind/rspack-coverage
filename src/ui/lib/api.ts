@@ -10,10 +10,21 @@ import type {
 
 const PREFIX = "/__rspack_coverage__/api";
 
+export interface SnapshotImportResponse {
+  snapshotId: string;
+  bytes: number;
+  build: BuildManifest;
+}
+
 function token(): string {
   return (
     document.querySelector<HTMLMetaElement>('meta[name="rspack-coverage-token"]')?.content ?? ""
   );
+}
+
+export function snapshotDownloadUrl(): string {
+  const search = new URLSearchParams({ token: token() });
+  return `${PREFIX}/snapshot?${search}`;
 }
 
 async function request(path: string, init: RequestInit = {}): Promise<Response> {
@@ -27,7 +38,14 @@ async function request(path: string, init: RequestInit = {}): Promise<Response> 
   const response = await fetch(`${PREFIX}${path}`, requestInit);
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`Coverage API ${response.status}: ${body}`);
+    let message = body;
+    try {
+      const parsed = JSON.parse(body) as { error?: unknown };
+      if (typeof parsed.error === "string") message = parsed.error;
+    } catch {
+      // Preserve a non-JSON server response as-is.
+    }
+    throw new Error(message || `Coverage API request failed with status ${response.status}.`);
   }
   return response;
 }
@@ -46,6 +64,12 @@ export async function loadSourceExportStatus(
 
 export async function loadBuild(): Promise<BuildManifest> {
   return (await request("/build")).json() as Promise<BuildManifest>;
+}
+
+export async function uploadSnapshot(file: File): Promise<SnapshotImportResponse> {
+  return (await request("/snapshot", { method: "POST", body: file }).then((response) =>
+    response.json(),
+  )) as SnapshotImportResponse;
 }
 
 export async function loadCoverageAnalysisStatus(

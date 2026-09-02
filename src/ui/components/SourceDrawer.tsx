@@ -191,7 +191,7 @@ function SourceCode(props: {
         type="button"
         className={`export-marker state-${marker.state} precision-${marker.precision} ${selected ? "is-active" : ""}`}
         key={marker.id}
-        title={`Open dependency graph for export ${marker.exportedName}`}
+        title={`Open importers and module graph for export ${marker.exportedName}`}
         onClick={() => props.onMarkerClick(marker)}
       >
         <SyntaxText text={text.slice(start, end)} keyPrefix={`export:${marker.id}`} />
@@ -215,6 +215,18 @@ function SourceCode(props: {
   );
 }
 
+function preferredModuleInstance(usage: SourceExportUsage) {
+  return (
+    usage.moduleInstances.find(
+      (candidate) => candidate.state === "used" && candidate.chunks.length > 0,
+    ) ??
+    usage.moduleInstances.find((candidate) => candidate.chunks.length > 0) ??
+    usage.moduleInstances.find((candidate) => candidate.state === "used") ??
+    usage.moduleInstances[0] ??
+    null
+  );
+}
+
 export function SourceDrawer(props: {
   buildHash: string;
   file: SourceFileSummary | null;
@@ -232,6 +244,7 @@ export function SourceDrawer(props: {
   const [snippet, setSnippet] = useState<ReferenceSnippetResponse | null>(null);
   const [snippetFlashKey, setSnippetFlashKey] = useState(0);
   const [loadingReferences, setLoadingReferences] = useState(false);
+  const [referenceError, setReferenceError] = useState<string | null>(null);
   const analysis = useExportAnalysis(props.buildHash, props.file, retry);
   const detailStatus = useSourceDetail(props.buildHash, props.file, props.moduleId, detailRetry);
   const report = analysis?.status === "complete" ? analysis.report : null;
@@ -261,18 +274,7 @@ export function SourceDrawer(props: {
   const markerLines = useMemo(() => {
     const result = new Map<number, SourceExportUsage[]>();
     for (const item of report?.exports ?? []) {
-      if (item.state !== "used" || item.precision !== "exact") continue;
-      if (
-        props.moduleId &&
-        !item.moduleInstances.some(
-          (instance) =>
-            instance.moduleId === props.moduleId &&
-            instance.state === "used" &&
-            instance.precision === "exact",
-        )
-      ) {
-        continue;
-      }
+      if (item.moduleInstances.length === 0) continue;
       if (item.range.start.line !== item.range.end.line) continue;
       const list = result.get(item.range.start.line) ?? [];
       list.push(item);
@@ -282,7 +284,7 @@ export function SourceDrawer(props: {
       list.sort((left, right) => left.range.start.column - right.range.start.column);
     }
     return result;
-  }, [report, props.moduleId]);
+  }, [report]);
   const virtualizer = useVirtualizer({
     count: lines.length,
     getScrollElement: () => scrollRef.current,
@@ -293,13 +295,17 @@ export function SourceDrawer(props: {
     if (!moduleId) return;
     let cancelled = false;
     setLoadingReferences(true);
+    setReferenceError(null);
     setSnippet(null);
     void loadReferences(moduleId, direction)
       .then((next) => {
         if (!cancelled) setReferences(next);
       })
-      .catch(() => {
-        if (!cancelled) setReferences(null);
+      .catch((error) => {
+        if (!cancelled) {
+          setReferences(null);
+          setReferenceError(error instanceof Error ? error.message : String(error));
+        }
       })
       .finally(() => {
         if (!cancelled) setLoadingReferences(false);
@@ -312,14 +318,14 @@ export function SourceDrawer(props: {
   const openDependencyGraph = (usage: SourceExportUsage) => {
     const instance =
       usage.moduleInstances.find((candidate) => candidate.moduleId === props.moduleId) ??
-      usage.moduleInstances.find((candidate) => candidate.state === "used") ??
-      usage.moduleInstances[0];
+      preferredModuleInstance(usage);
     if (!instance) return;
     setActiveExportId(usage.id);
     setModuleId(instance.moduleId);
     setDirection("in");
     setReferences(null);
     setSnippet(null);
+    setReferenceError(null);
     const url = new URL(location.href);
     url.searchParams.set("module", instance.moduleId);
     url.searchParams.set("export", usage.exportedName);
@@ -331,6 +337,7 @@ export function SourceDrawer(props: {
     setReferences(null);
     setSnippet(null);
     setLoadingReferences(false);
+    setReferenceError(null);
     const url = new URL(location.href);
     url.searchParams.delete("module");
     url.searchParams.delete("export");
@@ -339,6 +346,9 @@ export function SourceDrawer(props: {
   if (!props.file) return null;
   const file = props.file;
   const metrics = props.moduleId ? metricsForModuleInstance(file, props.module) : file.metrics;
+  const activeExport = report?.exports.find((candidate) => candidate.id === activeExportId) ?? null;
+  const activeModuleInstance =
+    activeExport?.moduleInstances.find((candidate) => candidate.moduleId === moduleId) ?? null;
   return (
     <div className="drawer-backdrop">
       <aside
@@ -346,11 +356,7 @@ export function SourceDrawer(props: {
         aria-label={`Source details for ${file.path}`}
       >
         <header>
-          <div>
-            <span className="eyebrow">{props.moduleId ? "Rspack module" : "Original source"}</span>
-            <h2>{file.path.split("/").at(-1)}</h2>
-            <code>{file.path}</code>
-          </div>
+          <h2 title={file.path}>{file.path.split("/").at(-1)}</h2>
           <button
             type="button"
             className="close-button"
@@ -402,7 +408,7 @@ export function SourceDrawer(props: {
             <i className="swatch not-emitted" /> not emitted
           </span>
           <span>
-            <i className="swatch export-used" /> export used
+            <i className="swatch export-used" /> clickable export
           </span>
         </div>
         <div className="source-code-panel">
@@ -450,12 +456,32 @@ export function SourceDrawer(props: {
           {moduleId ? (
             <div className="export-dependency-graph">
               <ReferencePanel
+                exportUsage={activeExport}
+                moduleInstance={activeModuleInstance}
                 references={references}
                 direction={direction}
                 loading={loadingReferences}
+                error={referenceError}
                 snippet={snippet}
                 snippetFlashKey={snippetFlashKey}
-                onDirectionChange={setDirection}
+                onDirectionChange={(nextDirection) => {
+                  if (nextDirection === direction) return;
+                  setDirection(nextDirection);
+                  setReferences((current) =>
+                    current
+                      ? {
+                          ...current,
+                          direction: nextDirection,
+                          total: current.counts[nextDirection],
+                          cursor: 0,
+                          nextCursor: null,
+                          edges: [],
+                        }
+                      : null,
+                  );
+                  setSnippet(null);
+                  setReferenceError(null);
+                }}
                 onSelectEdge={(edgeId) => {
                   void loadReferenceSnippet(edgeId).then((next) => {
                     setSnippet(next);
@@ -469,6 +495,16 @@ export function SourceDrawer(props: {
                     setReferences({ ...next, edges: [...references.edges, ...next.edges] }),
                   );
                 }}
+                onModuleChange={(nextModuleId) => {
+                  setModuleId(nextModuleId);
+                  setDirection("in");
+                  setReferences(null);
+                  setSnippet(null);
+                  setReferenceError(null);
+                  const url = new URL(location.href);
+                  url.searchParams.set("module", nextModuleId);
+                  history.replaceState(null, "", url);
+                }}
                 onClose={closeDependencyGraph}
                 onCloseSnippet={() => setSnippet(null)}
               />
@@ -478,9 +514,9 @@ export function SourceDrawer(props: {
         <footer>
           Module sizes count retained original-source UTF-8 bytes once, so generated/minified output
           cannot inflate this module. Unused excludes source lines removed from the final build and
-          code in chunks that were not loaded. A line with any executed range is colored green;
-          otherwise a retained and loaded line is red. Only exports that Rspack identifies as
-          exactly used are highlighted. Click an export to jump to its captured dependency graph.
+          code in chunks that were not loaded. Exports with a captured module instance are
+          clickable. The importer chain and module graph retain separate usage evidence; green and
+          red remain runtime Coverage states.
         </footer>
       </aside>
     </div>

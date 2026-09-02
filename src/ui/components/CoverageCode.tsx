@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { type ReactNode, useEffect, useRef } from "react";
 import type { CodeCoverageSpan, CodeViewResponse } from "../../shared/types.js";
 
 const TOKEN_RE =
@@ -56,7 +56,17 @@ function segmentsForLine(
   return result;
 }
 
-export function CoverageCode(props: { code: CodeViewResponse }) {
+export function CoverageCode(props: {
+  code: CodeViewResponse;
+  highlight?: { start: number; end: number; flashKey: number } | null;
+}) {
+  const rootRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (!props.highlight) return;
+    rootRef.current
+      ?.querySelector<HTMLElement>("[data-usage-highlight]")
+      ?.scrollIntoView?.({ behavior: "smooth", block: "center", inline: "nearest" });
+  }, [props.highlight]);
   const starts = [0];
   for (let index = 0; index < props.code.content.length; index += 1) {
     if (props.code.content.charCodeAt(index) === 10) starts.push(index + 1);
@@ -65,7 +75,11 @@ export function CoverageCode(props: { code: CodeViewResponse }) {
     (left, right) => left.start - right.start || left.end - right.end,
   );
   return (
-    <section className="coverage-code" aria-label={`${props.code.view} code coverage`}>
+    <section
+      className="coverage-code"
+      aria-label={`${props.code.view} code coverage`}
+      ref={rootRef}
+    >
       {starts.map((start, index) => {
         const next = starts[index + 1] ?? props.code.content.length;
         const end =
@@ -75,17 +89,49 @@ export function CoverageCode(props: { code: CodeViewResponse }) {
           <div className="coverage-code-line" key={start || `line:${index}`}>
             <span className="coverage-line-number">{props.code.startLine + index}</span>
             <code>
-              {segments.map((segment) => (
-                <span
-                  className={`coverage-segment coverage-${segment.status}`}
-                  key={`${start}:${segment.start}:${segment.end}:${segment.status}`}
-                >
-                  <SyntaxText
-                    text={props.code.content.slice(segment.start, segment.end) || " "}
-                    keyPrefix={`${start}:${segment.start}`}
-                  />
-                </span>
-              ))}
+              {segments.map((segment) => {
+                const highlightStart = props.highlight
+                  ? Math.max(segment.start, props.highlight.start)
+                  : segment.end;
+                const highlightEnd = props.highlight
+                  ? Math.min(segment.end, props.highlight.end)
+                  : segment.start;
+                const hasHighlight = highlightEnd > highlightStart;
+                return (
+                  <span
+                    className={`coverage-segment coverage-${segment.status}`}
+                    key={`${start}:${segment.start}:${segment.end}:${segment.status}`}
+                  >
+                    {hasHighlight ? (
+                      <>
+                        <SyntaxText
+                          text={props.code.content.slice(segment.start, highlightStart)}
+                          keyPrefix={`${start}:${segment.start}:before`}
+                        />
+                        <mark
+                          className="usage-highlight"
+                          data-usage-highlight
+                          key={`${highlightStart}:${highlightEnd}:${props.highlight?.flashKey}`}
+                        >
+                          <SyntaxText
+                            text={props.code.content.slice(highlightStart, highlightEnd) || " "}
+                            keyPrefix={`${start}:${highlightStart}:highlight`}
+                          />
+                        </mark>
+                        <SyntaxText
+                          text={props.code.content.slice(highlightEnd, segment.end)}
+                          keyPrefix={`${start}:${highlightEnd}:after`}
+                        />
+                      </>
+                    ) : (
+                      <SyntaxText
+                        text={props.code.content.slice(segment.start, segment.end) || " "}
+                        keyPrefix={`${start}:${segment.start}`}
+                      />
+                    )}
+                  </span>
+                );
+              })}
             </code>
           </div>
         );

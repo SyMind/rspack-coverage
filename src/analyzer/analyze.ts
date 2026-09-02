@@ -45,7 +45,6 @@ interface LineAssetEvidence {
 
 interface MutableFile {
   path: string;
-  content: string | null;
   metrics: UsageMetrics;
   chunks: Set<string>;
   loadedChunks: Set<string>;
@@ -65,7 +64,9 @@ interface SourceModuleIndex {
 }
 
 interface CapturedSourceContentIndex {
+  /** normalized source path -> provider key */
   exact: Map<string, string>;
+  /** normalized suffix -> unique provider key, or null when ambiguous */
   suffix: Map<string, string | null>;
 }
 
@@ -200,21 +201,11 @@ export function materializeSourceFileDetail(
   return { id: input.id, lines };
 }
 
-function mutableFile(
-  files: Map<string, MutableFile>,
-  path: string,
-  content: string | null,
-): MutableFile {
+function mutableFile(files: Map<string, MutableFile>, path: string): MutableFile {
   const existing = files.get(path);
-  if (existing) {
-    // Compilation-captured source is seeded before source maps are decoded.
-    // Keep it instead of replacing it with compacted loader `sourcesContent`.
-    if (existing.content === null && content !== null) existing.content = content;
-    return existing;
-  }
+  if (existing) return existing;
   const created: MutableFile = {
     path,
-    content,
     metrics: emptyMetrics(),
     chunks: new Set(),
     loadedChunks: new Set(),
@@ -227,21 +218,21 @@ function mutableFile(
 function indexCapturedSourceContent(
   index: CapturedSourceContentIndex,
   path: string,
-  content: string,
+  sourceKey: string,
 ): void {
-  index.exact.set(path, content);
+  index.exact.set(path, sourceKey);
   const parts = path.split("/").filter(Boolean);
   // A basename alone is not a stable source identity. Keep suffixes with at
   // least two path segments, and reject suffixes that resolve ambiguously.
   for (let offset = 0; offset < parts.length - 1; offset += 1) {
     const suffix = parts.slice(offset).join("/");
     const existing = index.suffix.get(suffix);
-    if (existing === undefined) index.suffix.set(suffix, content);
-    else if (existing !== content) index.suffix.set(suffix, null);
+    if (existing === undefined) index.suffix.set(suffix, sourceKey);
+    else if (existing !== sourceKey) index.suffix.set(suffix, null);
   }
 }
 
-function capturedSourceContent(index: CapturedSourceContentIndex, path: string): string | null {
+function capturedSourceKey(index: CapturedSourceContentIndex, path: string): string | null {
   const exact = index.exact.get(path);
   if (exact !== undefined) return exact;
   const directSuffix = index.suffix.get(path);
@@ -414,11 +405,12 @@ function modulesForSource(index: SourceModuleIndex, sourcePath: string): Indexed
 
 function retainedSourceMetrics(
   file: MutableFile,
+  content: string | null,
   moduleChunks?: ReadonlySet<string>,
 ): UsageMetrics | null {
-  if (file.content === null) return null;
-  const prefix = buildUtf8Prefix(file.content);
-  const starts = buildLineStarts(file.content);
+  if (content === null) return null;
+  const prefix = buildUtf8Prefix(content);
+  const starts = buildLineStarts(content);
   const metrics = emptyMetrics();
 
   // The module view is source-oriented: a retained source line is counted
@@ -431,7 +423,7 @@ function retainedSourceMetrics(
     if (emittedBytes <= 0) continue;
     const start = starts[lineIndex];
     if (start === undefined) continue;
-    const end = starts[lineIndex + 1] ?? file.content.length;
+    const end = starts[lineIndex + 1] ?? content.length;
     const sourceBytes = utf8BytesBetween(prefix, start, end);
     if (sourceBytes === 0) continue;
 
@@ -463,6 +455,7 @@ function lineEvidence(
 async function toFileReports(
   files: Map<string, MutableFile>,
   build: BuildManifest,
+  loadSourceContent: (path: string) => Promise<string | null>,
   onProgress?: (phase: string, completed: number, total: number) => void,
   onFileDetail?: (file: StoredSourceFileDetail) => void | Promise<void>,
 ): Promise<SourceFileSummary[]> {
@@ -484,16 +477,17 @@ async function toFileReports(
     }
     const fileChunks = [...chunks];
     const loadedChunks = [...file.loadedChunks];
+    const content = await loadSourceContent(file.path);
     const moduleMetrics =
       modules.length === 1
-        ? retainedSourceMetrics(file, new Set(modules[0]?.chunks))
-        : retainedSourceMetrics(file);
+        ? retainedSourceMetrics(file, content, new Set(modules[0]?.chunks))
+        : retainedSourceMetrics(file, content);
     const moduleMetricsById =
       modules.length > 1
         ? Object.fromEntries(
             modules.map((module) => [
               module.id,
-              retainedSourceMetrics(file, new Set(module.chunks)) ?? emptyMetrics(),
+              retainedSourceMetrics(file, content, new Set(module.chunks)) ?? emptyMetrics(),
             ]),
           )
         : undefined;
@@ -512,7 +506,7 @@ async function toFileReports(
     };
     await onFileDetail?.({
       id: file.path,
-      content: file.content,
+      content,
       sourceMapAvailable: build.capabilities.sourceMap !== "none",
       chunks: fileChunks,
       mappedLines: [...file.lines].map(([lineIndex, line]) => ({
@@ -724,7 +718,11 @@ export async function analyzeCoverage(input: {
   coverage: ChromeCoverageEntry[];
   maps?: Record<string, RawSourceMapPayload>;
   generatedAssets?: Record<string, string>;
-  originalSources: Record<string, string>;
+  /** In-memory compatibility input. Persistent analysis should use the lazy provider below. */
+  originalSources?: Record<string, string>;
+  originalSourcePaths?: Iterable<string>;
+  loadOriginalSource?: (sourceKey: string) => Promise<string | null>;
+  storeDiscoveredSource?: (sourceKey: string, content: string) => Promise<void>;
   precision: CoverageImportSummary["precision"];
   onProgress?: (phase: string, completed: number, total: number) => void;
   onFileDetail?: (file: StoredSourceFileDetail) => void | Promise<void>;
@@ -744,11 +742,32 @@ export async function analyzeCoverage(input: {
     exact: new Map(),
     suffix: new Map(),
   };
-  for (const [source, content] of Object.entries(input.originalSources)) {
+  const inlineSources = input.originalSources ?? {};
+  const discoveredSources = new Map<string, string>();
+  const registerSource = (source: string, sourceKey: string) => {
     const path = normalizeSourcePathForContext(source, input.build.context);
-    mutableFile(files, path, content);
-    indexCapturedSourceContent(capturedContentIndex, path, content);
+    mutableFile(files, path);
+    indexCapturedSourceContent(capturedContentIndex, path, sourceKey);
+  };
+  for (const source of Object.keys(inlineSources)) registerSource(source, source);
+  for (const source of input.originalSourcePaths ?? []) {
+    const path = normalizeSourcePathForContext(source, input.build.context);
+    if (!capturedContentIndex.exact.has(path)) registerSource(source, source);
   }
+  const loadSourceContent = async (path: string): Promise<string | null> => {
+    const sourceKey = capturedSourceKey(capturedContentIndex, path);
+    if (sourceKey === null) return null;
+    if (Object.hasOwn(inlineSources, sourceKey)) return inlineSources[sourceKey] ?? null;
+    const discovered = discoveredSources.get(sourceKey);
+    if (discovered !== undefined || discoveredSources.has(sourceKey)) return discovered ?? null;
+    return (await input.loadOriginalSource?.(sourceKey)) ?? null;
+  };
+  const rememberDiscoveredSource = async (path: string, content: string): Promise<void> => {
+    if (capturedSourceKey(capturedContentIndex, path) !== null) return;
+    if (input.storeDiscoveredSource) await input.storeDiscoveredSource(path, content);
+    else discoveredSources.set(path, content);
+    indexCapturedSourceContent(capturedContentIndex, path, path);
+  };
   const globalMetrics = emptyMetrics();
   const assetMetrics = new Map<string, UsageMetrics>();
   const loadedChunkIds = new Set<string>();
@@ -809,11 +828,10 @@ export async function analyzeCoverage(input: {
       const path = span.source
         ? normalizeSourcePathForContext(span.source, input.build.context)
         : `[rspack runtime / unmapped]/${asset.name}`;
-      const file = mutableFile(
-        files,
-        path,
-        capturedSourceContent(capturedContentIndex, path) ?? span.sourceContent,
-      );
+      if (span.sourceContent !== null) {
+        await rememberDiscoveredSource(path, span.sourceContent);
+      }
+      const file = mutableFile(files, path);
       addMetrics(file.metrics, metrics);
       for (const chunk of asset.chunks) {
         file.chunks.add(chunk);
@@ -842,7 +860,13 @@ export async function analyzeCoverage(input: {
     input.build.assets.length,
   );
 
-  const fileReports = await toFileReports(files, input.build, input.onProgress, input.onFileDetail);
+  const fileReports = await toFileReports(
+    files,
+    input.build,
+    loadSourceContent,
+    input.onProgress,
+    input.onFileDetail,
+  );
   const moduleMetrics = emptyMetrics();
   for (const file of fileReports) {
     if (file.moduleMetrics) addMetrics(moduleMetrics, file.moduleMetrics);

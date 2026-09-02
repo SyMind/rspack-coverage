@@ -223,6 +223,8 @@ describe("export usage analysis", () => {
 
     expect(actions).toMatchObject({ state: "used", precision: "exact", referenceCount: 1 });
     expect(actions?.references[0]).toMatchObject({
+      moduleId: "consumer",
+      targetModuleId: "target",
       path: "src/consumer.ts",
       line: 1,
       column: 1,
@@ -230,6 +232,7 @@ describe("export usage analysis", () => {
       referencedPath: ["ACTIONS", "next"],
       locationPrecision: "exact",
     });
+    expect(actions?.referenceCountByModule).toEqual({ target: 1 });
     expect(events).toMatchObject({ state: "unused", precision: "exact", referenceCount: 0 });
     expect(renamed).toMatchObject({ state: "unused", precision: "exact", referenceCount: 0 });
   });

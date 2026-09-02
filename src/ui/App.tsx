@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type DragEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   BuildManifest,
   CoverageAnalysisStatus,
@@ -16,7 +16,9 @@ import {
   loadBuild,
   loadCoverageAnalysisStatus,
   reuseCoverageAnalysis,
+  snapshotDownloadUrl,
   startCoverageAnalysis,
+  uploadSnapshot,
 } from "./lib/api.js";
 import { formatBytes } from "./lib/format.js";
 
@@ -29,6 +31,8 @@ interface SelectedSource {
 
 export function App() {
   const [build, setBuild] = useState<BuildManifest | null>(null);
+  const [initialLoadComplete, setInitialLoadComplete] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [report, setReport] = useState<CoverageReport | null>(null);
   const [tab, setTab] = useState<Tab>("sources");
   const [selectedSource, setSelectedSource] = useState<SelectedSource | null>(null);
@@ -37,7 +41,13 @@ export function App() {
   const [recentAvailable, setRecentAvailable] = useState(false);
   const [progress, setProgress] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [snapshotProgress, setSnapshotProgress] = useState<string | null>(null);
+  const [snapshotError, setSnapshotError] = useState<string | null>(null);
+  const [snapshotDragActive, setSnapshotDragActive] = useState(false);
   const pollingGeneration = useRef(0);
+  const snapshotInput = useRef<HTMLInputElement>(null);
+  const snapshotImportActive = useRef(false);
+  const dragDepth = useRef(0);
 
   const followAnalysis = useCallback(
     async (
@@ -90,7 +100,11 @@ export function App() {
         const status = await loadCoverageAnalysisStatus(nextBuild.hash);
         followSafely(nextBuild.hash, status);
       })
-      .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
+      .catch((cause) => {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        if (message !== "Build data is not ready") setLoadError(message);
+      })
+      .finally(() => setInitialLoadComplete(true));
     return () => {
       pollingGeneration.current += 1;
     };
@@ -133,45 +147,173 @@ export function App() {
     }
   };
 
+  const importSnapshot = async (file: File) => {
+    if (snapshotImportActive.current) return;
+    snapshotImportActive.current = true;
+    pollingGeneration.current += 1;
+    setSnapshotError(null);
+    setSnapshotProgress(`Uploading ${file.name} (${formatBytes(file.size)})…`);
+    try {
+      const imported = await uploadSnapshot(file);
+      setBuild(imported.build);
+      setReport(null);
+      setSelectedSource(null);
+      setTab("sources");
+      setError(null);
+      setProgress(null);
+      setSnapshotProgress("Snapshot verified. Loading its analysis data…");
+      const status = await loadCoverageAnalysisStatus(imported.build.hash);
+      followSafely(imported.build.hash, status);
+      setSnapshotProgress(null);
+    } catch (cause) {
+      setSnapshotProgress(null);
+      setSnapshotError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      snapshotImportActive.current = false;
+    }
+  };
+
+  const hasDraggedFiles = (event: DragEvent<HTMLElement>) =>
+    Array.from(event.dataTransfer.types).includes("Files");
+
+  const onSnapshotDragEnter = (event: DragEvent<HTMLDivElement>) => {
+    if (!hasDraggedFiles(event)) return;
+    event.preventDefault();
+    dragDepth.current += 1;
+    setSnapshotDragActive(true);
+  };
+
+  const onSnapshotDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    if (!snapshotDragActive && !hasDraggedFiles(event)) return;
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setSnapshotDragActive(false);
+  };
+
+  const onSnapshotDrop = (event: DragEvent<HTMLDivElement>) => {
+    if (!hasDraggedFiles(event)) return;
+    const alreadyHandled = event.defaultPrevented;
+    event.preventDefault();
+    dragDepth.current = 0;
+    setSnapshotDragActive(false);
+    if (alreadyHandled) return;
+    const file = event.dataTransfer.files[0];
+    if (file) void importSnapshot(file);
+  };
+
   const loadedChunkCount = useMemo(
     () => report?.chunks.filter((chunk) => chunk.loaded).length ?? 0,
     [report],
   );
 
-  if (!build) {
-    return (
-      <div className="app-loading">
-        <span className="spinner" />
-        {error ?? "Loading compilation snapshot…"}
-      </div>
-    );
-  }
-
   return (
-    <div className="app-shell">
-      <header className="topbar">
-        <a className="brand" href="/__rspack_coverage__/">
-          <span className="brand-mark">R</span>
-          <span>
-            Rspack Coverage<small>runtime-to-source analysis</small>
-          </span>
-        </a>
-        <div className="build-status">
-          <span className="status-light" /> Build {build.hash.slice(0, 10)}
-          <small>{build.mode}</small>
-        </div>
-        {report ? (
+    <section
+      className="app-shell"
+      aria-label="Rspack Coverage workbench"
+      onDragEnter={onSnapshotDragEnter}
+      onDragOver={(event) => {
+        if (hasDraggedFiles(event)) event.preventDefault();
+      }}
+      onDragLeave={onSnapshotDragLeave}
+      onDrop={onSnapshotDrop}
+    >
+      <header className="topbar topbar--actions-only">
+        <div className="topbar-actions">
+          {report ? (
+            <button
+              type="button"
+              className="button button--secondary"
+              onClick={() => setReport(null)}
+            >
+              Import another recording
+            </button>
+          ) : null}
+          {build && !progress ? (
+            <a
+              className="button button--secondary snapshot-download-button"
+              href={snapshotDownloadUrl()}
+            >
+              Download snapshot
+            </a>
+          ) : null}
+          <input
+            ref={snapshotInput}
+            className="sr-only"
+            type="file"
+            aria-label="Snapshot file"
+            accept=".rspack-coverage,.rspack-coverage-snapshot,application/vnd.rspack.coverage-snapshot"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              event.target.value = "";
+              if (file) void importSnapshot(file);
+            }}
+          />
           <button
             type="button"
-            className="button button--secondary"
-            onClick={() => setReport(null)}
+            className="button snapshot-upload-button"
+            disabled={Boolean(snapshotProgress)}
+            aria-busy={Boolean(snapshotProgress)}
+            onClick={() => snapshotInput.current?.click()}
           >
-            Import another recording
+            {snapshotProgress ? (
+              <span className="snapshot-upload-status" aria-hidden="true" />
+            ) : null}
+            {snapshotProgress ? "Importing snapshot…" : "Upload snapshot"}
           </button>
-        ) : null}
+        </div>
       </header>
 
-      {!report ? (
+      {snapshotDragActive ? (
+        <div className="snapshot-drop-overlay" role="status" aria-live="polite">
+          <div>
+            <span className="snapshot-drop-icon">⇩</span>
+            <strong>Drop snapshot to open it</strong>
+            <small>The file is streamed to local disk and verified before switching builds.</small>
+          </div>
+        </div>
+      ) : null}
+
+      {snapshotProgress || snapshotError ? (
+        <div
+          className={`snapshot-toast${snapshotError ? " snapshot-toast--error" : ""}`}
+          role={snapshotError ? "alert" : "status"}
+        >
+          {snapshotProgress ? <span className="spinner" /> : null}
+          <span>{snapshotError ?? snapshotProgress}</span>
+          {snapshotError ? (
+            <button type="button" onClick={() => setSnapshotError(null)} aria-label="Dismiss">
+              ×
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
+      {!initialLoadComplete && !build ? (
+        <div className="app-loading">
+          <span className="spinner" /> Loading compilation snapshot…
+        </div>
+      ) : !build ? (
+        <main className="empty-snapshot-shell">
+          <span className="eyebrow">Portable build data</span>
+          <h1>Open a saved snapshot</h1>
+          <p>
+            Upload a <code>.rspack-coverage</code> file to inspect a build without running Rspack.
+            You can also drop the file anywhere on this page.
+          </p>
+          <button
+            type="button"
+            className="button snapshot-upload-button empty-snapshot-button"
+            disabled={Boolean(snapshotProgress)}
+            aria-busy={Boolean(snapshotProgress)}
+            onClick={() => snapshotInput.current?.click()}
+          >
+            {snapshotProgress ? (
+              <span className="snapshot-upload-status" aria-hidden="true" />
+            ) : null}
+            {snapshotProgress ? "Importing snapshot…" : "Choose snapshot file"}
+          </button>
+          {loadError ? <div className="import-error empty-snapshot-error">{loadError}</div> : null}
+        </main>
+      ) : !report ? (
         <SetupGuide
           build={build}
           precision={precision}
@@ -184,22 +326,11 @@ export function App() {
         />
       ) : (
         <main className="report-shell">
-          <section className="report-heading">
-            <div>
-              <span className="eyebrow">Imported user journey</span>
-              <h1>What loaded, what ran, what remained</h1>
-              <p>
-                {report.importSummary.matchedAssets} matched assets ·{" "}
-                {report.importSummary.ignoredEntries.length} ignored ·{" "}
-                {report.importSummary.precision.replace("-", " ")} precision
-              </p>
+          {report.importSummary.precision !== "per-block" ? (
+            <div className="precision-warning report-precision-warning">
+              Low/unknown precision: record with JavaScript Per block for line-level decisions.
             </div>
-            {report.importSummary.precision !== "per-block" ? (
-              <div className="precision-warning">
-                Low/unknown precision: record with JavaScript Per block for line-level decisions.
-              </div>
-            ) : null}
-          </section>
+          ) : null}
           <section className="metric-grid">
             <MetricCard
               label="Loaded JS"
@@ -275,24 +406,26 @@ export function App() {
           )}
         </main>
       )}
-      <SourceDrawer
-        key={`${build.hash}:${selectedFile?.id ?? "closed"}:${selectedSource?.moduleId ?? "source"}`}
-        buildHash={build.hash}
-        file={selectedFile}
-        moduleId={selectedSource?.moduleId ?? null}
-        module={
-          selectedSource?.moduleId
-            ? (build.modules.find((module) => module.id === selectedSource.moduleId) ?? null)
-            : null
-        }
-        onClose={() => {
-          setSelectedSource(null);
-          const url = new URL(location.href);
-          url.searchParams.delete("module");
-          url.searchParams.delete("export");
-          history.replaceState(null, "", url);
-        }}
-      />
-    </div>
+      {build ? (
+        <SourceDrawer
+          key={`${build.hash}:${selectedFile?.id ?? "closed"}:${selectedSource?.moduleId ?? "source"}`}
+          buildHash={build.hash}
+          file={selectedFile}
+          moduleId={selectedSource?.moduleId ?? null}
+          module={
+            selectedSource?.moduleId
+              ? (build.modules.find((module) => module.id === selectedSource.moduleId) ?? null)
+              : null
+          }
+          onClose={() => {
+            setSelectedSource(null);
+            const url = new URL(location.href);
+            url.searchParams.delete("module");
+            url.searchParams.delete("export");
+            history.replaceState(null, "", url);
+          }}
+        />
+      ) : null}
+    </section>
   );
 }

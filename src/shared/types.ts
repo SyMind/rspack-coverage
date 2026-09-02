@@ -154,13 +154,52 @@ export interface BuildSnapshot {
   manifest: BuildManifest;
   assets: ReadonlyMap<string, Buffer>;
   maps: ReadonlyMap<string, RawSourceMapPayload>;
-  originalSources: Map<string, string>;
+  /** Raw JSON source-map payloads used to persist/copy maps without re-stringifying them. */
+  mapPayloads?: ReadonlyMap<string, Buffer>;
+  originalSources: ReadonlyMap<string, string>;
   exportGraph: ExportGraphSnapshot;
   references: BuildReference[];
-  codeGeneration: Map<string, ModuleCodeGeneration[]>;
+  /** Disk-backed reference access used by persisted or spill-to-disk snapshots. */
+  referenceStore?: BuildReferenceStore;
+  /** Disk-backed export graph access used by persisted snapshots. */
+  exportGraphStore?: ExportGraphStore;
+  codeGeneration: ReadonlyMap<string, ModuleCodeGeneration[]>;
   loadCodeGeneration?: (moduleId: string) => ModuleCodeGeneration[];
+  /** Release a lazily materialized code-generation record after it has been persisted. */
+  releaseCodeGeneration?: (moduleId: string) => void;
+  /** Release temporary spill files or database handles owned by this snapshot. */
+  dispose?: () => void;
   outputPath: string;
   indexAsset: string | null;
+  storage?: {
+    version: 2;
+    snapshotId: string;
+    directory: string;
+  };
+}
+
+export type ReferenceDirection = "in" | "out" | "both";
+
+export interface BuildReferenceStore {
+  readonly size: number;
+  get(id: string): BuildReference | undefined;
+  count(moduleId: string, direction: ReferenceDirection): number;
+  page(
+    moduleId: string,
+    direction: ReferenceDirection,
+    cursor: number,
+    limit: number,
+  ): BuildReference[];
+  incomingOrigins(moduleId: string): string[];
+  countTargets(targetModuleIds: ReadonlySet<string>): number;
+  forTargets(targetModuleIds: ReadonlySet<string>): BuildReference[];
+  entries(): IterableIterator<BuildReference>;
+}
+
+export interface ExportGraphStore {
+  getModule(moduleId: string): ExportGraphModule | undefined;
+  moduleIdsForSource(source: string): string[];
+  edgesForTargets(targetModuleIds: ReadonlySet<string>): ExportReferenceEdge[];
 }
 
 export type CodeCoverageState =
@@ -227,6 +266,11 @@ export interface ReferenceEdgeReport extends BuildReference {
 export interface ModuleReferencesResponse {
   module: BuildModule;
   direction: "in" | "out" | "both";
+  counts: {
+    in: number;
+    out: number;
+    both: number;
+  };
   total: number;
   cursor: number;
   nextCursor: number | null;
@@ -238,6 +282,8 @@ export interface ReferenceSnippetResponse {
   edge: BuildReference;
   available: boolean;
   gap: string | null;
+  /** Full source code with the same Coverage evidence used by the source detail panel. */
+  code?: CodeViewResponse;
   filename?: string;
   startLine?: number;
   endLine?: number;
@@ -284,6 +330,10 @@ export interface ExportReferenceEdge {
   referencedPath: string[] | null;
   location: SourceRange | null;
   active: boolean;
+  /** Original consumer source after tracing loader source maps, when available. */
+  sourcePath?: string | null;
+  /** Whether `location` is already expressed in `sourcePath` coordinates. */
+  originalLocation?: boolean;
 }
 
 export interface ExportGraphSnapshot {
@@ -307,7 +357,10 @@ export interface ExportModuleInstance {
 }
 
 export interface ExportReference {
+  /** Module that imports and consumes the current export. */
   moduleId: string;
+  /** Captured module instance whose export is being consumed. */
+  targetModuleId: string;
   path: string;
   line: number | null;
   column: number | null;
@@ -327,6 +380,7 @@ export interface SourceExportUsage {
   precision: ExportUsagePrecision;
   moduleInstances: ExportModuleInstance[];
   referenceCount: number;
+  referenceCountByModule: Record<string, number>;
   references: ExportReference[];
   truncated: boolean;
 }

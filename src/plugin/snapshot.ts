@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { GREATEST_LOWER_BOUND, originalPositionFor, TraceMap } from "@jridgewell/trace-mapping";
 import type { Compiler, Stats } from "@rspack/core";
 import { assetUrlPath, normalizeSourcePath } from "../shared/path.js";
+import { assertSnapshotRecordSize } from "../shared/snapshotLimits.js";
 import type {
   AnalysisCapabilities,
   BuildAsset,
@@ -12,13 +13,33 @@ import type {
   BuildEntrypoint,
   BuildManifest,
   BuildModule,
-  BuildReference,
   BuildSnapshot,
   ModuleCodeGeneration,
   RawSourceMapPayload,
   ReferenceLocation,
 } from "../shared/types.js";
+import {
+  CapturePayloadStore,
+  type MutableCaptureReferenceStore,
+  type MutableCaptureSourceMap,
+} from "./captureStore.js";
 import { collectExportGraph } from "./exportGraph.js";
+
+export interface PrivateSourceMapCapture {
+  maps: Map<string, RawSourceMapPayload | Buffer | string | { kind: "file"; path: string }>;
+  dispose(): void;
+}
+
+function isPrivateSourceMapFile(
+  value: RawSourceMapPayload | Buffer | string | { kind: "file"; path: string },
+): value is { kind: "file"; path: string } {
+  return (
+    typeof value === "object" &&
+    !Buffer.isBuffer(value) &&
+    value.kind === "file" &&
+    typeof value.path === "string"
+  );
+}
 
 const JAVASCRIPT_ASSET_RE = /\.(?:js|mjs|cjs)$/i;
 const NON_JAVASCRIPT_SOURCE_RE =
@@ -38,6 +59,34 @@ function shortHash(value: Buffer | string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 20);
 }
 
+function codeGenerationHash(content: string, map: RawSourceMapPayload | null): string {
+  const digest = createHash("sha256");
+  digest.update(content);
+  digest.update("\0");
+  if (map) {
+    digest.update(String(map.version));
+    digest.update("\0");
+    digest.update(map.file ?? "");
+    digest.update("\0");
+    digest.update(map.sourceRoot ?? "");
+    digest.update("\0");
+    digest.update(map.mappings);
+    for (const source of map.sources) {
+      digest.update("\0s");
+      digest.update(source);
+    }
+    for (const name of map.names) {
+      digest.update("\0n");
+      digest.update(name);
+    }
+    for (const sourceContent of map.sourcesContent ?? []) {
+      digest.update("\0c");
+      if (sourceContent !== null) digest.update(sourceContent);
+    }
+  }
+  return digest.digest("hex").slice(0, 20);
+}
+
 function asArray<T>(value: Iterable<T> | null | undefined): T[] {
   return value ? [...value] : [];
 }
@@ -53,7 +102,8 @@ function safeCall<T>(callback: () => T, fallback: T): T {
 class LazySnapshotMap<T> implements ReadonlyMap<string, T> {
   readonly #loaders = new Map<string, () => T | null | undefined>();
   readonly #cache = new Map<string, T>();
-  readonly #loaded = new Set<string>();
+
+  constructor(private readonly cacheLimit = 2) {}
 
   get size(): number {
     return this.#loaders.size;
@@ -62,16 +112,26 @@ class LazySnapshotMap<T> implements ReadonlyMap<string, T> {
   register(key: string, loader: () => T | null | undefined): void {
     this.#loaders.set(key, loader);
     this.#cache.delete(key);
-    this.#loaded.delete(key);
   }
 
   get(key: string): T | undefined {
-    if (this.#loaded.has(key)) return this.#cache.get(key);
+    const cached = this.#cache.get(key);
+    if (cached !== undefined || this.#cache.has(key)) {
+      this.#cache.delete(key);
+      this.#cache.set(key, cached as T);
+      return cached;
+    }
     const loader = this.#loaders.get(key);
     if (!loader) return undefined;
     const value = loader() ?? undefined;
-    this.#loaded.add(key);
-    if (value !== undefined) this.#cache.set(key, value);
+    if (value !== undefined) {
+      this.#cache.set(key, value);
+      while (this.#cache.size > this.cacheLimit) {
+        const oldest = this.#cache.keys().next().value;
+        if (oldest === undefined) break;
+        this.#cache.delete(oldest);
+      }
+    }
     return value;
   }
 
@@ -219,8 +279,9 @@ interface CapturedModuleSource {
 }
 
 interface OriginalSourceCapture {
-  sources: Map<string, string>;
+  sources: MutableCaptureSourceMap;
   capture(module: any, owner: BuildModule | null): CapturedModuleSource | null;
+  release(module: any): void;
 }
 
 function sourceName(map: RawSourceMapPayload, index: number): string {
@@ -232,8 +293,8 @@ function sourceName(map: RawSourceMapPayload, index: number): string {
 function collectOriginalSources(
   records: RawModuleRecord[],
   lookup: Map<string, BuildModule[]>,
+  sources: MutableCaptureSourceMap,
 ): OriginalSourceCapture {
-  const sources = new Map<string, string>();
   const captured = new WeakMap<object, CapturedModuleSource | null>();
   const registeredSources = new WeakSet<object>();
   const registeredOwners = new WeakMap<object, Set<string>>();
@@ -247,6 +308,8 @@ function collectOriginalSources(
         const originalSource = module.originalSource();
         if (!originalSource) return null;
         const sourceAndMap = getSourceAndMap({ source: originalSource });
+        const identifier = moduleIdentifier(module);
+        assertSnapshotRecordSize("module source", identifier, sourceAndMap.content.byteLength);
         const moduleResource = safeCall(() => module.nameForCondition?.() ?? null, null);
         const resource = moduleResource ? String(moduleResource) : (owner?.resource ?? null);
         return {
@@ -263,7 +326,10 @@ function collectOriginalSources(
           // locations and the source view share the same coordinate system.
           resourceContent:
             resource && isAbsolute(resource)
-              ? safeCall(() => readFileSync(resource, "utf8"), null)
+              ? safeCall(() => {
+                  assertSnapshotRecordSize("resource source", resource, statSync(resource).size);
+                  return readFileSync(resource, "utf8");
+                }, null)
               : null,
         };
       }, null);
@@ -338,8 +404,9 @@ function collectOriginalSources(
 
   for (const { module } of records) {
     capture(module, buildModuleFor(module, lookup));
+    captured.delete(module);
   }
-  return { sources, capture };
+  return { sources, capture, release: (module) => captured.delete(module) };
 }
 
 function stringifyDiagnostic(diagnostic: any): string {
@@ -643,9 +710,8 @@ function collectReferences(
   records: RawModuleRecord[],
   lookup: Map<string, BuildModule[]>,
   originalSources: OriginalSourceCapture,
-): BuildReference[] {
-  const references: BuildReference[] = [];
-  const seen = new Set<string>();
+  references: MutableCaptureReferenceStore,
+): void {
   for (const { module: originModule } of records) {
     const containingOrigin = buildModuleFor(originModule, lookup);
     if (!containingOrigin) continue;
@@ -653,6 +719,7 @@ function collectReferences(
       () => asArray((compilation.moduleGraph as any).getOutgoingConnections(originModule)),
       [],
     );
+    const capturedModules = new Set<any>();
     for (const connection of connections as any[]) {
       const dependency = connection.dependency ?? null;
       const dependencyOriginModule = dependency
@@ -674,16 +741,15 @@ function collectReferences(
       const exports = Array.isArray(dependency?.ids) ? dependency.ids.map(String) : null;
       const location = normalizeLocation(dependency?.loc);
       const capturedOrigin = originalSources.capture(graphOriginModule, origin);
+      capturedModules.add(graphOriginModule);
       const traced = traceReferenceLocation(capturedOrigin, location);
       const identity = `${origin.id}\0${target.id}\0${dependencyType ?? ""}\0${request ?? ""}\0${JSON.stringify(
         location,
       )}\0${traced?.sourcePath ?? origin.resource ?? ""}\0${JSON.stringify(
         traced?.sourceLocation ?? location,
       )}\0${JSON.stringify(exports)}`;
-      if (seen.has(identity)) continue;
-      seen.add(identity);
       const activeState = safeCall(() => connection.getActiveState(undefined), null);
-      references.push({
+      references.add({
         id: `ref_${shortHash(identity)}`,
         originId: origin.id,
         targetId: target.id,
@@ -696,12 +762,9 @@ function collectReferences(
         sourceLocation: traced?.sourceLocation ?? location,
       });
     }
+    for (const module of capturedModules) originalSources.release(module);
   }
-  return references.sort((left, right) =>
-    `${left.originId}\0${left.targetId}\0${left.id}`.localeCompare(
-      `${right.originId}\0${right.targetId}\0${right.id}`,
-    ),
-  );
+  references.finish();
 }
 
 function moduleRuntimeSpecs(compilation: Stats["compilation"], module: any): string[][] {
@@ -748,9 +811,10 @@ function collectCodeGenerationForModule(
     if (!javascriptSource) continue;
     const captured = safeCall(() => getSourceAndMap({ source: javascriptSource }), null);
     if (!captured) continue;
+    assertSnapshotRecordSize("module code generation", module.id, captured.content.byteLength);
     const content = captured.content.toString("utf8");
     if (!content) continue;
-    const digest = shortHash(`${content}\0${JSON.stringify(captured.map)}`);
+    const digest = codeGenerationHash(content, captured.map);
     const existing = byContent.get(digest);
     if (existing) {
       existing.runtimes.push(runtime);
@@ -774,6 +838,7 @@ function createCodeGenerationStore(
 ): {
   cache: Map<string, ModuleCodeGeneration[]>;
   load: (moduleId: string) => ModuleCodeGeneration[];
+  release: (moduleId: string) => void;
 } {
   const rawModules = new Map<string, { raw: any; module: BuildModule }>();
   for (const { module: raw, nested } of records) {
@@ -793,7 +858,15 @@ function createCodeGenerationStore(
       if (!target) return [];
       const records = collectCodeGenerationForModule(compilation, target.raw, target.module);
       cache.set(moduleId, records);
+      while (cache.size > 8) {
+        const oldest = cache.keys().next().value;
+        if (oldest === undefined) break;
+        cache.delete(oldest);
+      }
       return records;
+    },
+    release(moduleId) {
+      cache.delete(moduleId);
     },
   };
 }
@@ -839,8 +912,11 @@ function getPublicPath(compiler: Compiler, json: any): string {
 export function createBuildSnapshot(
   stats: Stats,
   compiler: Compiler,
-  privateMaps: Map<string, RawSourceMapPayload | Buffer | string> = new Map(),
+  privateMapCapture:
+    | PrivateSourceMapCapture
+    | Map<string, RawSourceMapPayload | Buffer | string> = new Map(),
 ): BuildSnapshot {
+  const privateMaps = privateMapCapture instanceof Map ? privateMapCapture : privateMapCapture.maps;
   const compilation = stats.compilation;
   const json = stats.toJson({
     all: false,
@@ -864,16 +940,16 @@ export function createBuildSnapshot(
   const publicPathSupported = !/^https?:\/\//i.test(publicPath) && !publicPath.startsWith("//");
   const statsAssets = new Map((json.assets ?? []).map((asset: any) => [asset.name, asset]));
   const compilationAssets = compilation.getAssets();
-  const emittedMapLoaders = new Map<string, () => RawSourceMapPayload | null>();
+  const emittedMapLoaders = new Map<string, () => Buffer | null>();
   for (const asset of compilationAssets) {
     if (!asset.name.endsWith(".map")) continue;
     emittedMapLoaders.set(asset.name, () => {
-      const content = readAssetContent(asset, compiler.outputPath);
-      return content ? parseSourceMap(content.toString("utf8")) : null;
+      return readAssetContent(asset, compiler.outputPath);
     });
   }
   const assets = new LazySnapshotMap<Buffer>();
   const maps = new LazySnapshotMap<RawSourceMapPayload>();
+  const mapPayloads = new LazySnapshotMap<Buffer>(1);
   const manifestAssets: BuildAsset[] = [];
 
   const unavailableAssets: string[] = [];
@@ -884,17 +960,33 @@ export function createBuildSnapshot(
       unavailableAssets.push(asset.name);
       continue;
     }
+    assertSnapshotRecordSize("asset", asset.name, content.byteLength);
     const relatedMapName = (asset.info as any).related?.sourceMap;
     const privateMap = privateMaps.get(asset.name);
-    const sourceMapLoader = privateMap
-      ? () => parseSourceMap(Buffer.isBuffer(privateMap) ? privateMap.toString("utf8") : privateMap)
+    const sourceMapPayloadLoader = privateMap
+      ? () => {
+          if (isPrivateSourceMapFile(privateMap)) {
+            assertSnapshotRecordSize("source map", asset.name, statSync(privateMap.path).size);
+            return readFileSync(privateMap.path);
+          }
+          if (Buffer.isBuffer(privateMap)) return privateMap;
+          const content = typeof privateMap === "string" ? privateMap : JSON.stringify(privateMap);
+          assertSnapshotRecordSize("source map", asset.name, Buffer.byteLength(content));
+          return Buffer.from(content);
+        }
       : typeof relatedMapName === "string" && emittedMapLoaders.has(relatedMapName)
         ? emittedMapLoaders.get(relatedMapName)
         : emittedMapLoaders.get(`${asset.name}.map`);
     const id = shortHash(`${asset.name}:${shortHash(content)}`);
     const statsAsset = statsAssets.get(asset.name) as any;
     assets.register(id, () => readAssetContent(asset, compiler.outputPath));
-    if (sourceMapLoader) maps.register(id, sourceMapLoader);
+    if (sourceMapPayloadLoader) {
+      mapPayloads.register(id, sourceMapPayloadLoader);
+      maps.register(id, () => {
+        const payload = mapPayloads.get(id);
+        return payload ? parseSourceMap(payload.toString("utf8")) : null;
+      });
+    }
     manifestAssets.push({
       id,
       name: asset.name,
@@ -902,7 +994,7 @@ export function createBuildSnapshot(
       size: content.byteLength,
       contentHash: shortHash(content),
       chunks: (statsAsset?.chunks ?? []).map(String),
-      mapAvailable: Boolean(sourceMapLoader),
+      mapAvailable: Boolean(sourceMapPayloadLoader),
     });
   }
 
@@ -919,110 +1011,126 @@ export function createBuildSnapshot(
   const rawModuleRecords = collectRawModuleRecords(compilation);
   addMissingNestedModules(compilation, rawModuleRecords, modules, entryIdentifiers);
   const modulesByIdentifier = moduleLookup(modules);
-  const originalSources = collectOriginalSources(rawModuleRecords, modulesByIdentifier);
-  const exportData = collectExportGraph(compilation, modules, compiler.context);
-  for (const [source, content] of exportData.originalSources) {
-    if (!originalSources.sources.has(source)) originalSources.sources.set(source, content);
-  }
-  const references = collectReferences(
-    compilation,
-    rawModuleRecords,
-    modulesByIdentifier,
-    originalSources,
-  );
-  const codeGenerationStore = createCodeGenerationStore(
-    compilation,
-    rawModuleRecords,
-    modulesByIdentifier,
-  );
-  const moduleIdsByChunk = new Map<string, string[]>();
-  for (const module of modules) {
-    for (const chunkId of module.chunks) {
-      const list = moduleIdsByChunk.get(chunkId) ?? [];
-      list.push(module.id);
-      moduleIdsByChunk.set(chunkId, list);
+  const captureStore = new CapturePayloadStore();
+  try {
+    const originalSources = collectOriginalSources(
+      rawModuleRecords,
+      modulesByIdentifier,
+      captureStore.sources,
+    );
+    const exportGraph = collectExportGraph(compilation, modules);
+    collectReferences(
+      compilation,
+      rawModuleRecords,
+      modulesByIdentifier,
+      originalSources,
+      captureStore.references,
+    );
+    const codeGenerationStore = createCodeGenerationStore(
+      compilation,
+      rawModuleRecords,
+      modulesByIdentifier,
+    );
+    const moduleIdsByChunk = new Map<string, string[]>();
+    for (const module of modules) {
+      for (const chunkId of module.chunks) {
+        const list = moduleIdsByChunk.get(chunkId) ?? [];
+        list.push(module.id);
+        moduleIdsByChunk.set(chunkId, list);
+      }
     }
-  }
-  const assetByName = new Map(manifestAssets.map((asset) => [asset.name, asset]));
-  const chunks: BuildChunk[] = (json.chunks ?? []).map((chunk: any) => {
-    const id = String(chunk.id ?? chunk.names?.[0] ?? "unknown");
-    const files = (chunk.files ?? []).filter((file: string) => JAVASCRIPT_ASSET_RE.test(file));
-    return {
-      id,
-      names: (chunk.names ?? []).map(String),
-      files,
-      initial: Boolean(chunk.initial),
-      entry: Boolean(chunk.entry),
-      moduleIds: moduleIdsByChunk.get(id) ?? [],
-      emittedBytes: files.reduce(
-        (sum: number, file: string) => sum + (assetByName.get(file)?.size ?? 0),
-        0,
-      ),
-    };
-  });
-
-  const diagnostics = collectDiagnostics(json);
-  if (unavailableAssets.length) {
-    diagnostics.push({
-      severity: "warning",
-      message: `${unavailableAssets.length} JavaScript asset(s) could not be read from the compilation or output directory: ${unavailableAssets.slice(0, 5).join(", ")}${unavailableAssets.length > 5 ? ", …" : ""}.`,
+    const assetByName = new Map(manifestAssets.map((asset) => [asset.name, asset]));
+    const chunks: BuildChunk[] = (json.chunks ?? []).map((chunk: any) => {
+      const id = String(chunk.id ?? chunk.names?.[0] ?? "unknown");
+      const files = (chunk.files ?? []).filter((file: string) => JAVASCRIPT_ASSET_RE.test(file));
+      return {
+        id,
+        names: (chunk.names ?? []).map(String),
+        files,
+        initial: Boolean(chunk.initial),
+        entry: Boolean(chunk.entry),
+        moduleIds: moduleIdsByChunk.get(id) ?? [],
+        emittedBytes: files.reduce(
+          (sum: number, file: string) => sum + (assetByName.get(file)?.size ?? 0),
+          0,
+        ),
+      };
     });
-  }
-  if (!publicPathSupported) {
-    diagnostics.push({
-      severity: "warning",
-      message:
-        "Absolute CDN publicPath is not supported by the local preview. Use publicPath: 'auto', a relative path, or a local path for the analysis build.",
-    });
-  }
 
-  const htmlAssets = compilation
-    .getAssets()
-    .filter((asset) => asset.name.endsWith(".html"))
-    .sort((a, b) => Number(a.name !== "index.html") - Number(b.name !== "index.html"));
-  for (const asset of htmlAssets) {
-    const content = readAssetContent(asset, compiler.outputPath);
-    if (content)
-      assets.register(`html:${asset.name}`, () => readAssetContent(asset, compiler.outputPath));
-  }
+    const diagnostics = collectDiagnostics(json);
+    if (unavailableAssets.length) {
+      diagnostics.push({
+        severity: "warning",
+        message: `${unavailableAssets.length} JavaScript asset(s) could not be read from the compilation or output directory: ${unavailableAssets.slice(0, 5).join(", ")}${unavailableAssets.length > 5 ? ", …" : ""}.`,
+      });
+    }
+    if (!publicPathSupported) {
+      diagnostics.push({
+        severity: "warning",
+        message:
+          "Absolute CDN publicPath is not supported by the local preview. Use publicPath: 'auto', a relative path, or a local path for the analysis build.",
+      });
+    }
 
-  const manifest: BuildManifest = {
-    hash: String(json.hash ?? compilation.hash ?? "unknown"),
-    mode: String(compiler.options.mode ?? "none"),
-    context: compiler.context,
-    publicPath,
-    builtAt: Date.now(),
-    assets: manifestAssets,
-    chunks,
-    modules,
-    entrypoints: collectEntrypoints(json.entrypoints),
-    diagnostics,
-    capabilities: capabilities(compiler, maps.size),
-    counts: {
-      assets: compilation.getAssets().length,
-      javascriptAssets: manifestAssets.length,
-      chunks: chunks.length,
-      modules: modules.length,
-      sourceMaps: maps.size,
-      references: references.length,
-    },
-    previewAvailable:
-      !stats.hasErrors() &&
-      Boolean(htmlAssets[0] && assets.has(`html:${htmlAssets[0].name}`)) &&
+    const htmlAssets = compilation
+      .getAssets()
+      .filter((asset) => asset.name.endsWith(".html"))
+      .sort((a, b) => Number(a.name !== "index.html") - Number(b.name !== "index.html"));
+    for (const asset of htmlAssets) {
+      const content = readAssetContent(asset, compiler.outputPath);
+      if (content)
+        assets.register(`html:${asset.name}`, () => readAssetContent(asset, compiler.outputPath));
+    }
+
+    const manifest: BuildManifest = {
+      hash: String(json.hash ?? compilation.hash ?? "unknown"),
+      mode: String(compiler.options.mode ?? "none"),
+      context: compiler.context,
+      publicPath,
+      builtAt: Date.now(),
+      assets: manifestAssets,
+      chunks,
+      modules,
+      entrypoints: collectEntrypoints(json.entrypoints),
+      diagnostics,
+      capabilities: capabilities(compiler, maps.size),
+      counts: {
+        assets: compilation.getAssets().length,
+        javascriptAssets: manifestAssets.length,
+        chunks: chunks.length,
+        modules: modules.length,
+        sourceMaps: maps.size,
+        references: captureStore.references.size,
+      },
+      previewAvailable:
+        !stats.hasErrors() &&
+        Boolean(htmlAssets[0] && assets.has(`html:${htmlAssets[0].name}`)) &&
+        publicPathSupported,
       publicPathSupported,
-    publicPathSupported,
-  };
+    };
 
-  return {
-    manifest,
-    assets,
-    maps,
-    originalSources: originalSources.sources,
-    exportGraph: exportData.graph,
-    references,
-    codeGeneration: codeGenerationStore.cache,
-    loadCodeGeneration: codeGenerationStore.load,
-    outputPath: compiler.outputPath,
-    indexAsset: htmlAssets[0]?.name ?? null,
-  };
+    return {
+      manifest,
+      assets,
+      maps,
+      mapPayloads,
+      originalSources: originalSources.sources,
+      exportGraph,
+      references: [],
+      referenceStore: captureStore.references,
+      codeGeneration: codeGenerationStore.cache,
+      loadCodeGeneration: codeGenerationStore.load,
+      releaseCodeGeneration: codeGenerationStore.release,
+      dispose: () => {
+        captureStore.dispose();
+        if (!(privateMapCapture instanceof Map)) privateMapCapture.dispose();
+      },
+      outputPath: compiler.outputPath,
+      indexAsset: htmlAssets[0]?.name ?? null,
+    };
+  } catch (error) {
+    captureStore.dispose();
+    if (!(privateMapCapture instanceof Map)) privateMapCapture.dispose();
+    throw error;
+  }
 }

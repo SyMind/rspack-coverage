@@ -2,7 +2,8 @@ export function formatBytes(value: number): string {
   if (!Number.isFinite(value)) return "—";
   if (value < 1024) return `${Math.round(value)} B`;
   if (value < 1024 ** 2) return `${(value / 1024).toFixed(value < 10 * 1024 ? 1 : 0)} KB`;
-  return `${(value / 1024 ** 2).toFixed(1)} MB`;
+  if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MB`;
+  return `${(value / 1024 ** 3).toFixed(2)} GB`;
 }
 
 export function formatPercent(value: number | null): string {

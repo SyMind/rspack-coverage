@@ -8,6 +8,7 @@ import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { materializeSourceFileDetail, type StoredSourceFileDetail } from "../analyzer/analyze.js";
+import { MAX_COVERAGE_ANALYSIS_BYTES } from "../shared/snapshotLimits.js";
 import type {
   BuildSnapshot,
   CoverageAnalysisStatus,
@@ -21,13 +22,13 @@ import {
   type StagedCoverageSnapshot,
 } from "./coverageAnalysisRunner.js";
 
-const MAX_COVERAGE_BYTES = 1024 * 1024 * 1024;
-
 interface StagedBuild {
   hash: string;
+  identity: string;
   generation: number;
   directory: Promise<string>;
   recordingFile: string | null;
+  persistent: boolean;
 }
 
 interface AnalysisJob {
@@ -40,6 +41,7 @@ interface AnalysisJob {
   detailsFile: string;
   detailsIndexFile: string;
   detailsIndex?: Promise<CoverageFileDetailIndex>;
+  persistent: boolean;
 }
 
 type WorkerMessage =
@@ -102,10 +104,12 @@ async function stageSnapshot(snapshot: BuildSnapshot): Promise<string> {
       if (!content) continue;
       const contentFile = `assets/${index}.js`;
       await writeFile(join(directory, contentFile), content);
-      const sourceMap = snapshot.maps.get(asset.id);
-      const mapFile = sourceMap ? `maps/${index}.json` : null;
-      if (sourceMap && mapFile)
-        await writeFile(join(directory, mapFile), JSON.stringify(sourceMap));
+      const sourceMapPayload = snapshot.mapPayloads?.get(asset.id);
+      const sourceMap = sourceMapPayload ? undefined : snapshot.maps.get(asset.id);
+      const mapFile = sourceMapPayload || sourceMap ? `maps/${index}.json` : null;
+      if (mapFile) {
+        await writeFile(join(directory, mapFile), sourceMapPayload ?? JSON.stringify(sourceMap));
+      }
       staged.assets[asset.id] = { contentFile, mapFile };
     }
 
@@ -129,8 +133,12 @@ async function storeUpload(body: Readable, destination: string): Promise<void> {
   const limiter = new Transform({
     transform(chunk: Buffer, _encoding, callback) {
       bytes += chunk.byteLength;
-      if (bytes > MAX_COVERAGE_BYTES) {
-        callback(new CoverageUploadTooLargeError("Coverage JSON exceeds the 1 GiB local limit."));
+      if (bytes > MAX_COVERAGE_ANALYSIS_BYTES) {
+        callback(
+          new CoverageUploadTooLargeError(
+            "Coverage JSON exceeds the 128 MiB in-memory analysis guard.",
+          ),
+        );
       } else {
         callback(null, chunk);
       }
@@ -150,21 +158,47 @@ export class CoverageAnalysisService {
   #job: AnalysisJob | null = null;
   #worker: Worker | null = null;
 
-  update(snapshot: BuildSnapshot): void {
-    if (this.#build?.hash === snapshot.manifest.hash) return;
+  update(snapshot: BuildSnapshot, force = false): void {
+    const identity =
+      snapshot.storage?.snapshotId ??
+      `memory:${snapshot.manifest.hash}:${snapshot.manifest.builtAt}`;
+    if (!force && this.#build?.identity === identity) return;
     const previous = this.#build;
     this.#generation += 1;
     this.#cancelWorker();
     this.#job = null;
-    const directory = stageSnapshot(snapshot);
+    const persistentDirectory = snapshot.storage?.directory ?? null;
+    const persistent = persistentDirectory !== null;
+    const directory = persistentDirectory
+      ? Promise.resolve(persistentDirectory)
+      : stageSnapshot(snapshot);
     void directory.catch(() => undefined);
+    const recordingFile = persistentDirectory ? join(persistentDirectory, "coverage.json") : null;
     this.#build = {
       hash: snapshot.manifest.hash,
+      identity,
       generation: this.#generation,
       directory,
-      recordingFile: null,
+      recordingFile: recordingFile && existsSync(recordingFile) ? recordingFile : null,
+      persistent,
     };
-    if (previous) {
+    if (persistentDirectory) {
+      const reportFile = join(persistentDirectory, "report.json");
+      const detailsFile = join(persistentDirectory, "report.sources");
+      const detailsIndexFile = join(persistentDirectory, "report.sources.index.json");
+      if (existsSync(reportFile) && existsSync(detailsFile) && existsSync(detailsIndexFile)) {
+        this.#job = {
+          id: "restored",
+          generation: this.#generation,
+          status: { status: "complete", id: "restored", recentAvailable: true },
+          reportFile,
+          detailsFile,
+          detailsIndexFile,
+          persistent: true,
+        };
+      }
+    }
+    if (previous && !previous.persistent) {
       void previous.directory
         .then((path) => rm(path, { recursive: true, force: true }))
         .catch(() => undefined);
@@ -177,7 +211,7 @@ export class CoverageAnalysisService {
     if (worker) await worker.terminate();
     const build = this.#build;
     this.#build = null;
-    if (build) {
+    if (build && !build.persistent) {
       await build.directory
         .then((path) => rm(path, { recursive: true, force: true }))
         .catch(() => undefined);
@@ -288,9 +322,15 @@ export class CoverageAnalysisService {
     if (!build.recordingFile)
       throw new MissingCoverageRecordingError("Coverage recording missing.");
     const id = randomUUID();
-    const reportFile = join(resolve(dirname(build.recordingFile)), `report-${id}.json`);
-    const detailsFile = `${reportFile}.sources`;
-    const detailsIndexFile = `${detailsFile}.index.json`;
+    const reportFile = build.persistent
+      ? join(resolve(dirname(build.recordingFile)), "report.json")
+      : join(resolve(dirname(build.recordingFile)), `report-${id}.json`);
+    const detailsFile = build.persistent
+      ? join(resolve(dirname(build.recordingFile)), "report.sources")
+      : `${reportFile}.sources`;
+    const detailsIndexFile = build.persistent
+      ? join(resolve(dirname(build.recordingFile)), "report.sources.index.json")
+      : `${detailsFile}.index.json`;
     const status: AnalysisJob["status"] = {
       status: "pending",
       id,
@@ -307,9 +347,10 @@ export class CoverageAnalysisService {
       reportFile,
       detailsFile,
       detailsIndexFile,
+      persistent: build.persistent,
     };
     this.#job = job;
-    if (previousJob) void this.#removeArtifacts(previousJob);
+    if (previousJob && !previousJob.persistent) void this.#removeArtifacts(previousJob);
     void build.directory
       .then((stageDirectory) => {
         if (this.#job !== job) return;
@@ -395,15 +436,15 @@ export class CoverageAnalysisService {
       recentAvailable: Boolean(this.#build?.recordingFile),
       message: error instanceof Error ? error.message : String(error),
     };
-    void this.#removeArtifacts(job);
+    void this.#removeArtifacts(job, !job.persistent);
   }
 
-  async #removeArtifacts(job: AnalysisJob): Promise<void> {
+  async #removeArtifacts(job: AnalysisJob, includeFinal = true): Promise<void> {
+    const files = includeFinal ? [job.reportFile, job.detailsFile, job.detailsIndexFile] : [];
     await Promise.all(
-      [job.reportFile, job.detailsFile, job.detailsIndexFile].flatMap((file) => [
-        rm(file, { force: true }),
-        rm(`${file}.tmp`, { force: true }),
-      ]),
+      [job.reportFile, job.detailsFile, job.detailsIndexFile]
+        .flatMap((file) => [rm(`${file}.tmp`, { force: true })])
+        .concat(files.map((file) => rm(file, { force: true }))),
     );
   }
 

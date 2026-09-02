@@ -30,10 +30,12 @@ describe("coverage investigation UI", () => {
           provenance: "test",
           gap: null,
         }}
+        highlight={{ start: 8, end: 14, flashKey: 1 }}
       />,
     );
 
     expect(document.querySelector(".coverage-executed")).toHaveTextContent("used();");
     expect(document.querySelector(".coverage-unexecuted")).toHaveTextContent("unused();");
+    expect(document.querySelector(".usage-highlight")).toHaveTextContent("unused");
   });
 });

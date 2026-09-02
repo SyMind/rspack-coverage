@@ -463,7 +463,15 @@ function mapReference(
   let snippet: string | null = null;
   let locationPrecision: ExportReference["locationPrecision"] = "unavailable";
 
-  if (origin?.sourceMap && rawLine !== null && rawColumn !== null) {
+  if (edge.originalLocation && edge.sourcePath) {
+    path = edge.sourcePath;
+    locationPrecision =
+      input.originalLocations === "exact"
+        ? "exact"
+        : input.originalLocations === "line-only"
+          ? "line-only"
+          : "unavailable";
+  } else if (origin?.sourceMap && rawLine !== null && rawColumn !== null) {
     try {
       const traced = originalPositionFor(new TraceMap(origin.sourceMap as any), {
         line: rawLine,
@@ -498,6 +506,7 @@ function mapReference(
   path = normalizeSourcePathForContext(path, input.context);
   return {
     moduleId: origin?.id ?? edge.originModuleId,
+    targetModuleId: edge.targetModuleId,
     path,
     line,
     column,
@@ -566,6 +575,7 @@ export async function analyzeSourceExports(
         precision: "exact",
         moduleInstances: [],
         referenceCount: 0,
+        referenceCountByModule: {},
         references: [],
         truncated: false,
       });
@@ -632,12 +642,20 @@ export async function analyzeSourceExports(
     const references = matchingReferences
       .map(({ edge, origin }) => mapReference(input, origin, edge))
       .sort(compareReferences);
+    const referenceCountByModule = Object.fromEntries(
+      moduleInstances.map((module) => [module.moduleId, 0]),
+    );
+    for (const reference of references) {
+      referenceCountByModule[reference.targetModuleId] =
+        (referenceCountByModule[reference.targetModuleId] ?? 0) + 1;
+    }
     exports.push({
       ...item,
       state: aggregate.state,
       precision: aggregate.precision,
       moduleInstances,
       referenceCount: references.length,
+      referenceCountByModule,
       references: references.slice(0, MAX_REFERENCES),
       truncated: references.length > MAX_REFERENCES,
     });
