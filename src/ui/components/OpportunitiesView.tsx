@@ -54,7 +54,7 @@ export function OpportunitiesView(props: {
                     {formatBytes(opportunity.metrics.loadedBytes)}
                   </span>
                   <span>
-                    <small>Unused</small>
+                    <small>{opportunity.fileId ? "Unused" : "Unexecuted"}</small>
                     {formatBytes(opportunity.metrics.unusedBytes)}
                   </span>
                   <span>

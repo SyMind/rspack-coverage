@@ -110,6 +110,111 @@ describe("export usage analysis", () => {
     ]);
   });
 
+  it("parses static CommonJS exports and prefers the real assignment over initialization", () => {
+    const source = [
+      'Object.defineProperty(exports, "__esModule", { value: true });',
+      "exports.normal = void 0;",
+      "exports.normal = (0, FontData_js_1.AddPaths)(normal_js_1.normal, {});",
+      "module.exports.bold = bold;",
+      'exports["italic"] = italic;',
+      "module.exports = { serif, sans: sansFont };",
+      'Object.defineProperty(exports, "forwarded", { enumerable: true, get: () => remote });',
+    ].join("\n");
+    const result = parseExports(source, "src/module.js");
+
+    expect(result.diagnostics).toEqual([]);
+    expect(result.exports.map((item) => [item.exportedName, item.localName])).toEqual([
+      ["normal", null],
+      ["bold", "bold"],
+      ["italic", "italic"],
+      ["serif", "serif"],
+      ["sans", "sansFont"],
+      ["forwarded", null],
+    ]);
+    const normal = result.exports.find((item) => item.exportedName === "normal");
+    expect(normal?.range).toEqual({
+      start: { line: 3, column: 8 },
+      end: { line: 3, column: 14 },
+    });
+  });
+
+  it("matches a CommonJS export to exact Rspack usage", async () => {
+    const report = await analyzeSourceExports(
+      input({
+        source: "src/module.js",
+        content: "exports.normal = makeNormal();\nexports.unused = makeUnused();",
+        modules: [
+          graphModule({
+            resource: "/project/src/module.js",
+            originalSources: ["src/module.js"],
+            moduleType: "javascript/dynamic",
+            providedExports: ["normal", "unused"],
+            usedExports: ["normal"],
+          }),
+        ],
+        references: [],
+      }),
+    );
+
+    expect(report.exports.find((item) => item.exportedName === "normal")).toMatchObject({
+      state: "used",
+      precision: "exact",
+    });
+    expect(report.exports.find((item) => item.exportedName === "unused")).toMatchObject({
+      state: "unused",
+      precision: "exact",
+    });
+  });
+
+  it("infers exact CommonJS usage from destructured and namespace require expressions", async () => {
+    const origin = graphModule({
+      id: "consumer",
+      resource: "/project/src/consumer.js",
+      originalSources: ["src/consumer.js"],
+      transformedSource: [
+        'const { normal } = require("./module.js");',
+        'const fonts = require("./module.js");',
+        "fonts.bold();",
+      ].join("\n"),
+    });
+    const report = await analyzeSourceExports(
+      input({
+        source: "src/module.js",
+        content: "exports.normal = makeNormal();\nexports.bold = makeBold();",
+        modules: [
+          graphModule({
+            resource: "/project/src/module.js",
+            originalSources: ["src/module.js"],
+            moduleType: "javascript/dynamic",
+            providedExports: ["normal", "bold"],
+            usedExports: true,
+          }),
+        ],
+        references: [
+          {
+            edge: referenceEdge({
+              dependencyType: "cjs require",
+              request: "./module.js",
+              referencedPath: null,
+            }),
+            origin,
+          },
+        ],
+      }),
+    );
+
+    expect(report.exports.find((item) => item.exportedName === "normal")).toMatchObject({
+      state: "used",
+      precision: "exact",
+      references: [{ referencedPath: ["normal"] }],
+    });
+    expect(report.exports.find((item) => item.exportedName === "bold")).toMatchObject({
+      state: "used",
+      precision: "exact",
+      references: [{ referencedPath: ["bold"] }],
+    });
+  });
+
   it("combines stats and exact ModuleGraph references without losing an unused result", async () => {
     const report = await analyzeSourceExports(input());
     const actions = report.exports.find((item) => item.exportedName === "ACTIONS");

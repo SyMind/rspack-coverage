@@ -232,7 +232,11 @@ export class CoverageAnalysisService {
     return { status: "complete-file", reportFile: job.reportFile };
   }
 
-  async source(buildHash: string, fileId: string): Promise<SourceFileDetail> {
+  async source(
+    buildHash: string,
+    fileId: string,
+    moduleId?: string | null,
+  ): Promise<SourceFileDetail> {
     const build = this.#requireBuild(buildHash);
     const job = this.#job;
     if (!job || job.generation !== build.generation || job.status.status !== "complete") {
@@ -264,7 +268,7 @@ export class CoverageAnalysisService {
     if (stored.id !== fileId) {
       throw new CoverageReportNotReadyError("Coverage source details index is invalid.");
     }
-    return materializeSourceFileDetail(stored);
+    return materializeSourceFileDetail(stored, moduleId);
   }
 
   #requireBuild(buildHash: string): StagedBuild {

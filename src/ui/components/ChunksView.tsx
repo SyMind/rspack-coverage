@@ -23,7 +23,7 @@ export function ChunksView(props: { chunks: ChunkReport[] }) {
           <span>Type</span>
           <span>Status</span>
           <span>Emitted</span>
-          <span>Unused</span>
+          <span>Unexecuted</span>
           <span>Usage</span>
           <span>Modules</span>
         </div>

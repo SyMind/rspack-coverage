@@ -61,11 +61,13 @@ export async function loadCoverageSource(
   fileId: string,
   signal?: AbortSignal,
   attempt = 0,
+  moduleId?: string | null,
 ): Promise<SourceFileDetail> {
-  return (await request(
-    `/coverage-analysis/source?buildHash=${encodeURIComponent(buildHash)}&fileId=${encodeURIComponent(fileId)}&attempt=${attempt}`,
-    signal ? { signal } : {},
-  ).then((response) => response.json())) as SourceFileDetail;
+  const search = new URLSearchParams({ buildHash, fileId, attempt: String(attempt) });
+  if (moduleId) search.set("moduleId", moduleId);
+  return (await request(`/coverage-analysis/source?${search}`, signal ? { signal } : {}).then(
+    (response) => response.json(),
+  )) as SourceFileDetail;
 }
 
 export async function startCoverageAnalysis(

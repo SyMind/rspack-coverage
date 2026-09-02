@@ -3,7 +3,12 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { SourceFileSummary, TreeNodeReport, UsageMetrics } from "../../src/shared/types.js";
+import type {
+  BuildModule,
+  SourceFileSummary,
+  TreeNodeReport,
+  UsageMetrics,
+} from "../../src/shared/types.js";
 import { SourceExplorer, sortModuleSources } from "../../src/ui/components/SourceExplorer.js";
 
 vi.mock("@tanstack/react-virtual", () => ({
@@ -48,7 +53,7 @@ function source(
     metrics: metrics(unusedBytes),
     chunks: duplicated ? ["main", "lazy"] : ["main"],
     loadedChunks: duplicated ? ["main", "lazy"] : ["main"],
-    moduleIds: [],
+    moduleIds: [`module:${path}`],
     duplicated,
   };
 }
@@ -74,6 +79,10 @@ function fixture() {
     source("node_modules/pkg/index.js", 100, "node_modules"),
     source("src/heavy.js", 800, "first-party", true),
     source("src/alpha.js", 200),
+    {
+      ...source("[rspack runtime / unmapped]/main.js", 900, "runtime"),
+      moduleIds: [],
+    },
   ];
   const srcFiles = files.filter((file) => file.category === "first-party");
   const dependency = files.find((file) => file.category === "node_modules");
@@ -124,34 +133,41 @@ describe("SourceExplorer", () => {
         tree={tree}
         files={files}
         selectedFileId={null}
+        selectedModuleId={null}
         onSelectFile={onSelectFile}
       />,
     );
 
     expect(screen.getByRole("button", { name: "Modules" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("heading", { name: "Modules" })).toBeInTheDocument();
-    const sourceRows = screen.getAllByRole("button", { name: /^Open source / });
+    const sourceRows = screen.getAllByRole("button", { name: /^Open module / });
     expect(sourceRows.map((row) => row.getAttribute("aria-label"))).toEqual([
-      "Open source src/heavy.js",
-      "Open source src/alpha.js",
-      "Open source src/zeta.js",
-      "Open source node_modules/pkg/index.js",
+      "Open module src/heavy.js",
+      "Open module src/alpha.js",
+      "Open module src/zeta.js",
+      "Open module node_modules/pkg/index.js",
     ]);
     expect(within(sourceRows[0] as HTMLElement).getByText("duplicated")).toBeInTheDocument();
 
     fireEvent.click(sourceRows[0] as HTMLElement);
-    expect(onSelectFile).toHaveBeenCalledWith(files[2]);
+    expect(onSelectFile).toHaveBeenCalledWith(files[2], "module:src/heavy.js");
   });
 
   it("shares filters and supports directory expansion", () => {
     const { files, tree } = fixture();
     render(
-      <SourceExplorer tree={tree} files={files} selectedFileId={null} onSelectFile={vi.fn()} />,
+      <SourceExplorer
+        tree={tree}
+        files={files}
+        selectedFileId={null}
+        selectedModuleId={null}
+        onSelectFile={vi.fn()}
+      />,
     );
 
     fireEvent.change(screen.getByLabelText("Search sources"), { target: { value: "alpha" } });
-    expect(screen.getByRole("button", { name: "Open source src/alpha.js" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Open source src/heavy.js" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Open module src/alpha.js" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open module src/heavy.js" })).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Directory" }));
     expect(screen.getByRole("heading", { name: "Directory tree" })).toBeInTheDocument();
@@ -169,6 +185,73 @@ describe("SourceExplorer", () => {
     });
     expect(screen.queryByRole("button", { name: /directory src/ })).toBeNull();
     expect(screen.getByRole("button", { name: "Collapse directory node_modules" })).toBeVisible();
+  });
+
+  it("keeps separate Rspack module identities for one mapped source", () => {
+    const file = {
+      ...source("src/shared.ts", 100),
+      moduleIds: ["module-a", "module-b"],
+      moduleMetrics: metrics(7, 20),
+    };
+    const tree: TreeNodeReport = {
+      id: "root",
+      name: "Sources",
+      path: "",
+      kind: "root",
+      category: "all",
+      metrics: file.metrics,
+      chunks: file.chunks,
+      duplicated: false,
+      children: [fileNode(file)],
+    };
+    const onSelectFile = vi.fn();
+    const modules: BuildModule[] = [
+      {
+        id: "module-a",
+        identifier: "/project/src/shared.ts",
+        name: "./src/shared.ts",
+        resource: "/project/src/shared.ts",
+        moduleType: "javascript/auto",
+        chunks: ["main"],
+        issuer: null,
+        size: 20,
+        usedExports: true,
+        providedExports: null,
+        optimizationBailout: [],
+        nested: false,
+      },
+      {
+        id: "module-b",
+        identifier: "/project/src/shared.ts?lazy",
+        name: "./src/shared.ts?lazy",
+        resource: "/project/src/shared.ts",
+        moduleType: "javascript/auto",
+        chunks: ["lazy"],
+        issuer: null,
+        size: 20,
+        usedExports: true,
+        providedExports: null,
+        optimizationBailout: [],
+        nested: false,
+      },
+    ];
+    render(
+      <SourceExplorer
+        tree={tree}
+        files={[file]}
+        modules={modules}
+        selectedFileId={null}
+        selectedModuleId={null}
+        onSelectFile={onSelectFile}
+      />,
+    );
+
+    const rows = screen.getAllByRole("button", { name: "Open module src/shared.ts" });
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveTextContent("20 B7 B65%");
+    expect(rows[1]).toHaveTextContent("0 B0 B—");
+    fireEvent.click(rows[1] as HTMLElement);
+    expect(onSelectFile).toHaveBeenCalledWith(file, "module-b");
   });
 
   it("sorts large module collections without mutating the report", () => {

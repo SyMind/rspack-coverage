@@ -256,6 +256,7 @@ describe("RspackCoveragePlugin", () => {
     temporaryDirectory = await mkdtemp(join(tmpdir(), "rspack-coverage-exports-"));
     const entry = join(temporaryDirectory, "index.js");
     const exportsFile = join(temporaryDirectory, "exports.js");
+    const commonJsExportsFile = join(temporaryDirectory, "common.cjs");
     const output = join(temporaryDirectory, "dist");
     await writeFile(
       exportsFile,
@@ -265,8 +266,20 @@ describe("RspackCoveragePlugin", () => {
       ].join("\n"),
     );
     await writeFile(
+      commonJsExportsFile,
+      [
+        "exports.normal = void 0;",
+        "exports.normal = () => 'normal';",
+        "exports.skipped = () => 'skipped';",
+      ].join("\n"),
+    );
+    await writeFile(
       entry,
-      "import { ACTIONS } from './exports.js'; document.body.textContent = ACTIONS.next();\n",
+      [
+        "import { ACTIONS } from './exports.js';",
+        "const { normal } = require('./common.cjs');",
+        "document.body.textContent = ACTIONS.next() + normal();",
+      ].join("\n"),
     );
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -322,6 +335,30 @@ describe("RspackCoveragePlugin", () => {
     ).toMatchObject({
       state: "unused",
       precision: "exact",
+    });
+
+    status = 202;
+    payload = null;
+    for (let attempt = 0; attempt < 50 && status === 202; attempt += 1) {
+      const response = await fetch(
+        `${origin}/__rspack_coverage__/api/source-exports?buildHash=${encodeURIComponent(manifest.hash)}&source=${encodeURIComponent("common.cjs")}`,
+        { headers },
+      );
+      status = response.status;
+      payload = await response.json();
+      if (status === 202) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    expect(status).toBe(200);
+    expect(
+      payload.report.exports.find((item: any) => item.exportedName === "normal"),
+    ).toMatchObject({
+      state: "used",
+      precision: "exact",
+      range: {
+        start: { line: 2, column: 8 },
+        end: { line: 2, column: 14 },
+      },
     });
   });
 });

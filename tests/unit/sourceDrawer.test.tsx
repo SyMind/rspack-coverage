@@ -55,6 +55,16 @@ const file: SourceFileSummary = {
     unmappedBytes: 0,
     usageRatio: 0.5,
   },
+  moduleMetrics: {
+    emittedBytes: 12,
+    loadedBytes: 12,
+    executedBytes: 4,
+    unusedBytes: 8,
+    notLoadedBytes: 0,
+    mappedBytes: 12,
+    unmappedBytes: 0,
+    usageRatio: 1 / 3,
+  },
   chunks: ["main"],
   loadedChunks: ["main"],
   moduleIds: ["target"],
@@ -70,6 +80,7 @@ const detail: SourceFileDetail = {
       buildState: "retained",
       runtimeState: "executed",
       emittedBytes: 20,
+      loadedBytes: 20,
       executedBytes: 10,
       chunks: ["main"],
       ranges: [{ startColumn: 0, endColumn: 38, executed: true }],
@@ -80,6 +91,7 @@ const detail: SourceFileDetail = {
       buildState: "retained",
       runtimeState: "not-executed",
       emittedBytes: 10,
+      loadedBytes: 10,
       executedBytes: 0,
       chunks: ["main"],
       ranges: [{ startColumn: 0, endColumn: 22, executed: false }],
@@ -232,13 +244,23 @@ describe("SourceDrawer export usage", () => {
       entryPath: [],
     });
     const onClose = vi.fn();
-    render(<SourceDrawer buildHash="build" file={file} onClose={onClose} />);
+    render(<SourceDrawer buildHash="build" file={file} moduleId="target" onClose={onClose} />);
 
     expect(screen.getByText("Starting")).toBeVisible();
     expect(await screen.findByText("export", { selector: ".syntax-keyword" })).toBeVisible();
+    expect(api.loadCoverageSource).toHaveBeenCalledWith(
+      "build",
+      file.id,
+      expect.anything(),
+      0,
+      "target",
+    );
     expect(screen.getByLabelText("Source details for src/exports.ts")).toHaveClass(
       "coverage-source-drawer",
     );
+    expect(screen.getByText("Loaded").parentElement).toHaveTextContent("12 B");
+    expect(screen.getByText("Executed").parentElement).toHaveTextContent("4 B");
+    expect(screen.getByText("Unused").parentElement).toHaveTextContent("8 B");
     expect(document.querySelector(".source-columns")).toHaveTextContent("LineSource");
     expect(document.querySelector(".source-line")?.children).toHaveLength(2);
     expect(document.querySelector(".source-line .coverage-executed")).toHaveTextContent(

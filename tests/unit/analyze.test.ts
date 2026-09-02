@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { analyzeCoverage, materializeSourceFileDetail } from "../../src/analyzer/analyze.js";
+import {
+  analyzeCoverage,
+  materializeSourceFileDetail,
+  type StoredSourceFileDetail,
+} from "../../src/analyzer/analyze.js";
 import type {
   BuildManifest,
   RawSourceMapPayload,
@@ -19,7 +23,7 @@ function hash(text: string): string {
 
 describe("coverage analysis", () => {
   it("maps executed, unexecuted, not-loaded, not-emitted, and unmapped bytes", async () => {
-    const main = "aaaaabbbbb";
+    const main = "aaaaabbbbbrrrrr";
     const lazy = "ccccc";
     const build: BuildManifest = {
       hash: "build-1",
@@ -32,7 +36,7 @@ describe("coverage analysis", () => {
           id: "main",
           name: "main.js",
           urlPath: "/main.js",
-          size: 10,
+          size: 15,
           contentHash: hash(main),
           chunks: ["main"],
           mapAvailable: true,
@@ -55,7 +59,7 @@ describe("coverage analysis", () => {
           initial: true,
           entry: true,
           moduleIds: ["module-main"],
-          emittedBytes: 10,
+          emittedBytes: 15,
         },
         {
           id: "lazy",
@@ -110,7 +114,7 @@ describe("coverage analysis", () => {
         sources: ["webpack:///./src/index.js"],
         sourcesContent: ["used();\ncold();\nremoved();"],
         names: [],
-        mappings: "AAAA,KACA",
+        mappings: "AAAA,KACA,K",
       },
       lazy: {
         version: 3,
@@ -143,13 +147,40 @@ describe("coverage analysis", () => {
     });
 
     expect(report.metrics).toMatchObject({
-      emittedBytes: 15,
+      emittedBytes: 20,
+      loadedBytes: 15,
+      executedBytes: 5,
+      unusedBytes: 10,
+      notLoadedBytes: 5,
+      mappedBytes: 15,
+      unmappedBytes: 5,
+    });
+    expect(report.moduleMetrics).toMatchObject({
+      emittedBytes: 23,
+      loadedBytes: 16,
+      executedBytes: 8,
+      unusedBytes: 8,
+      notLoadedBytes: 7,
+      mappedBytes: 23,
+      unmappedBytes: 0,
+    });
+    const mainFile = report.files.find((file) => file.path === "src/index.js");
+    expect(mainFile?.metrics).toMatchObject({
+      emittedBytes: 10,
       loadedBytes: 10,
       executedBytes: 5,
       unusedBytes: 5,
-      notLoadedBytes: 5,
     });
-    const mainFile = report.files.find((file) => file.path === "src/index.js");
+    expect(mainFile?.moduleMetrics).toMatchObject({
+      emittedBytes: 16,
+      loadedBytes: 16,
+      executedBytes: 8,
+      unusedBytes: 8,
+    });
+    expect(report.files.find((file) => file.category === "runtime")).toMatchObject({
+      moduleIds: [],
+      metrics: { emittedBytes: 5, loadedBytes: 5, executedBytes: 0, unusedBytes: 5 },
+    });
     expect(
       details.get("src/index.js")?.lines.map((line) => [line.buildState, line.runtimeState]),
     ).toEqual([
@@ -163,8 +194,8 @@ describe("coverage analysis", () => {
     expect(report.chunks.find((chunk) => chunk.id === "main")?.loaded).toBe(true);
     expect(report.chunks.find((chunk) => chunk.id === "lazy")?.loaded).toBe(false);
     expect(progress).toContainEqual(["Mapping generated code", 2, 2]);
-    expect(progress).toContainEqual(["Building file reports", 0, 3]);
-    expect(progress).toContainEqual(["Building file reports", 3, 3]);
+    expect(progress).toContainEqual(["Building file reports", 0, 4]);
+    expect(progress).toContainEqual(["Building file reports", 4, 4]);
     expect(progress).toContainEqual(["Aggregating report", 0, 1]);
     expect(progress).toContainEqual(["Aggregating report", 1, 1]);
   });
@@ -228,6 +259,126 @@ describe("coverage analysis", () => {
         ?.lines.map((line) => line.text)
         .join("\n"),
     ).toBe(original);
+  });
+
+  it("keeps coverage separate for loaded module instances sharing one source", async () => {
+    const executed = "aaaaa";
+    const unexecuted = "bbbbb";
+    const build: BuildManifest = {
+      hash: "build-shared-source",
+      mode: "production",
+      context: "/project",
+      publicPath: "/",
+      builtAt: 1,
+      assets: [
+        {
+          id: "executed",
+          name: "executed.js",
+          urlPath: "/executed.js",
+          size: executed.length,
+          contentHash: hash(executed),
+          chunks: ["executed"],
+          mapAvailable: true,
+        },
+        {
+          id: "unexecuted",
+          name: "unexecuted.js",
+          urlPath: "/unexecuted.js",
+          size: unexecuted.length,
+          contentHash: hash(unexecuted),
+          chunks: ["unexecuted"],
+          mapAvailable: true,
+        },
+      ],
+      chunks: [],
+      modules: [
+        {
+          id: "module-executed",
+          identifier: "/project/src/shared.ts?executed",
+          name: "./src/shared.ts?executed",
+          resource: "/project/src/shared.ts",
+          moduleType: "javascript/auto",
+          chunks: ["executed"],
+          issuer: null,
+          size: 9,
+          usedExports: true,
+          providedExports: null,
+          optimizationBailout: [],
+          nested: false,
+        },
+        {
+          id: "module-unexecuted",
+          identifier: "/project/src/shared.ts?unexecuted",
+          name: "./src/shared.ts?unexecuted",
+          resource: "/project/src/shared.ts",
+          moduleType: "javascript/auto",
+          chunks: ["unexecuted"],
+          issuer: null,
+          size: 9,
+          usedExports: true,
+          providedExports: null,
+          optimizationBailout: [],
+          nested: false,
+        },
+      ],
+      entrypoints: [],
+      diagnostics: [],
+      capabilities: FULL_CAPABILITIES,
+      counts: { assets: 2, javascriptAssets: 2, chunks: 0, modules: 2, sourceMaps: 2 },
+      previewAvailable: true,
+      publicPathSupported: true,
+    };
+    const map: RawSourceMapPayload = {
+      version: 3,
+      sources: ["webpack:///./src/shared.ts"],
+      sourcesContent: ["shared();"],
+      names: [],
+      mappings: "AAAA",
+    };
+
+    let storedDetail: StoredSourceFileDetail | undefined;
+    const report = await analyzeCoverage({
+      build,
+      coverage: [
+        { url: "/executed.js", text: executed, ranges: [{ start: 0, end: executed.length }] },
+        { url: "/unexecuted.js", text: unexecuted, ranges: [] },
+      ],
+      maps: { executed: map, unexecuted: map },
+      generatedAssets: { executed, unexecuted },
+      originalSources: {},
+      precision: "per-block",
+      onFileDetail: (detail) => {
+        if (detail.id === "src/shared.ts") storedDetail = detail;
+      },
+    });
+
+    const file = report.files.find((candidate) => candidate.path === "src/shared.ts");
+    expect(file?.moduleMetrics).toMatchObject({
+      emittedBytes: 9,
+      loadedBytes: 9,
+      executedBytes: 9,
+      unusedBytes: 0,
+    });
+    expect(file?.moduleMetricsById?.["module-executed"]).toMatchObject({
+      loadedBytes: 9,
+      executedBytes: 9,
+      unusedBytes: 0,
+    });
+    expect(file?.moduleMetricsById?.["module-unexecuted"]).toMatchObject({
+      loadedBytes: 9,
+      executedBytes: 0,
+      unusedBytes: 9,
+    });
+    expect(
+      storedDetail
+        ? materializeSourceFileDetail(storedDetail, "module-executed").lines[0]?.runtimeState
+        : null,
+    ).toBe("executed");
+    expect(
+      storedDetail
+        ? materializeSourceFileDetail(storedDetail, "module-unexecuted").lines[0]?.runtimeState
+        : null,
+    ).toBe("not-executed");
   });
 
   it("rejects stale generated content instead of producing a report", async () => {
@@ -296,6 +447,21 @@ describe("coverage analysis", () => {
       chunks: [],
       modules: [
         {
+          id: "exact-resource",
+          identifier: "/project/.generated/feature.js",
+          name: "./src/feature.js",
+          resource: "/project/.generated/feature.js",
+          sourcePaths: ["/project/src/feature.js"],
+          moduleType: "javascript/auto",
+          chunks: ["exact"],
+          issuer: null,
+          size: 1,
+          usedExports: true,
+          providedExports: null,
+          optimizationBailout: [],
+          nested: false,
+        },
+        {
           id: "longer-resource",
           identifier: "/workspace/project/src/feature.js",
           name: "./src/feature.js",
@@ -331,7 +497,7 @@ describe("coverage analysis", () => {
         sourceMap: "none",
         originalLocations: "unavailable",
       },
-      counts: { assets: 1, javascriptAssets: 1, chunks: 0, modules: 2, sourceMaps: 0 },
+      counts: { assets: 1, javascriptAssets: 1, chunks: 0, modules: 3, sourceMaps: 0 },
       previewAvailable: true,
       publicPathSupported: true,
     };
@@ -348,8 +514,8 @@ describe("coverage analysis", () => {
     });
 
     expect(report.files.find((file) => file.path === "src/feature.js")).toMatchObject({
-      moduleIds: ["longer-resource"],
-      chunks: ["feature"],
+      moduleIds: ["exact-resource"],
+      chunks: ["exact"],
     });
     expect(report.files.find((file) => file.path === "packages/app/src/shared.js")).toMatchObject({
       moduleIds: ["shorter-resource"],
@@ -357,7 +523,7 @@ describe("coverage analysis", () => {
     });
   });
 
-  it("uses one executed state for a partially covered source line", async () => {
+  it("marks a source line executed when any mapped range ran", async () => {
     const text = "aaaaabbbbb";
     const build: BuildManifest = {
       hash: "build-line",
@@ -408,7 +574,7 @@ describe("coverage analysis", () => {
 
     const line = details.get("src/one-line.js")?.lines[0];
     expect(line?.runtimeState).toBe("executed");
-    expect(new Set(line?.ranges.map((range) => range.executed))).toEqual(new Set([true]));
+    expect(new Set(line?.ranges.map((range) => range.executed))).toEqual(new Set([true, false]));
   });
 
   it("does not create empty rows beyond available sourcesContent", async () => {

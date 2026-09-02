@@ -19,7 +19,7 @@ import type {
 } from "../shared/types.js";
 import { intersectRanges, mergeRanges } from "./ranges.js";
 import { buildGeneratedSpans } from "./sourceMap.js";
-import { buildUtf8Prefix, splitSourceLines, utf8BytesBetween } from "./utf.js";
+import { buildLineStarts, buildUtf8Prefix, splitSourceLines, utf8BytesBetween } from "./utf.js";
 
 interface MatchedCoverage {
   asset: BuildAsset;
@@ -33,6 +33,14 @@ interface MutableLine {
   executedBytes: number;
   chunks: Set<string>;
   ranges: SourceLineState["ranges"];
+  assets: Map<string, LineAssetEvidence>;
+}
+
+interface LineAssetEvidence {
+  emittedBytes: number;
+  loadedBytes: number;
+  executedBytes: number;
+  chunks: string[];
 }
 
 interface MutableFile {
@@ -68,6 +76,10 @@ interface StoredSourceLine {
   executedBytes: number;
   chunks: string[];
   ranges: SourceLineState["ranges"];
+  moduleStates?: Record<
+    string,
+    { emittedBytes: number; loadedBytes: number; executedBytes: number }
+  >;
 }
 
 export interface StoredSourceFileDetail {
@@ -148,7 +160,10 @@ function runtimeState(line: Pick<MutableLine, "loadedBytes" | "executedBytes">):
   return line.executedBytes > 0 ? "executed" : "not-executed";
 }
 
-export function materializeSourceFileDetail(input: StoredSourceFileDetail): SourceFileDetail {
+export function materializeSourceFileDetail(
+  input: StoredSourceFileDetail,
+  moduleId?: string | null,
+): SourceFileDetail {
   const sourceLines = input.content === null ? [] : splitSourceLines(input.content);
   let maxMappedLine = -1;
   const mappedLines = new Map<number, StoredSourceLine>();
@@ -162,8 +177,10 @@ export function materializeSourceFileDetail(input: StoredSourceFileDetail): Sour
   const lines: SourceLineState[] = [];
   for (let index = 0; index < lineCount; index += 1) {
     const mapped = mappedLines.get(index);
+    const moduleState = moduleId ? mapped?.moduleStates?.[moduleId] : undefined;
+    const evidence = mapped && moduleState ? { ...mapped, ...moduleState } : mapped;
     const text = sourceLines[index] ?? "";
-    const lineRuntimeState = mapped ? runtimeState(mapped) : "not-loaded";
+    const lineRuntimeState = evidence ? runtimeState(evidence) : "not-loaded";
     lines.push({
       line: index + 1,
       text,
@@ -173,14 +190,11 @@ export function materializeSourceFileDetail(input: StoredSourceFileDetail): Sour
           ? "not-emitted"
           : "unknown",
       runtimeState: lineRuntimeState,
-      emittedBytes: mapped?.emittedBytes ?? 0,
-      executedBytes: mapped?.executedBytes ?? 0,
+      emittedBytes: evidence?.emittedBytes ?? 0,
+      loadedBytes: evidence?.loadedBytes ?? 0,
+      executedBytes: evidence?.executedBytes ?? 0,
       chunks: mapped?.chunks ?? input.chunks,
-      ranges:
-        mapped?.ranges.map((range) => ({
-          ...range,
-          executed: lineRuntimeState === "executed",
-        })) ?? [],
+      ranges: mapped?.ranges.map((range) => ({ ...range })) ?? [],
     });
   }
   return { id: input.id, lines };
@@ -248,20 +262,32 @@ function addLineBytes(
     loaded: number;
     executed: number;
     chunks: string[];
+    assetId: string;
     startColumn: number;
     endColumn: number;
   },
 ): void {
-  const line = file.lines.get(lineNumber) ?? {
+  const line: MutableLine = file.lines.get(lineNumber) ?? {
     emittedBytes: 0,
     loadedBytes: 0,
     executedBytes: 0,
     chunks: new Set<string>(),
     ranges: [],
+    assets: new Map(),
   };
   line.emittedBytes += input.emitted;
   line.loadedBytes += input.loaded;
   line.executedBytes += input.executed;
+  const asset = line.assets.get(input.assetId) ?? {
+    emittedBytes: 0,
+    loadedBytes: 0,
+    executedBytes: 0,
+    chunks: input.chunks,
+  };
+  asset.emittedBytes += input.emitted;
+  asset.loadedBytes += input.loaded;
+  asset.executedBytes += input.executed;
+  line.assets.set(input.assetId, asset);
   for (const chunk of input.chunks) line.chunks.add(chunk);
   if (input.loaded > 0) {
     line.ranges.push({
@@ -325,8 +351,13 @@ function buildSourceModuleIndex(
 
   for (let order = 0; order < build.modules.length; order += 1) {
     const module = build.modules[order];
-    if (module?.resource) {
-      const resource = normalizeSourcePathForContext(module.resource, build.context);
+    if (!module) continue;
+    const ownedPaths = new Set(
+      [module.resource, ...(module.sourcePaths ?? [])]
+        .filter((path): path is string => Boolean(path))
+        .map((path) => normalizeSourcePathForContext(path, build.context)),
+    );
+    for (const resource of ownedPaths) {
       const indexed = {
         id: module.id,
         chunks: module.chunks,
@@ -351,14 +382,22 @@ function buildSourceModuleIndex(
 }
 
 function modulesForSource(index: SourceModuleIndex, sourcePath: string): IndexedSourceModule[] {
-  const matches = new Map<number, IndexedSourceModule>();
-  const suffixes = pathSuffixes(sourcePath);
-  for (const suffix of suffixes) {
-    for (const module of index.byResource.get(suffix) ?? []) {
-      matches.set(module.order, module);
+  // Exact normalized resource identity is authoritative. Previously an exact
+  // match was combined with every shorter suffix match, so `src/index.ts`
+  // could inherit unrelated module instances ending in the same path.
+  const exact = index.byResource.get(sourcePath);
+  if (exact?.length) return [...exact].sort((a, b) => a.order - b.order);
+
+  // If source-map and stats paths use different roots, use only the longest
+  // suffix that resolves. Never merge progressively shorter suffixes.
+  for (const suffix of pathSuffixes(sourcePath).slice(1)) {
+    const suffixMatches = index.byResource.get(suffix);
+    if (suffixMatches?.length) {
+      return [...suffixMatches].sort((a, b) => a.order - b.order);
     }
   }
 
+  const matches = new Map<number, IndexedSourceModule>();
   const reversedPrefix = `${reversePath(sourcePath)}/`;
   for (
     let moduleIndex = lowerBoundByReversedResource(index.byReversedResource, reversedPrefix);
@@ -371,6 +410,54 @@ function modulesForSource(index: SourceModuleIndex, sourcePath: string): Indexed
   }
 
   return [...matches.values()].sort((a, b) => a.order - b.order);
+}
+
+function retainedSourceMetrics(
+  file: MutableFile,
+  moduleChunks?: ReadonlySet<string>,
+): UsageMetrics | null {
+  if (file.content === null) return null;
+  const prefix = buildUtf8Prefix(file.content);
+  const starts = buildLineStarts(file.content);
+  const metrics = emptyMetrics();
+
+  // The module view is source-oriented: a retained source line is counted
+  // once, regardless of how much generated/minified code maps back to it or
+  // how many assets contain a copy. Generated-byte evidence is used only to
+  // classify that source line as loaded/executed. A line with any executed
+  // generated range is counted as fully executed at source-line precision.
+  for (const [lineIndex, line] of file.lines) {
+    const { emittedBytes, loadedBytes, executedBytes } = lineEvidence(line, moduleChunks);
+    if (emittedBytes <= 0) continue;
+    const start = starts[lineIndex];
+    if (start === undefined) continue;
+    const end = starts[lineIndex + 1] ?? file.content.length;
+    const sourceBytes = utf8BytesBetween(prefix, start, end);
+    if (sourceBytes === 0) continue;
+
+    metrics.emittedBytes += sourceBytes;
+    metrics.mappedBytes += sourceBytes;
+    if (loadedBytes <= 0) continue;
+    metrics.loadedBytes += sourceBytes;
+    if (executedBytes <= 0) continue;
+    metrics.executedBytes += sourceBytes;
+  }
+  return finalizeMetrics(metrics);
+}
+
+function lineEvidence(
+  line: MutableLine,
+  moduleChunks?: ReadonlySet<string>,
+): Pick<LineAssetEvidence, "emittedBytes" | "loadedBytes" | "executedBytes"> {
+  if (!moduleChunks?.size) return line;
+  const result = { emittedBytes: 0, loadedBytes: 0, executedBytes: 0 };
+  for (const evidence of line.assets.values()) {
+    if (!evidence.chunks.some((chunk) => moduleChunks.has(chunk))) continue;
+    result.emittedBytes += evidence.emittedBytes;
+    result.loadedBytes += evidence.loadedBytes;
+    result.executedBytes += evidence.executedBytes;
+  }
+  return result;
 }
 
 async function toFileReports(
@@ -397,12 +484,27 @@ async function toFileReports(
     }
     const fileChunks = [...chunks];
     const loadedChunks = [...file.loadedChunks];
+    const moduleMetrics =
+      modules.length === 1
+        ? retainedSourceMetrics(file, new Set(modules[0]?.chunks))
+        : retainedSourceMetrics(file);
+    const moduleMetricsById =
+      modules.length > 1
+        ? Object.fromEntries(
+            modules.map((module) => [
+              module.id,
+              retainedSourceMetrics(file, new Set(module.chunks)) ?? emptyMetrics(),
+            ]),
+          )
+        : undefined;
     const summary: SourceFileSummary = {
       id: file.path,
       path: file.path,
       displayPath: file.path,
       category: sourceCategory(file.path),
       metrics: file.metrics,
+      moduleMetrics: modules.length > 0 ? moduleMetrics : null,
+      ...(moduleMetricsById ? { moduleMetricsById } : {}),
       chunks: fileChunks,
       loadedChunks,
       moduleIds,
@@ -420,6 +522,13 @@ async function toFileReports(
         executedBytes: line.executedBytes,
         chunks: [...line.chunks],
         ranges: line.ranges,
+        ...(modules.length > 1
+          ? {
+              moduleStates: Object.fromEntries(
+                modules.map((module) => [module.id, lineEvidence(line, new Set(module.chunks))]),
+              ),
+            }
+          : {}),
       })),
     });
     reports.push(summary);
@@ -531,24 +640,25 @@ function buildTree(files: SourceFileSummary[]): TreeNodeReport {
 function buildOpportunities(files: SourceFileSummary[], chunks: ChunkReport[]): Opportunity[] {
   const opportunities: Opportunity[] = [];
   for (const file of files) {
-    if (file.metrics.loadedBytes === 0) continue;
-    if (file.metrics.unusedBytes >= 1024) {
+    const metrics = file.moduleMetrics;
+    if (!metrics || metrics.loadedBytes === 0) continue;
+    if (metrics.unusedBytes >= 1024) {
       opportunities.push({
         id: `unused:${file.id}`,
         kind: "largest-unused",
-        title: "Large loaded-but-unexecuted source",
+        title: "Large unused retained module",
         description:
-          "This source contributed generated bytes to a loaded asset, but much of that generated code did not execute in this recording.",
+          "Rspack retained these original-source lines in a loaded module, but much of that source did not execute in this recording.",
         path: file.path,
         fileId: file.id,
-        metrics: file.metrics,
+        metrics,
         evidence: [
-          `${file.metrics.unusedBytes} unused generated bytes`,
+          `${metrics.unusedBytes} unused retained source bytes`,
           `${file.loadedChunks.length} loaded chunk(s)`,
         ],
       });
     }
-    if ((file.metrics.usageRatio ?? 1) < 0.25 && file.metrics.loadedBytes >= 10_000) {
+    if ((metrics.usageRatio ?? 1) < 0.25 && metrics.loadedBytes >= 10_000) {
       opportunities.push({
         id: `low:${file.id}`,
         kind: "low-usage",
@@ -557,8 +667,8 @@ function buildOpportunities(files: SourceFileSummary[], chunks: ChunkReport[]): 
           "A large emitted contribution has low execution coverage in the imported user journey.",
         path: file.path,
         fileId: file.id,
-        metrics: file.metrics,
-        evidence: [`${Math.round((file.metrics.usageRatio ?? 0) * 100)}% byte usage`],
+        metrics,
+        evidence: [`${Math.round((metrics.usageRatio ?? 0) * 100)}% byte usage`],
       });
     }
     if (file.duplicated) {
@@ -570,13 +680,13 @@ function buildOpportunities(files: SourceFileSummary[], chunks: ChunkReport[]): 
           "Generated instances of the same original source are present in more than one loaded chunk.",
         path: file.path,
         fileId: file.id,
-        metrics: file.metrics,
+        metrics,
         evidence: file.loadedChunks.map((chunk) => `Loaded chunk ${chunk}`),
       });
     }
     if (
       /(?:locale|locales|schema|schemas|polyfill|icons?)(?:\/|\.|-)/i.test(file.path) &&
-      file.metrics.loadedBytes >= 4096
+      metrics.loadedBytes >= 4096
     ) {
       opportunities.push({
         id: `collection:${file.id}`,
@@ -586,7 +696,7 @@ function buildOpportunities(files: SourceFileSummary[], chunks: ChunkReport[]): 
           "The path looks like a locale, schema, polyfill, or icon collection. Check whether narrower imports or lazy loading fit the product behavior.",
         path: file.path,
         fileId: file.id,
-        metrics: file.metrics,
+        metrics,
         evidence: ["Path-pattern signal only; verify source and runtime behavior"],
       });
     }
@@ -717,6 +827,7 @@ export async function analyzeCoverage(input: {
           loaded: loaded ? emittedBytes : 0,
           executed: executedBytes,
           chunks: asset.chunks,
+          assetId: asset.id,
           startColumn,
           endColumn,
         });
@@ -732,6 +843,10 @@ export async function analyzeCoverage(input: {
   );
 
   const fileReports = await toFileReports(files, input.build, input.onProgress, input.onFileDetail);
+  const moduleMetrics = emptyMetrics();
+  for (const file of fileReports) {
+    if (file.moduleMetrics) addMetrics(moduleMetrics, file.moduleMetrics);
+  }
   input.onProgress?.("Aggregating report", 0, 1);
   const tree = buildTree(fileReports);
   const assetsByName = new Map<string, BuildAsset>();
@@ -764,6 +879,7 @@ export async function analyzeCoverage(input: {
     buildHash: input.build.hash,
     createdAt: Date.now(),
     metrics: finalizeMetrics(globalMetrics),
+    moduleMetrics: finalizeMetrics(moduleMetrics),
     importSummary: {
       importedEntries: input.coverage.length,
       matchedAssets: matched.size,

@@ -18,14 +18,21 @@ import {
   reuseCoverageAnalysis,
   startCoverageAnalysis,
 } from "./lib/api.js";
+import { formatBytes } from "./lib/format.js";
 
 type Tab = "sources" | "chunks" | "opportunities";
+
+interface SelectedSource {
+  file: SourceFileSummary;
+  moduleId: string | null;
+}
 
 export function App() {
   const [build, setBuild] = useState<BuildManifest | null>(null);
   const [report, setReport] = useState<CoverageReport | null>(null);
   const [tab, setTab] = useState<Tab>("sources");
-  const [selectedFile, setSelectedFile] = useState<SourceFileSummary | null>(null);
+  const [selectedSource, setSelectedSource] = useState<SelectedSource | null>(null);
+  const selectedFile = selectedSource?.file ?? null;
   const [precision, setPrecision] = useState<CoverageImportSummary["precision"]>("per-block");
   const [recentAvailable, setRecentAvailable] = useState(false);
   const [progress, setProgress] = useState<string | null>(null);
@@ -197,26 +204,32 @@ export function App() {
             <MetricCard
               label="Loaded JS"
               value={report.metrics.loadedBytes}
-              note={`${loadedChunkCount} of ${report.chunks.length} chunks`}
+              note={`${formatBytes(report.moduleMetrics.loadedBytes)} retained module code`}
             />
-            <MetricCard label="Executed" value={report.metrics.executedBytes} tone="green" />
+            <MetricCard
+              label="Executed"
+              value={report.moduleMetrics.executedBytes}
+              tone="green"
+              note="retained module code"
+            />
             <MetricCard
               label="Unused"
-              value={report.metrics.unusedBytes}
+              value={report.moduleMetrics.unusedBytes}
               tone="orange"
-              note="loaded, not executed"
+              note="retained + loaded, not executed"
             />
             <MetricCard
               label="Usage"
-              value={report.metrics.usageRatio ?? 0}
+              value={report.moduleMetrics.usageRatio ?? 0}
               kind="percent"
               tone="green"
+              note="retained module code"
             />
             <MetricCard
               label="Not loaded"
-              value={report.metrics.notLoadedBytes}
+              value={report.moduleMetrics.notLoadedBytes}
               tone="gray"
-              note="emitted in other chunks"
+              note={`${loadedChunkCount} of ${report.chunks.length} chunks loaded`}
             />
           </section>
           <nav className="tabs" aria-label="Coverage report sections">
@@ -246,8 +259,10 @@ export function App() {
             <SourceExplorer
               tree={report.tree}
               files={report.files}
+              modules={build.modules}
               selectedFileId={selectedFile?.id ?? null}
-              onSelectFile={setSelectedFile}
+              selectedModuleId={selectedSource?.moduleId ?? null}
+              onSelectFile={(file, moduleId) => setSelectedSource({ file, moduleId })}
             />
           ) : tab === "chunks" ? (
             <ChunksView chunks={report.chunks} />
@@ -255,17 +270,23 @@ export function App() {
             <OpportunitiesView
               opportunities={report.opportunities}
               files={report.files}
-              onSelectFile={setSelectedFile}
+              onSelectFile={(file) => setSelectedSource({ file, moduleId: null })}
             />
           )}
         </main>
       )}
       <SourceDrawer
-        key={`${build.hash}:${selectedFile?.id ?? "closed"}`}
+        key={`${build.hash}:${selectedFile?.id ?? "closed"}:${selectedSource?.moduleId ?? "source"}`}
         buildHash={build.hash}
         file={selectedFile}
+        moduleId={selectedSource?.moduleId ?? null}
+        module={
+          selectedSource?.moduleId
+            ? (build.modules.find((module) => module.id === selectedSource.moduleId) ?? null)
+            : null
+        }
         onClose={() => {
-          setSelectedFile(null);
+          setSelectedSource(null);
           const url = new URL(location.href);
           url.searchParams.delete("module");
           url.searchParams.delete("export");

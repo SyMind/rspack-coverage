@@ -1,5 +1,5 @@
 import { extname, isAbsolute } from "node:path";
-import { emptyMetrics, finalizeMetrics } from "../shared/metrics.js";
+import { emptyMetrics, finalizeMetrics, metricsForModuleInstance } from "../shared/metrics.js";
 import { normalizeSourcePath } from "../shared/path.js";
 import type {
   BuildModule,
@@ -129,6 +129,7 @@ function unknownLines(content: string): SourceLineState[] {
     buildState: "unknown",
     runtimeState: "not-loaded",
     emittedBytes: 0,
+    loadedBytes: 0,
     executedBytes: 0,
     chunks: [],
     ranges: [],
@@ -144,7 +145,7 @@ function coverageStatus(
 ): "executed" | "unexecuted" | "not-emitted" | "unloaded" | "unknown" {
   if (!line) return "unknown";
   if (line.buildState === "not-emitted") return "not-emitted";
-  if (line.runtimeState === "executed" || line.runtimeState === "partial") return "executed";
+  if (line.runtimeState === "executed") return "executed";
   if (line.runtimeState === "not-executed") return "unexecuted";
   if (line.runtimeState === "not-loaded") return "unloaded";
   return "unknown";
@@ -228,12 +229,14 @@ export class InvestigationModel {
 
   #metrics(moduleId: string): UsageMetrics {
     const metrics = emptyMetrics();
+    const module = this.#modules.get(moduleId);
     for (const file of this.#filesForModule(moduleId)) {
-      metrics.emittedBytes += file.metrics.emittedBytes;
-      metrics.loadedBytes += file.metrics.loadedBytes;
-      metrics.executedBytes += file.metrics.executedBytes;
-      metrics.mappedBytes += file.metrics.mappedBytes;
-      metrics.unmappedBytes += file.metrics.unmappedBytes;
+      const sourceMetrics = metricsForModuleInstance(file, module);
+      metrics.emittedBytes += sourceMetrics.emittedBytes;
+      metrics.loadedBytes += sourceMetrics.loadedBytes;
+      metrics.executedBytes += sourceMetrics.executedBytes;
+      metrics.mappedBytes += sourceMetrics.mappedBytes;
+      metrics.unmappedBytes += sourceMetrics.unmappedBytes;
     }
     return finalizeMetrics(metrics);
   }
@@ -258,13 +261,16 @@ export class InvestigationModel {
     const hasMappedOutput = metrics.mappedBytes > 0;
     return {
       ...module,
-      sources: files.map((file) => ({
-        id: file.id,
-        name: file.path,
-        mappedBytes: file.metrics.mappedBytes,
-        loadedBytes: file.metrics.loadedBytes,
-        executedBytes: file.metrics.executedBytes,
-      })),
+      sources: files.map((file) => {
+        const sourceMetrics = metricsForModuleInstance(file, module);
+        return {
+          id: file.id,
+          name: file.path,
+          mappedBytes: sourceMetrics.mappedBytes,
+          loadedBytes: sourceMetrics.loadedBytes,
+          executedBytes: sourceMetrics.executedBytes,
+        };
+      }),
       metrics,
       incomingReferences: this.#incoming.get(moduleId)?.length ?? 0,
       outgoingReferences: this.#outgoing.get(moduleId)?.length ?? 0,

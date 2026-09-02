@@ -1,10 +1,18 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useMemo, useRef, useState } from "react";
-import type { SourceFileSummary, TreeNodeReport } from "../../shared/types.js";
+import { metricsForModuleInstance } from "../../shared/metrics.js";
+import type { BuildModule, SourceFileSummary, TreeNodeReport } from "../../shared/types.js";
 import { formatBytes, formatPercent, usageColor } from "../lib/format.js";
 
 type SourceView = "modules" | "directory";
-type FlatNode = { node: TreeNodeReport; depth: number };
+type FlatNode = { node: TreeNodeReport; depth: number; moduleId: string | null };
+
+function displayedModuleMetrics(
+  file: SourceFileSummary,
+  module?: BuildModule,
+): SourceFileSummary["metrics"] {
+  return metricsForModuleInstance(file, module);
+}
 
 function compareByUnusedBytesAndPath(
   left: Pick<SourceFileSummary, "path" | "metrics">,
@@ -16,7 +24,14 @@ function compareByUnusedBytesAndPath(
 }
 
 export function sortModuleSources(files: SourceFileSummary[]): SourceFileSummary[] {
-  return [...files].sort(compareByUnusedBytesAndPath);
+  return files
+    .filter((file) => file.moduleIds.length > 0)
+    .sort((left, right) =>
+      compareByUnusedBytesAndPath(
+        { path: left.path, metrics: displayedModuleMetrics(left) },
+        { path: right.path, metrics: displayedModuleMetrics(right) },
+      ),
+    );
 }
 
 function matchesFilter(node: TreeNodeReport, category: string, search: string): boolean {
@@ -38,7 +53,7 @@ function flattenTree(
   const output: FlatNode[] = [];
   const visit = (node: TreeNodeReport, depth: number) => {
     if (node !== root && !matchesFilter(node, category, search)) return;
-    if (node !== root) output.push({ node, depth });
+    if (node !== root) output.push({ node, depth, moduleId: null });
     const open = node === root || expanded.has(node.id) || Boolean(search);
     if (open) {
       for (const child of [...node.children].sort(compareByUnusedBytesAndPath)) {
@@ -50,35 +65,49 @@ function flattenTree(
   return output;
 }
 
-function moduleRows(files: SourceFileSummary[], category: string, search: string): FlatNode[] {
+function moduleRows(
+  files: SourceFileSummary[],
+  modulesById: ReadonlyMap<string, BuildModule>,
+  category: string,
+  search: string,
+): FlatNode[] {
   return sortModuleSources(files)
     .filter(
       (file) =>
         (category === "all" || file.category === category) &&
         (!search || file.path.toLowerCase().includes(search)),
     )
-    .map((file) => ({
-      depth: 0,
-      node: {
-        id: `module:${file.id}`,
-        name: file.displayPath,
-        path: file.path,
-        kind: "file",
-        category: file.category,
-        metrics: file.metrics,
-        chunks: file.chunks,
-        duplicated: file.duplicated,
-        fileId: file.id,
-        children: [],
-      },
-    }));
+    .flatMap((file) =>
+      file.moduleIds.map((moduleId) => {
+        const module = modulesById.get(moduleId);
+        return {
+          depth: 0,
+          moduleId,
+          node: {
+            id: `module:${moduleId}:${file.id}`,
+            name: file.displayPath,
+            path: file.path,
+            kind: "file" as const,
+            category: file.category,
+            metrics: displayedModuleMetrics(file, module),
+            chunks: module?.chunks ?? file.chunks,
+            duplicated: file.duplicated,
+            fileId: file.id,
+            children: [],
+          },
+        };
+      }),
+    )
+    .sort((left, right) => compareByUnusedBytesAndPath(left.node, right.node));
 }
 
 export function SourceExplorer(props: {
   tree: TreeNodeReport;
   files: SourceFileSummary[];
+  modules?: BuildModule[];
   selectedFileId: string | null;
-  onSelectFile: (file: SourceFileSummary) => void;
+  selectedModuleId: string | null;
+  onSelectFile: (file: SourceFileSummary, moduleId: string | null) => void;
 }) {
   const [view, setView] = useState<SourceView>("modules");
   const [expanded, setExpanded] = useState(
@@ -88,12 +117,16 @@ export function SourceExplorer(props: {
   const [category, setCategory] = useState("all");
   const scrollRef = useRef<HTMLDivElement>(null);
   const normalizedSearch = search.trim().toLowerCase();
+  const modulesById = useMemo(
+    () => new Map((props.modules ?? []).map((module) => [module.id, module])),
+    [props.modules],
+  );
   const rows = useMemo(
     () =>
       view === "modules"
-        ? moduleRows(props.files, category, normalizedSearch)
+        ? moduleRows(props.files, modulesById, category, normalizedSearch)
         : flattenTree(props.tree, expanded, category, normalizedSearch),
-    [props.files, props.tree, view, expanded, category, normalizedSearch],
+    [props.files, props.tree, modulesById, view, expanded, category, normalizedSearch],
   );
   const virtualizer = useVirtualizer({
     count: rows.length,
@@ -161,7 +194,7 @@ export function SourceExplorer(props: {
       <div className="tree-table-head">
         <span>Path</span>
         <span>Loaded</span>
-        <span>Unused</span>
+        <span>{view === "modules" ? "Unused" : "Unexecuted"}</span>
         <span>Usage</span>
         <span>Chunks</span>
       </div>
@@ -170,7 +203,7 @@ export function SourceExplorer(props: {
           {virtualizer.getVirtualItems().map((virtualRow) => {
             const row = rows[virtualRow.index];
             if (!row) return null;
-            const { node, depth } = row;
+            const { node, depth, moduleId } = row;
             const open = expanded.has(node.id) || Boolean(normalizedSearch);
             const isFile = node.kind === "file";
             return (
@@ -178,17 +211,23 @@ export function SourceExplorer(props: {
                 type="button"
                 aria-label={
                   isFile
-                    ? `Open source ${node.path}`
+                    ? view === "modules"
+                      ? `Open module ${node.path}`
+                      : `Open source ${node.path}`
                     : `${open ? "Collapse" : "Expand"} directory ${node.path}`
                 }
                 aria-expanded={isFile ? undefined : open}
-                className={`tree-row ${node.fileId === props.selectedFileId ? "is-selected" : ""}`}
+                className={`tree-row ${
+                  node.fileId === props.selectedFileId && moduleId === props.selectedModuleId
+                    ? "is-selected"
+                    : ""
+                }`}
                 key={node.id}
                 style={{ transform: `translateY(${virtualRow.start}px)` }}
                 onClick={() => {
                   if (isFile && node.fileId) {
                     const file = filesById.get(node.fileId);
-                    if (file) props.onSelectFile(file);
+                    if (file) props.onSelectFile(file, moduleId);
                   } else {
                     const next = new Set(expanded);
                     if (next.has(node.id)) next.delete(node.id);
@@ -200,7 +239,7 @@ export function SourceExplorer(props: {
                 <span
                   className="tree-path"
                   style={{ paddingLeft: `${12 + depth * 18}px` }}
-                  title={node.path}
+                  title={moduleId ? `${node.path}\n${moduleId}` : node.path}
                 >
                   <i
                     className={`usage-dot ${node.metrics.loadedBytes === 0 ? "is-not-loaded" : ""}`}
@@ -234,7 +273,7 @@ export function SourceExplorer(props: {
       </div>
       <div className="panel-footnote">
         {view === "modules"
-          ? "Each row is an original source-map source, ordered by unused generated bytes."
+          ? "Each row is a Rspack module instance. Sizes count retained original-source UTF-8 bytes once; tree-shaken/minified-away lines and not-loaded code are excluded from unused."
           : "Sizes are final generated UTF-8 bytes. Directory usage is byte-weighted."}
       </div>
     </section>

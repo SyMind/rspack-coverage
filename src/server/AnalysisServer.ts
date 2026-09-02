@@ -244,7 +244,11 @@ export class AnalysisServer {
         sendJson(response, 400, { error: "buildHash and fileId are required" });
         return;
       }
-      const source = await this.#coverageAnalysis.source(buildHash, fileId);
+      const source = await this.#coverageAnalysis.source(
+        buildHash,
+        fileId,
+        url.searchParams.get("moduleId"),
+      );
       sendJson(response, 200, source);
       return;
     }

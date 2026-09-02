@@ -23,6 +23,11 @@ interface ParsedExport {
   typeOnly: boolean;
 }
 
+interface InferredCommonJsUsage {
+  names: Set<string>;
+  namespace: boolean;
+}
+
 type Progress = (phase: string, completed: number, total: number) => void;
 
 function nodeName(node: any): string | null {
@@ -65,6 +70,176 @@ function keywordRange(content: string, node: any, keyword: string): SourceRange 
     start: { line: node.loc.start.line, column: node.loc.start.column + index },
     end: { line: node.loc.start.line, column: node.loc.start.column + index + keyword.length },
   };
+}
+
+function staticProperty(source: string, member: any): { name: string; range: SourceRange } | null {
+  const property = member?.property;
+  if (!property) return null;
+  if (!member.computed && property.type === "Identifier") {
+    const range = nodeRange(property);
+    return range ? { name: property.name, range } : null;
+  }
+  if (
+    member.computed &&
+    (property.type === "StringLiteral" || property.type === "Literal") &&
+    typeof property.value === "string"
+  ) {
+    const range = nodeRange(property);
+    if (!range) return null;
+    const raw = source.slice(property.start ?? 0, property.end ?? 0);
+    if (
+      range.start.line === range.end.line &&
+      ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'")))
+    ) {
+      range.start.column += 1;
+      range.end.column -= 1;
+    }
+    return { name: property.value, range };
+  }
+  return null;
+}
+
+function isModuleExports(node: any): boolean {
+  if (node?.type !== "MemberExpression") return false;
+  const property = staticProperty("", node);
+  return (
+    node.object?.type === "Identifier" &&
+    node.object.name === "module" &&
+    property?.name === "exports"
+  );
+}
+
+function isCommonJsExportsObject(node: any): boolean {
+  return (node?.type === "Identifier" && node.name === "exports") || isModuleExports(node);
+}
+
+function commonJsExportMember(
+  source: string,
+  node: any,
+): { name: string; range: SourceRange } | null {
+  if (node?.type !== "MemberExpression" || !isCommonJsExportsObject(node.object)) return null;
+  return staticProperty(source, node);
+}
+
+function isPlaceholderAssignment(node: any): boolean {
+  let value = node;
+  while (value?.type === "AssignmentExpression" && value.operator === "=") {
+    value = value.right;
+  }
+  return (
+    (value?.type === "UnaryExpression" && value.operator === "void") ||
+    (value?.type === "Identifier" && value.name === "undefined")
+  );
+}
+
+function visitAst(node: any, parent: any, visitor: (node: any, parent: any) => void): void {
+  if (!node || typeof node !== "object" || typeof node.type !== "string") return;
+  visitor(node, parent);
+  for (const value of Object.values(node)) {
+    if (Array.isArray(value)) {
+      for (const child of value) visitAst(child, node, visitor);
+    } else {
+      visitAst(value, node, visitor);
+    }
+  }
+}
+
+function requireRequest(node: any): string | null {
+  let expression = node;
+  while (
+    expression?.type === "CallExpression" &&
+    expression.arguments?.length === 1 &&
+    expression.callee?.type === "Identifier" &&
+    (expression.callee.name === "__importStar" || expression.callee.name === "__importDefault")
+  ) {
+    expression = expression.arguments[0];
+  }
+  if (
+    expression?.type !== "CallExpression" ||
+    expression.callee?.type !== "Identifier" ||
+    expression.callee.name !== "require"
+  ) {
+    return null;
+  }
+  const request = expression.arguments?.[0];
+  return request?.type === "StringLiteral" && typeof request.value === "string"
+    ? request.value
+    : null;
+}
+
+function inferCommonJsUsage(source: string): Map<string, InferredCommonJsUsage> {
+  let ast: any;
+  try {
+    ast = parse(source, { sourceType: "unambiguous", errorRecovery: true });
+  } catch {
+    return new Map();
+  }
+  const result = new Map<string, InferredCommonJsUsage>();
+  const bindings = new Map<string, string>();
+  const bindingNodes = new Set<any>();
+  const usageFor = (request: string): InferredCommonJsUsage => {
+    const existing = result.get(request);
+    if (existing) return existing;
+    const usage = { names: new Set<string>(), namespace: false };
+    result.set(request, usage);
+    return usage;
+  };
+
+  visitAst(ast.program, null, (node) => {
+    if (node.type !== "VariableDeclarator") return;
+    const request = requireRequest(node.init);
+    if (!request) return;
+    const usage = usageFor(request);
+    if (node.id?.type === "Identifier") {
+      bindings.set(node.id.name, request);
+      bindingNodes.add(node.id);
+      return;
+    }
+    if (node.id?.type !== "ObjectPattern") {
+      usage.namespace = true;
+      return;
+    }
+    for (const property of node.id.properties ?? []) {
+      if (property.type === "RestElement") {
+        usage.namespace = true;
+        continue;
+      }
+      const exported = staticProperty(source, {
+        property: property.key,
+        computed: property.computed,
+      });
+      if (exported) usage.names.add(exported.name);
+      else usage.namespace = true;
+    }
+  });
+
+  visitAst(ast.program, null, (node, parent) => {
+    if (node.type === "MemberExpression") {
+      const directRequest = requireRequest(node.object);
+      const bindingRequest =
+        node.object?.type === "Identifier" ? bindings.get(node.object.name) : undefined;
+      const request = directRequest ?? bindingRequest;
+      if (request) {
+        const usage = usageFor(request);
+        const property = staticProperty(source, node);
+        if (property) usage.names.add(property.name);
+        else usage.namespace = true;
+      }
+      return;
+    }
+    if (node.type !== "Identifier" || bindingNodes.has(node)) return;
+    const request = bindings.get(node.name);
+    if (!request) return;
+    if (parent?.type === "MemberExpression") {
+      if (parent.object === node) return;
+      if (parent.property === node && !parent.computed) return;
+    }
+    if (parent?.type === "ObjectProperty" && parent.key === node && !parent.computed) {
+      if (!parent.shorthand) return;
+    }
+    usageFor(request).namespace = true;
+  });
+  return result;
 }
 
 function addParsed(
@@ -113,6 +288,77 @@ export function parseExports(
   }
 
   const output: ParsedExport[] = [];
+  const commonJsExports = new Map<string, { item: ParsedExport; placeholder: boolean }>();
+  const addCommonJsExport = (
+    exportedName: string,
+    localName: string | null,
+    range: SourceRange | null,
+    placeholder = false,
+  ): void => {
+    if (!range || exportedName === "__esModule") return;
+    const item: ParsedExport = {
+      id: `${exportedName}:${range.start.line}:${range.start.column}`,
+      exportedName,
+      localName,
+      range,
+      typeOnly: false,
+    };
+    const previous = commonJsExports.get(exportedName);
+    if (!previous || previous.placeholder || !placeholder) {
+      commonJsExports.set(exportedName, { item, placeholder });
+    }
+  };
+  const scanCommonJsExpression = (expression: any): void => {
+    if (expression?.type === "SequenceExpression") {
+      for (const item of expression.expressions ?? []) scanCommonJsExpression(item);
+      return;
+    }
+    if (expression?.type === "AssignmentExpression" && expression.operator === "=") {
+      const member = commonJsExportMember(source, expression.left);
+      if (member) {
+        addCommonJsExport(
+          member.name,
+          expression.right?.type === "Identifier" ? expression.right.name : null,
+          member.range,
+          isPlaceholderAssignment(expression.right),
+        );
+      } else if (
+        isModuleExports(expression.left) &&
+        expression.right?.type === "ObjectExpression"
+      ) {
+        for (const property of expression.right.properties ?? []) {
+          if (property.type !== "ObjectProperty" && property.type !== "ObjectMethod") continue;
+          const exported = staticProperty(source, {
+            property: property.key,
+            computed: property.computed,
+          });
+          if (!exported) continue;
+          const value = property.type === "ObjectProperty" ? property.value : null;
+          addCommonJsExport(
+            exported.name,
+            value?.type === "Identifier" ? value.name : null,
+            exported.range,
+          );
+        }
+      }
+      scanCommonJsExpression(expression.right);
+      return;
+    }
+    if (
+      expression?.type === "CallExpression" &&
+      expression.callee?.type === "MemberExpression" &&
+      expression.callee.object?.type === "Identifier" &&
+      expression.callee.object.name === "Object" &&
+      staticProperty(source, expression.callee)?.name === "defineProperty" &&
+      isCommonJsExportsObject(expression.arguments?.[0])
+    ) {
+      const exported = staticProperty(source, {
+        property: expression.arguments?.[1],
+        computed: true,
+      });
+      if (exported) addCommonJsExport(exported.name, null, exported.range);
+    }
+  };
   for (const statement of ast.program.body ?? []) {
     if (statement.type === "ExportNamedDeclaration") {
       const declaration = statement.declaration;
@@ -163,8 +409,11 @@ export function parseExports(
         "*",
       );
       addParsed(output, "*", null, star ?? nodeRange(statement), false);
+    } else if (statement.type === "ExpressionStatement") {
+      scanCommonJsExpression(statement.expression);
     }
   }
+  output.push(...[...commonJsExports.values()].map(({ item }) => item));
   return { exports: output, diagnostics };
 }
 
@@ -285,6 +534,27 @@ export async function analyzeSourceExports(
     diagnostics.push("No Rspack module could be matched to this source.");
   }
 
+  const inferredUsageByOrigin = new Map<string, Map<string, InferredCommonJsUsage>>();
+  const inferredUsage = (
+    origin: ExportGraphModule | null,
+    edge: ExportAnalysisInput["references"][number]["edge"],
+  ): InferredCommonJsUsage | null => {
+    if (
+      edge.referencedPath !== null ||
+      !edge.dependencyType.toLowerCase().includes("cjs") ||
+      !edge.request ||
+      !origin?.transformedSource
+    ) {
+      return null;
+    }
+    let byRequest = inferredUsageByOrigin.get(origin.id);
+    if (!byRequest) {
+      byRequest = inferCommonJsUsage(origin.transformedSource);
+      inferredUsageByOrigin.set(origin.id, byRequest);
+    }
+    return byRequest.get(edge.request) ?? null;
+  };
+
   const exports: SourceExportUsage[] = [];
   for (let index = 0; index < parsed.exports.length; index += 1) {
     const item = parsed.exports[index] as ParsedExport;
@@ -302,23 +572,33 @@ export async function analyzeSourceExports(
       continue;
     }
 
-    const matchingReferences = input.references.filter(({ edge }) => {
-      if (!edge.active) return false;
+    const matchingReferences = input.references.flatMap(({ edge, origin }) => {
+      if (!edge.active) return [];
       const first = edge.referencedPath?.[0];
-      return (
-        first === item.exportedName ||
-        edge.referencedPath === null ||
-        edge.referencedPath.length === 0
-      );
+      const inferred = inferredUsage(origin, edge);
+      const exact = first === item.exportedName || inferred?.names.has(item.exportedName) === true;
+      const namespace =
+        edge.referencedPath?.length === 0 ||
+        (edge.referencedPath === null && (!inferred || inferred.namespace));
+      if (!exact && !namespace) return [];
+      return [
+        {
+          edge:
+            exact && edge.referencedPath === null
+              ? { ...edge, referencedPath: [item.exportedName] }
+              : edge,
+          origin,
+          exact,
+          namespace,
+        },
+      ];
     });
     const exactModuleIds = new Set(
-      matchingReferences
-        .filter(({ edge }) => edge.referencedPath?.[0] === item.exportedName)
-        .map(({ edge }) => edge.targetModuleId),
+      matchingReferences.filter(({ exact }) => exact).map(({ edge }) => edge.targetModuleId),
     );
     const namespaceModuleIds = new Set(
       matchingReferences
-        .filter(({ edge }) => !edge.referencedPath || edge.referencedPath.length === 0)
+        .filter(({ namespace }) => namespace)
         .map(({ edge }) => edge.targetModuleId),
     );
     const moduleInstances = input.modules.map((module) => {

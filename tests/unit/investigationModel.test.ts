@@ -117,6 +117,7 @@ function source(
         buildState: "retained",
         runtimeState: state,
         emittedBytes: 10,
+        loadedBytes: 10,
         executedBytes: state === "executed" ? 10 : 0,
         chunks: [],
         ranges: [{ startColumn: 0, endColumn: content.length, executed: state === "executed" }],
@@ -131,6 +132,7 @@ function report(files: SourceFileReport[]): CoverageReport {
     buildHash: "build",
     createdAt: 1,
     metrics: metrics(),
+    moduleMetrics: metrics(),
     importSummary: {
       importedEntries: 1,
       matchedAssets: 1,

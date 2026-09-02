@@ -1,7 +1,9 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { sourceLineCoverageStatus } from "../../shared/codeCoverage.js";
+import { metricsForModuleInstance } from "../../shared/metrics.js";
 import type {
+  BuildModule,
   CodeCoverageState,
   ModuleReferencesResponse,
   ReferenceSnippetResponse,
@@ -27,12 +29,6 @@ function buildLabel(line: SourceLineState): string {
   if (line.runtimeState === "not-loaded") return "Retained, but its chunk was not loaded";
   if (line.runtimeState === "not-executed") return "Retained and loaded, but not executed";
   return "Executed mapped ranges";
-}
-
-function displayedRuntimeState(
-  line: SourceLineState,
-): Exclude<SourceLineState["runtimeState"], "partial"> {
-  return line.runtimeState === "partial" ? "executed" : line.runtimeState;
 }
 
 function wait(ms: number, signal: AbortSignal): Promise<void> {
@@ -82,13 +78,18 @@ type SourceDetailStatus =
   | { status: "complete"; detail: SourceFileDetail }
   | { status: "error"; message: string };
 
-function useSourceDetail(buildHash: string, file: SourceFileSummary | null, retry: number) {
+function useSourceDetail(
+  buildHash: string,
+  file: SourceFileSummary | null,
+  moduleId: string | null,
+  retry: number,
+) {
   const [status, setStatus] = useState<SourceDetailStatus | null>(null);
   useEffect(() => {
     setStatus(file ? { status: "loading" } : null);
     if (!file) return;
     const controller = new AbortController();
-    void loadCoverageSource(buildHash, file.id, controller.signal, retry)
+    void loadCoverageSource(buildHash, file.id, controller.signal, retry, moduleId)
       .then((detail) => {
         if (detail.id !== file.id)
           throw new Error("Coverage source detail does not match the file.");
@@ -103,7 +104,7 @@ function useSourceDetail(buildHash: string, file: SourceFileSummary | null, retr
         }
       });
     return () => controller.abort();
-  }, [buildHash, file, retry]);
+  }, [buildHash, file, moduleId, retry]);
   return status;
 }
 
@@ -217,6 +218,8 @@ function SourceCode(props: {
 export function SourceDrawer(props: {
   buildHash: string;
   file: SourceFileSummary | null;
+  moduleId: string | null;
+  module?: BuildModule | null;
   onClose: () => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -230,13 +233,46 @@ export function SourceDrawer(props: {
   const [snippetFlashKey, setSnippetFlashKey] = useState(0);
   const [loadingReferences, setLoadingReferences] = useState(false);
   const analysis = useExportAnalysis(props.buildHash, props.file, retry);
-  const detailStatus = useSourceDetail(props.buildHash, props.file, detailRetry);
+  const detailStatus = useSourceDetail(props.buildHash, props.file, props.moduleId, detailRetry);
   const report = analysis?.status === "complete" ? analysis.report : null;
-  const lines = detailStatus?.status === "complete" ? detailStatus.detail.lines : [];
+  const rawLines = detailStatus?.status === "complete" ? detailStatus.detail.lines : [];
+  const selectedModuleLoaded =
+    !props.module?.chunks.length ||
+    Boolean(
+      props.file && props.module.chunks.some((chunk) => props.file?.loadedChunks.includes(chunk)),
+    );
+  const lines = useMemo(
+    () =>
+      selectedModuleLoaded
+        ? rawLines
+        : rawLines.map((line) =>
+            line.buildState !== "retained"
+              ? line
+              : {
+                  ...line,
+                  runtimeState: "not-loaded" as const,
+                  loadedBytes: 0,
+                  executedBytes: 0,
+                  ranges: line.ranges.map((range) => ({ ...range, executed: false })),
+                },
+          ),
+    [rawLines, selectedModuleLoaded],
+  );
   const markerLines = useMemo(() => {
     const result = new Map<number, SourceExportUsage[]>();
     for (const item of report?.exports ?? []) {
       if (item.state !== "used" || item.precision !== "exact") continue;
+      if (
+        props.moduleId &&
+        !item.moduleInstances.some(
+          (instance) =>
+            instance.moduleId === props.moduleId &&
+            instance.state === "used" &&
+            instance.precision === "exact",
+        )
+      ) {
+        continue;
+      }
       if (item.range.start.line !== item.range.end.line) continue;
       const list = result.get(item.range.start.line) ?? [];
       list.push(item);
@@ -246,7 +282,7 @@ export function SourceDrawer(props: {
       list.sort((left, right) => left.range.start.column - right.range.start.column);
     }
     return result;
-  }, [report]);
+  }, [report, props.moduleId]);
   const virtualizer = useVirtualizer({
     count: lines.length,
     getScrollElement: () => scrollRef.current,
@@ -275,6 +311,7 @@ export function SourceDrawer(props: {
 
   const openDependencyGraph = (usage: SourceExportUsage) => {
     const instance =
+      usage.moduleInstances.find((candidate) => candidate.moduleId === props.moduleId) ??
       usage.moduleInstances.find((candidate) => candidate.state === "used") ??
       usage.moduleInstances[0];
     if (!instance) return;
@@ -301,6 +338,7 @@ export function SourceDrawer(props: {
   };
   if (!props.file) return null;
   const file = props.file;
+  const metrics = props.moduleId ? metricsForModuleInstance(file, props.module) : file.metrics;
   return (
     <div className="drawer-backdrop">
       <aside
@@ -309,7 +347,7 @@ export function SourceDrawer(props: {
       >
         <header>
           <div>
-            <span className="eyebrow">Original source</span>
+            <span className="eyebrow">{props.moduleId ? "Rspack module" : "Original source"}</span>
             <h2>{file.path.split("/").at(-1)}</h2>
             <code>{file.path}</code>
           </div>
@@ -326,27 +364,27 @@ export function SourceDrawer(props: {
         <div className="drawer-metrics">
           <span>
             <small>Loaded</small>
-            {formatBytes(file.metrics.loadedBytes)}
+            {formatBytes(metrics.loadedBytes)}
           </span>
           <span>
             <small>Executed</small>
-            {formatBytes(file.metrics.executedBytes)}
+            {formatBytes(metrics.executedBytes)}
           </span>
           <span>
-            <small>Unused</small>
-            {formatBytes(file.metrics.unusedBytes)}
+            <small>{props.moduleId ? "Unused" : "Unexecuted"}</small>
+            {formatBytes(metrics.unusedBytes)}
           </span>
           <span>
             <small>Usage</small>
-            {formatPercent(file.metrics.usageRatio)}
+            {formatPercent(metrics.usageRatio)}
           </span>
           <span>
-            <small>Mapped</small>
-            {formatPercent(
-              file.metrics.emittedBytes
-                ? file.metrics.mappedBytes / file.metrics.emittedBytes
-                : null,
-            )}
+            <small>{props.moduleId ? "Retained" : "Mapped"}</small>
+            {props.moduleId
+              ? formatBytes(metrics.emittedBytes)
+              : formatPercent(
+                  metrics.emittedBytes ? metrics.mappedBytes / metrics.emittedBytes : null,
+                )}
           </span>
         </div>
         <div className="source-legend">
@@ -354,7 +392,8 @@ export function SourceDrawer(props: {
             <i className="swatch executed" /> executed
           </span>
           <span>
-            <i className="swatch unused" /> loaded / unexecuted
+            <i className="swatch unused" />
+            {props.moduleId ? "retained + loaded, not executed" : "loaded / unexecuted"}
           </span>
           <span>
             <i className="swatch not-loaded" /> not loaded
@@ -388,10 +427,9 @@ export function SourceDrawer(props: {
               {virtualizer.getVirtualItems().map((virtualRow) => {
                 const line = lines[virtualRow.index];
                 if (!line) return null;
-                const runtimeState = displayedRuntimeState(line);
                 return (
                   <div
-                    className={`source-line build-${line.buildState} runtime-${runtimeState}`}
+                    className={`source-line build-${line.buildState} runtime-${line.runtimeState}`}
                     key={line.line}
                     style={{ transform: `translateY(${virtualRow.start}px)` }}
                     title={`${buildLabel(line)} · generated ${formatBytes(line.emittedBytes)} · executed ${formatBytes(line.executedBytes)} · chunks ${line.chunks.join(", ") || "none"}`}
@@ -438,8 +476,11 @@ export function SourceDrawer(props: {
           ) : null}
         </div>
         <footer>
-          Only exports that Rspack identifies as exactly used are highlighted. Click an export to
-          jump to its captured dependency graph. Green and red remain runtime Coverage states.
+          Module sizes count retained original-source UTF-8 bytes once, so generated/minified output
+          cannot inflate this module. Unused excludes source lines removed from the final build and
+          code in chunks that were not loaded. A line with any executed range is colored green;
+          otherwise a retained and loaded line is red. Only exports that Rspack identifies as
+          exactly used are highlighted. Click an export to jump to its captured dependency graph.
         </footer>
       </aside>
     </div>

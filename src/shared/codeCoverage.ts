@@ -10,7 +10,7 @@ export function sourceLineCoverageStatus(line: SourceLineState): CodeCoverageSta
   if (line.buildState === "unknown") return "unknown";
   if (line.runtimeState === "not-loaded") return "unloaded";
   if (line.runtimeState === "not-executed") return "unexecuted";
-  if (line.runtimeState === "executed" || line.runtimeState === "partial") return "executed";
+  if (line.runtimeState === "executed") return "executed";
   return "unknown";
 }
 
