@@ -6,13 +6,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   ModuleReferencesResponse,
   SourceExportAnalysisStatus,
+  SourceExportUsage,
   SourceFileDetail,
   SourceFileSummary,
 } from "../../src/shared/types.js";
+import { ReferencePanel } from "../../src/ui/components/ReferencePanel.js";
 import { SourceDrawer } from "../../src/ui/components/SourceDrawer.js";
 
 const api = vi.hoisted(() => ({
   loadCoverageSource: vi.fn(),
+  loadExportImporterChain: vi.fn(),
   loadReferenceSnippet: vi.fn(),
   loadReferences: vi.fn(),
   loadSourceExportStatus: vi.fn(),
@@ -36,6 +39,7 @@ vi.mock("@tanstack/react-virtual", () => ({
 afterEach(() => {
   cleanup();
   api.loadCoverageSource.mockReset();
+  api.loadExportImporterChain.mockReset();
   api.loadReferenceSnippet.mockReset();
   api.loadReferences.mockReset();
   api.loadSourceExportStatus.mockReset();
@@ -197,6 +201,179 @@ function completeStatus(): SourceExportAnalysisStatus {
 }
 
 describe("SourceDrawer export usage", () => {
+  it("opens the exact edge when one importer module has multiple export usages", () => {
+    const target = {
+      id: "target",
+      identifier: "/project/src/target.ts",
+      name: "./src/target.ts",
+      resource: "/project/src/target.ts",
+      moduleType: "javascript/auto",
+      chunks: ["main"],
+      issuer: null,
+      size: 20,
+      usedExports: ["default"],
+      providedExports: ["default"],
+      optimizationBailout: [],
+      nested: false,
+    };
+    const consumer = {
+      ...target,
+      id: "consumer",
+      identifier: "/project/src/consumer.ts",
+      name: "./src/consumer.ts",
+      resource: "/project/src/consumer.ts",
+      usedExports: true,
+      providedExports: null,
+    };
+    const edge = (id: string, line: number, column: number) => ({
+      id,
+      originId: consumer.id,
+      targetId: target.id,
+      dependencyType: "esm import specifier",
+      request: "./target",
+      exports: ["default"],
+      active: true,
+      location: {
+        start: { line, column },
+        end: { line, column: column + 7 },
+      },
+      origin: consumer,
+      target,
+    });
+    const references: ModuleReferencesResponse = {
+      module: target,
+      direction: "in",
+      counts: { in: 2, out: 0, both: 2 },
+      total: 2,
+      cursor: 0,
+      nextCursor: null,
+      edges: [edge("edge-21", 21, 18), edge("edge-34", 34, 26)],
+      entryPath: [],
+    };
+    const exportUsage: SourceExportUsage = {
+      id: "default:1:1",
+      exportedName: "default",
+      localName: "withField",
+      range: { start: { line: 1, column: 0 }, end: { line: 1, column: 7 } },
+      state: "used",
+      precision: "exact",
+      moduleInstances: [
+        {
+          moduleId: target.id,
+          identifier: target.identifier,
+          resource: target.resource,
+          chunks: target.chunks,
+          state: "used",
+          precision: "exact",
+          optimizationBailout: [],
+        },
+      ],
+      referenceCount: 2,
+      referenceCountByModule: { target: 2 },
+      references: [
+        {
+          moduleId: consumer.id,
+          targetModuleId: target.id,
+          path: "src/consumer.ts",
+          line: 21,
+          column: 18,
+          snippet: "withField(Input);",
+          dependencyType: "esm import specifier",
+          request: "./target",
+          referencedPath: ["default"],
+          locationPrecision: "exact",
+        },
+        {
+          moduleId: consumer.id,
+          targetModuleId: target.id,
+          path: "src/consumer.ts",
+          line: 34,
+          column: 26,
+          snippet: "withField(Group);",
+          dependencyType: "esm import specifier",
+          request: "./target",
+          referencedPath: ["default"],
+          locationPrecision: "exact",
+        },
+      ],
+      truncated: false,
+    };
+    const onSelectEdge = vi.fn();
+    const upstream = {
+      ...consumer,
+      id: "upstream",
+      identifier: "/project/src/index.ts",
+      name: "./src/index.ts",
+      resource: "/project/src/index.ts",
+      usedExports: true,
+      providedExports: null,
+    };
+    const upstreamEdge = {
+      ...edge("upstream-edge", 8, 4),
+      originId: upstream.id,
+      targetId: consumer.id,
+      exports: ["createWebSuite"],
+      origin: upstream,
+      target: consumer,
+    };
+    render(
+      <ReferencePanel
+        exportUsage={exportUsage}
+        moduleInstance={exportUsage.moduleInstances[0] ?? null}
+        references={references}
+        importerChain={{
+          module: target,
+          exportedName: "default",
+          truncated: false,
+          maxDepth: 12,
+          steps: [
+            {
+              id: "chain-direct",
+              parentId: null,
+              depth: 1,
+              importedExport: "default",
+              importerExports: ["createWebSuite"],
+              relationPrecision: "exact",
+              edge: references.edges[0] as NonNullable<(typeof references.edges)[number]>,
+            },
+            {
+              id: "chain-upstream",
+              parentId: "chain-direct",
+              depth: 2,
+              importedExport: "createWebSuite",
+              importerExports: [],
+              relationPrecision: "unavailable",
+              edge: upstreamEdge,
+            },
+          ],
+        }}
+        direction="in"
+        loading={false}
+        error={null}
+        snippet={null}
+        snippetFlashKey={0}
+        onDirectionChange={vi.fn()}
+        onSelectEdge={onSelectEdge}
+        onLoadMore={vi.fn()}
+        onModuleChange={vi.fn()}
+        onCloseSnippet={vi.fn()}
+      />,
+    );
+
+    const importerButtons = screen.getAllByRole("button", {
+      name: "Open importer usage src/consumer.ts",
+    });
+    fireEvent.click(importerButtons[0] as HTMLElement);
+    fireEvent.click(importerButtons[1] as HTMLElement);
+    expect(screen.getByLabelText("Transitive export importer chain")).toHaveTextContent(
+      "via export createWebSuite · uses default",
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Open importer chain usage /project/src/index.ts" }),
+    );
+    expect(onSelectEdge.mock.calls).toEqual([["edge-21"], ["edge-34"], ["upstream-edge"]]);
+  });
+
   it("keeps source available and opens export chains with their module graphs", async () => {
     let resolveStatus: (status: SourceExportAnalysisStatus) => void = () => undefined;
     api.loadSourceExportStatus.mockReturnValueOnce(
@@ -371,6 +548,21 @@ describe("SourceDrawer export usage", () => {
             : edge.originId === response.module.id),
       ),
     });
+    api.loadExportImporterChain.mockImplementation((moduleId: string, exportedName: string) => {
+      const graph =
+        moduleId === "target"
+          ? usedReferences
+          : moduleId === "unused-target-source"
+            ? sourceGraph
+            : emptyGraph;
+      return Promise.resolve({
+        module: graph.module,
+        exportedName,
+        steps: [],
+        truncated: false,
+        maxDepth: 12,
+      });
+    });
     api.loadReferences.mockImplementation((moduleId: string, direction: "in" | "out" | "both") => {
       if (moduleId === "target") return Promise.resolve(forDirection(usedReferences, direction));
       if (moduleId === "unused-target-source")
@@ -429,9 +621,8 @@ describe("SourceDrawer export usage", () => {
     expect(screen.getByText("Executed").parentElement).toHaveTextContent("4 B");
     expect(screen.getByText("Unused").parentElement).toHaveTextContent("8 B");
     const drawerHeader = document.querySelector(".coverage-source-drawer > header");
-    expect(drawerHeader).toHaveTextContent("exports.ts");
+    expect(drawerHeader).toHaveTextContent("src/exports.ts");
     expect(drawerHeader).not.toHaveTextContent("Original source");
-    expect(drawerHeader).not.toHaveTextContent("src/exports.ts");
     expect(document.querySelector(".source-columns")).toHaveTextContent("LineSource");
     expect(document.querySelector(".source-line")?.children).toHaveLength(2);
     expect(document.querySelector(".source-line .coverage-executed")).toHaveTextContent(
@@ -441,6 +632,15 @@ describe("SourceDrawer export usage", () => {
       "const cold = 'unused';",
     );
     expect(document.querySelector(".source-line .syntax-keyword")).toHaveTextContent("export");
+    const sourceSearch = screen.getByRole("searchbox", { name: "Search source code" });
+    fireEvent.change(sourceSearch, { target: { value: "unused" } });
+    expect(document.querySelector(".code-search-status")).toHaveTextContent("1 / 1");
+    expect(document.querySelector(".code-search-match.is-active")).toHaveTextContent("unused");
+    expect(document.querySelector(".source-line.is-search-active")).toHaveTextContent(
+      "const cold = 'unused';",
+    );
+    fireEvent.keyDown(sourceSearch, { key: "Escape" });
+    expect(sourceSearch).toHaveValue("");
     fireEvent.click(screen.getByRole("button", { name: "Close source details" }));
     expect(onClose).toHaveBeenCalledOnce();
 
@@ -476,6 +676,7 @@ describe("SourceDrawer export usage", () => {
       document.querySelector(".export-dependency-graph"),
     );
     expect(api.loadReferences).toHaveBeenCalledWith("target", "in");
+    expect(api.loadExportImporterChain).toHaveBeenCalledWith("target", "ACTIONS");
     expect(screen.getByText("ACTIONS", { selector: ".graph-export-center" })).toBeVisible();
     expect(await screen.findAllByLabelText("Show usage ./src/consumer.ts")).toHaveLength(1);
     expect(document.querySelectorAll(".graph-node.is-export-edge")).toHaveLength(1);

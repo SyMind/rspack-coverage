@@ -59,6 +59,33 @@ export class MissingCoverageRecordingError extends Error {}
 export class CoverageReportNotReadyError extends Error {}
 export class MissingCoverageSourceError extends Error {}
 
+const MAX_SOURCE_DETAIL_ALIASES = 16;
+
+function sourceIdsMayAlias(left: string, right: string): boolean {
+  const normalizedLeft = left.replace(/\\/g, "/").replace(/^\/+/, "");
+  const normalizedRight = right.replace(/\\/g, "/").replace(/^\/+/, "");
+  if (normalizedLeft === normalizedRight) return true;
+  const shorter = normalizedLeft.length < normalizedRight.length ? normalizedLeft : normalizedRight;
+  const longer = shorter === normalizedLeft ? normalizedRight : normalizedLeft;
+  return shorter.includes("/") && longer.endsWith(`/${shorter}`);
+}
+
+function storedSourceLineEvidenceScore(
+  detail: StoredSourceFileDetail,
+  lineNumber: number,
+  moduleId?: string | null,
+): number {
+  const line = detail.mappedLines.find((candidate) => candidate.lineIndex === lineNumber - 1);
+  if (!line) return 0;
+  if (line.emittedBytes <= 0) return 0;
+  if (moduleId && line.moduleStates && !Object.hasOwn(line.moduleStates, moduleId)) return 0;
+  const evidence = moduleId ? line.moduleStates?.[moduleId] : undefined;
+  const loadedBytes = evidence?.loadedBytes ?? line.loadedBytes;
+  const executedBytes = evidence?.executedBytes ?? line.executedBytes;
+  if (executedBytes > 0) return 5;
+  return loadedBytes > 0 ? 4 : 3;
+}
+
 async function readRange(file: string, offset: number, length: number): Promise<Buffer> {
   const handle = await open(file, "r");
   try {
@@ -270,6 +297,7 @@ export class CoverageAnalysisService {
     buildHash: string,
     fileId: string,
     moduleId?: string | null,
+    preferredLine?: number | null,
   ): Promise<SourceFileDetail> {
     const build = this.#requireBuild(buildHash);
     const job = this.#job;
@@ -286,23 +314,61 @@ export class CoverageAnalysisService {
     if (index.version !== 1 || !index.entries || typeof index.entries !== "object") {
       throw new CoverageReportNotReadyError("Coverage source details index is invalid.");
     }
-    const location = Object.hasOwn(index.entries, fileId) ? index.entries[fileId] : undefined;
-    if (
-      !location ||
-      !Number.isSafeInteger(location.offset) ||
-      location.offset < 0 ||
-      !Number.isSafeInteger(location.length) ||
-      location.length <= 0
-    ) {
+    const readStored = async (id: string): Promise<StoredSourceFileDetail | null> => {
+      const location = Object.hasOwn(index.entries, id) ? index.entries[id] : undefined;
+      if (!location) return null;
+      if (
+        !Number.isSafeInteger(location.offset) ||
+        location.offset < 0 ||
+        !Number.isSafeInteger(location.length) ||
+        location.length <= 0
+      ) {
+        throw new CoverageReportNotReadyError("Coverage source details index is invalid.");
+      }
+      const stored = JSON.parse(
+        (await readRange(job.detailsFile, location.offset, location.length)).toString("utf8"),
+      ) as StoredSourceFileDetail;
+      if (stored.id !== id) {
+        throw new CoverageReportNotReadyError("Coverage source details index is invalid.");
+      }
+      return stored;
+    };
+
+    const stored = await readStored(fileId);
+    if (!stored) {
       throw new MissingCoverageSourceError(`Coverage source detail not found for ${fileId}.`);
     }
-    const stored = JSON.parse(
-      (await readRange(job.detailsFile, location.offset, location.length)).toString("utf8"),
-    ) as StoredSourceFileDetail;
-    if (stored.id !== fileId) {
-      throw new CoverageReportNotReadyError("Coverage source details index is invalid.");
+    const lineNumber =
+      preferredLine && Number.isSafeInteger(preferredLine) && preferredLine > 0
+        ? preferredLine
+        : null;
+    if (
+      lineNumber === null ||
+      stored.content === null ||
+      storedSourceLineEvidenceScore(stored, lineNumber, moduleId) >= 3
+    ) {
+      return materializeSourceFileDetail(stored, moduleId);
     }
-    return materializeSourceFileDetail(stored, moduleId);
+
+    let selected = stored;
+    let selectedScore = storedSourceLineEvidenceScore(stored, lineNumber, moduleId);
+    const aliases: string[] = [];
+    for (const candidate in index.entries) {
+      if (candidate === fileId || !sourceIdsMayAlias(candidate, fileId)) continue;
+      aliases.push(candidate);
+      aliases.sort((left, right) => left.length - right.length);
+      if (aliases.length > MAX_SOURCE_DETAIL_ALIASES) aliases.pop();
+    }
+    for (const alias of aliases) {
+      const candidate = await readStored(alias);
+      if (!candidate || candidate.content !== stored.content) continue;
+      const score = storedSourceLineEvidenceScore(candidate, lineNumber, moduleId);
+      if (score <= selectedScore) continue;
+      selected = candidate;
+      selectedScore = score;
+      if (score === 5) break;
+    }
+    return materializeSourceFileDetail(selected, moduleId);
   }
 
   #requireBuild(buildHash: string): StagedBuild {

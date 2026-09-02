@@ -5,6 +5,7 @@ import { metricsForModuleInstance } from "../../shared/metrics.js";
 import type {
   BuildModule,
   CodeCoverageState,
+  ExportImporterChainResponse,
   ModuleReferencesResponse,
   ReferenceSnippetResponse,
   SourceExportAnalysisStatus,
@@ -15,6 +16,7 @@ import type {
 } from "../../shared/types.js";
 import {
   loadCoverageSource,
+  loadExportImporterChain,
   loadReferenceSnippet,
   loadReferences,
   loadSourceExportStatus,
@@ -152,12 +154,107 @@ function ExportStatus(props: { status: SourceExportAnalysisStatus | null; onRetr
   );
 }
 
+interface SourceSearchMatch {
+  index: number;
+  row: number;
+  line: number;
+  start: number;
+  end: number;
+}
+
+const MAX_SOURCE_SEARCH_MATCHES = 20_000;
+
+function findSourceSearchMatches(
+  lines: SourceLineState[],
+  query: string,
+): { matches: SourceSearchMatch[]; truncated: boolean } {
+  if (!query) return { matches: [], truncated: false };
+  const needle = query.toLowerCase();
+  const matches: SourceSearchMatch[] = [];
+  for (let row = 0; row < lines.length; row += 1) {
+    const line = lines[row];
+    if (!line) continue;
+    const haystack = line.text.toLowerCase();
+    let cursor = 0;
+    while (cursor <= haystack.length - needle.length) {
+      const start = haystack.indexOf(needle, cursor);
+      if (start < 0) break;
+      matches.push({
+        index: matches.length,
+        row,
+        line: line.line,
+        start,
+        end: start + needle.length,
+      });
+      if (matches.length === MAX_SOURCE_SEARCH_MATCHES) {
+        return { matches, truncated: true };
+      }
+      cursor = start + needle.length;
+    }
+  }
+  return { matches, truncated: false };
+}
+
+function SearchSyntaxText(props: {
+  text: string;
+  offset: number;
+  matches: SourceSearchMatch[];
+  activeMatchIndex: number;
+  keyPrefix: string;
+}) {
+  if (props.matches.length === 0) {
+    return <SyntaxText text={props.text} keyPrefix={props.keyPrefix} />;
+  }
+  const pieces: ReactNode[] = [];
+  const sliceEnd = props.offset + props.text.length;
+  let cursor = props.offset;
+  for (const match of props.matches) {
+    const start = Math.max(props.offset, match.start);
+    const end = Math.min(sliceEnd, match.end);
+    if (end <= start) continue;
+    if (start > cursor) {
+      pieces.push(
+        <SyntaxText
+          text={props.text.slice(cursor - props.offset, start - props.offset)}
+          keyPrefix={`${props.keyPrefix}:${cursor}:${start}`}
+          key={`text:${cursor}:${start}`}
+        />,
+      );
+    }
+    pieces.push(
+      <mark
+        className={`code-search-match ${match.index === props.activeMatchIndex ? "is-active" : ""}`}
+        data-code-search-index={match.index}
+        key={`match:${match.index}:${start}:${end}`}
+      >
+        <SyntaxText
+          text={props.text.slice(start - props.offset, end - props.offset)}
+          keyPrefix={`${props.keyPrefix}:match:${match.index}`}
+        />
+      </mark>,
+    );
+    cursor = end;
+  }
+  if (cursor < sliceEnd) {
+    pieces.push(
+      <SyntaxText
+        text={props.text.slice(cursor - props.offset)}
+        keyPrefix={`${props.keyPrefix}:${cursor}:${sliceEnd}`}
+        key={`text:${cursor}:${sliceEnd}`}
+      />,
+    );
+  }
+  return <>{pieces}</>;
+}
+
 function SourceCode(props: {
   text: string;
   status: CodeCoverageState;
   markers: SourceExportUsage[];
   onMarkerClick: (usage: SourceExportUsage) => void;
   activeExportId: string | null;
+  searchMatches: SourceSearchMatch[];
+  activeSearchIndex: number;
 }) {
   const text = props.text || " ";
   const coverageClass = `coverage-segment coverage-${props.status}`;
@@ -165,7 +262,13 @@ function SourceCode(props: {
     return (
       <code>
         <span className={coverageClass}>
-          <SyntaxText text={text} keyPrefix="source" />
+          <SearchSyntaxText
+            text={text}
+            offset={0}
+            matches={props.searchMatches}
+            activeMatchIndex={props.activeSearchIndex}
+            keyPrefix="source"
+          />
         </span>
       </code>
     );
@@ -178,8 +281,11 @@ function SourceCode(props: {
     if (end <= start) continue;
     if (start > cursor) {
       pieces.push(
-        <SyntaxText
+        <SearchSyntaxText
           text={text.slice(cursor, start)}
+          offset={cursor}
+          matches={props.searchMatches}
+          activeMatchIndex={props.activeSearchIndex}
           keyPrefix={`source:${cursor}:${start}`}
           key={`text:${cursor}:${start}`}
         />,
@@ -194,15 +300,24 @@ function SourceCode(props: {
         title={`Open importers and module graph for export ${marker.exportedName}`}
         onClick={() => props.onMarkerClick(marker)}
       >
-        <SyntaxText text={text.slice(start, end)} keyPrefix={`export:${marker.id}`} />
+        <SearchSyntaxText
+          text={text.slice(start, end)}
+          offset={start}
+          matches={props.searchMatches}
+          activeMatchIndex={props.activeSearchIndex}
+          keyPrefix={`export:${marker.id}`}
+        />
       </button>,
     );
     cursor = end;
   }
   if (cursor < text.length) {
     pieces.push(
-      <SyntaxText
+      <SearchSyntaxText
         text={text.slice(cursor)}
+        offset={cursor}
+        matches={props.searchMatches}
+        activeMatchIndex={props.activeSearchIndex}
         keyPrefix={`source:${cursor}:${text.length}`}
         key={`text:${cursor}:${text.length}`}
       />,
@@ -235,16 +350,22 @@ export function SourceDrawer(props: {
   onClose: () => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const [retry, setRetry] = useState(0);
   const [detailRetry, setDetailRetry] = useState(0);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchIndex, setSearchIndex] = useState(0);
   const [activeExportId, setActiveExportId] = useState<string | null>(null);
   const [moduleId, setModuleId] = useState<string | null>(null);
   const [direction, setDirection] = useState<"in" | "out" | "both">("in");
   const [references, setReferences] = useState<ModuleReferencesResponse | null>(null);
+  const [importerChain, setImporterChain] = useState<ExportImporterChainResponse | null>(null);
   const [snippet, setSnippet] = useState<ReferenceSnippetResponse | null>(null);
   const [snippetFlashKey, setSnippetFlashKey] = useState(0);
   const [loadingReferences, setLoadingReferences] = useState(false);
+  const [loadingImporterChain, setLoadingImporterChain] = useState(false);
   const [referenceError, setReferenceError] = useState<string | null>(null);
+  const [importerChainError, setImporterChainError] = useState<string | null>(null);
   const analysis = useExportAnalysis(props.buildHash, props.file, retry);
   const detailStatus = useSourceDetail(props.buildHash, props.file, props.moduleId, detailRetry);
   const report = analysis?.status === "complete" ? analysis.report : null;
@@ -285,12 +406,55 @@ export function SourceDrawer(props: {
     }
     return result;
   }, [report]);
+  const sourceSearch = useMemo(
+    () => findSourceSearchMatches(lines, searchQuery),
+    [lines, searchQuery],
+  );
+  const activeSearchIndex = sourceSearch.matches.length
+    ? Math.min(searchIndex, sourceSearch.matches.length - 1)
+    : -1;
+  const activeSearchMatch = sourceSearch.matches[activeSearchIndex] ?? null;
+  const searchMatchesByLine = useMemo(() => {
+    const result = new Map<number, SourceSearchMatch[]>();
+    for (const match of sourceSearch.matches) {
+      const matches = result.get(match.line) ?? [];
+      matches.push(match);
+      result.set(match.line, matches);
+    }
+    return result;
+  }, [sourceSearch.matches]);
   const virtualizer = useVirtualizer({
     count: lines.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => 24,
     overscan: 30,
   });
+  useEffect(() => {
+    if (!props.file?.id) return;
+    setSearchQuery("");
+    setSearchIndex(0);
+  }, [props.file?.id]);
+  useEffect(() => {
+    if (!activeSearchMatch) return;
+    virtualizer.scrollToIndex?.(activeSearchMatch.row, { align: "center" });
+  }, [activeSearchMatch, virtualizer]);
+  useEffect(() => {
+    const focusSearch = (event: KeyboardEvent) => {
+      if (moduleId || (!event.metaKey && !event.ctrlKey) || event.key.toLowerCase() !== "f") return;
+      event.preventDefault();
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    };
+    window.addEventListener("keydown", focusSearch);
+    return () => window.removeEventListener("keydown", focusSearch);
+  }, [moduleId]);
+  const moveSearch = (delta: number) => {
+    if (sourceSearch.matches.length === 0) return;
+    setSearchIndex((current) => {
+      const normalized = Math.min(Math.max(current, 0), sourceSearch.matches.length - 1);
+      return (normalized + delta + sourceSearch.matches.length) % sourceSearch.matches.length;
+    });
+  };
   useEffect(() => {
     if (!moduleId) return;
     let cancelled = false;
@@ -315,6 +479,30 @@ export function SourceDrawer(props: {
     };
   }, [moduleId, direction]);
 
+  useEffect(() => {
+    const selectedExport = report?.exports.find((candidate) => candidate.id === activeExportId);
+    setImporterChain(null);
+    setImporterChainError(null);
+    setLoadingImporterChain(Boolean(moduleId && selectedExport));
+    if (!moduleId || !selectedExport) return;
+    let cancelled = false;
+    void loadExportImporterChain(moduleId, selectedExport.exportedName)
+      .then((next) => {
+        if (!cancelled) setImporterChain(next);
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setImporterChainError(error instanceof Error ? error.message : String(error));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingImporterChain(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [moduleId, activeExportId, report]);
+
   const openDependencyGraph = (usage: SourceExportUsage) => {
     const instance =
       usage.moduleInstances.find((candidate) => candidate.moduleId === props.moduleId) ??
@@ -324,8 +512,10 @@ export function SourceDrawer(props: {
     setModuleId(instance.moduleId);
     setDirection("in");
     setReferences(null);
+    setImporterChain(null);
     setSnippet(null);
     setReferenceError(null);
+    setImporterChainError(null);
     const url = new URL(location.href);
     url.searchParams.set("module", instance.moduleId);
     url.searchParams.set("export", usage.exportedName);
@@ -335,9 +525,12 @@ export function SourceDrawer(props: {
     setModuleId(null);
     setActiveExportId(null);
     setReferences(null);
+    setImporterChain(null);
     setSnippet(null);
     setLoadingReferences(false);
+    setLoadingImporterChain(false);
     setReferenceError(null);
+    setImporterChainError(null);
     const url = new URL(location.href);
     url.searchParams.delete("module");
     url.searchParams.delete("export");
@@ -356,7 +549,7 @@ export function SourceDrawer(props: {
         aria-label={`Source details for ${file.path}`}
       >
         <header>
-          <h2 title={file.path}>{file.path.split("/").at(-1)}</h2>
+          <h2 title={file.path}>{file.path}</h2>
           <button
             type="button"
             className="close-button"
@@ -416,6 +609,51 @@ export function SourceDrawer(props: {
             <span>Line</span>
             <span>Source</span>
           </div>
+          <search className="code-search-toolbar" aria-label="Search source code">
+            <input
+              ref={searchInputRef}
+              type="search"
+              aria-label="Search source code"
+              placeholder="Search in file…"
+              value={searchQuery}
+              onChange={(event) => {
+                setSearchQuery(event.target.value);
+                setSearchIndex(0);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  moveSearch(event.shiftKey ? -1 : 1);
+                } else if (event.key === "Escape") {
+                  setSearchQuery("");
+                  setSearchIndex(0);
+                }
+              }}
+            />
+            <span className="code-search-status" aria-live="polite">
+              {searchQuery
+                ? sourceSearch.matches.length
+                  ? `${activeSearchIndex + 1} / ${sourceSearch.matches.length}${sourceSearch.truncated ? "+" : ""}`
+                  : "No matches"
+                : "⌘F"}
+            </span>
+            <button
+              type="button"
+              aria-label="Previous search match"
+              disabled={sourceSearch.matches.length === 0}
+              onClick={() => moveSearch(-1)}
+            >
+              ↑
+            </button>
+            <button
+              type="button"
+              aria-label="Next search match"
+              disabled={sourceSearch.matches.length === 0}
+              onClick={() => moveSearch(1)}
+            >
+              ↓
+            </button>
+          </search>
           <div className="source-scroll" ref={scrollRef}>
             {detailStatus?.status === "loading" ? (
               <div className="source-detail-status" aria-live="polite">
@@ -435,7 +673,7 @@ export function SourceDrawer(props: {
                 if (!line) return null;
                 return (
                   <div
-                    className={`source-line build-${line.buildState} runtime-${line.runtimeState}`}
+                    className={`source-line build-${line.buildState} runtime-${line.runtimeState} ${activeSearchMatch?.line === line.line ? "is-search-active" : ""}`}
                     key={line.line}
                     style={{ transform: `translateY(${virtualRow.start}px)` }}
                     title={`${buildLabel(line)} · generated ${formatBytes(line.emittedBytes)} · executed ${formatBytes(line.executedBytes)} · chunks ${line.chunks.join(", ") || "none"}`}
@@ -447,6 +685,8 @@ export function SourceDrawer(props: {
                       markers={markerLines.get(line.line) ?? []}
                       onMarkerClick={openDependencyGraph}
                       activeExportId={activeExportId}
+                      searchMatches={searchMatchesByLine.get(line.line) ?? []}
+                      activeSearchIndex={activeSearchIndex}
                     />
                   </div>
                 );
@@ -459,9 +699,12 @@ export function SourceDrawer(props: {
                 exportUsage={activeExport}
                 moduleInstance={activeModuleInstance}
                 references={references}
+                importerChain={importerChain}
                 direction={direction}
                 loading={loadingReferences}
+                importerChainLoading={loadingImporterChain}
                 error={referenceError}
+                importerChainError={importerChainError}
                 snippet={snippet}
                 snippetFlashKey={snippetFlashKey}
                 onDirectionChange={(nextDirection) => {
@@ -499,8 +742,10 @@ export function SourceDrawer(props: {
                   setModuleId(nextModuleId);
                   setDirection("in");
                   setReferences(null);
+                  setImporterChain(null);
                   setSnippet(null);
                   setReferenceError(null);
+                  setImporterChainError(null);
                   const url = new URL(location.href);
                   url.searchParams.set("module", nextModuleId);
                   history.replaceState(null, "", url);

@@ -2,6 +2,7 @@ import type {
   BuildManifest,
   CoverageAnalysisStatus,
   CoverageImportSummary,
+  ExportImporterChainResponse,
   ModuleReferencesResponse,
   ReferenceSnippetResponse,
   SourceExportAnalysisStatus,
@@ -125,6 +126,16 @@ export async function loadReferences(
   return (await request(`/modules/${encodeURIComponent(moduleId)}/references?${search}`).then(
     (response) => response.json(),
   )) as ModuleReferencesResponse;
+}
+
+export async function loadExportImporterChain(
+  moduleId: string,
+  exportedName: string,
+): Promise<ExportImporterChainResponse> {
+  const search = new URLSearchParams({ export: exportedName });
+  return (await request(`/modules/${encodeURIComponent(moduleId)}/export-chain?${search}`).then(
+    (response) => response.json(),
+  )) as ExportImporterChainResponse;
 }
 
 export async function loadReferenceSnippet(referenceId: string): Promise<ReferenceSnippetResponse> {

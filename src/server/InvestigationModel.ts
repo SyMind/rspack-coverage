@@ -1,7 +1,7 @@
 import { extname, isAbsolute } from "node:path";
 import { sourceFileCoverageSpans } from "../shared/codeCoverage.js";
 import { emptyMetrics, finalizeMetrics, metricsForModuleInstance } from "../shared/metrics.js";
-import { normalizeSourcePath } from "../shared/path.js";
+import { normalizeSourcePathForContext } from "../shared/path.js";
 import type {
   BuildModule,
   BuildReference,
@@ -9,6 +9,8 @@ import type {
   BuildSnapshot,
   CodeViewResponse,
   CoverageReport,
+  ExportImporterChainResponse,
+  ExportImporterChainStep,
   ModuleInvestigationDetail,
   ModuleReferencesResponse,
   ReferenceLocation,
@@ -21,13 +23,12 @@ import type {
 import { createInMemoryReferenceStore } from "./referenceStore.js";
 
 const DEFAULT_CODE_LIMIT = 240_000;
+const EXPORT_CHAIN_MAX_DEPTH = 12;
+const EXPORT_CHAIN_MAX_STEPS = 120;
+const EXPORT_CHAIN_MAX_INCOMING_PER_STATE = 250;
 
 function normalizeBuildSourcePath(value: string, context: string): string {
-  const source = normalizeSourcePath(value);
-  const normalizedContext = normalizeSourcePath(context);
-  if (source === normalizedContext) return source.split("/").at(-1) ?? source;
-  if (source.startsWith(`${normalizedContext}/`)) return source.slice(normalizedContext.length + 1);
-  return source;
+  return normalizeSourcePathForContext(value, context);
 }
 
 function locationFitsContent(content: string, location: ReferenceLocation | null): boolean {
@@ -143,6 +144,41 @@ function isDetailed(file: SourceFileSummary): file is SourceFileReport {
   return "content" in file && "lines" in file;
 }
 
+function referenceGroupKey(reference: BuildReference): string {
+  return `${reference.originId}\0${reference.targetId}\0${reference.request ?? ""}`;
+}
+
+function referencesForExport(references: BuildReference[], exportedName: string): BuildReference[] {
+  const explicitGroups = new Set(
+    references
+      .filter((reference) => reference.exports?.includes(exportedName))
+      .map(referenceGroupKey),
+  );
+  return references.filter((reference) => {
+    if (reference.active === false) return false;
+    if (reference.exports?.includes(exportedName)) return true;
+    return !reference.exports?.length && !explicitGroups.has(referenceGroupKey(reference));
+  });
+}
+
+function importerExportCandidates(module: BuildModule): {
+  exports: string[];
+  precision: ExportImporterChainStep["relationPrecision"];
+} {
+  if (Array.isArray(module.usedExports)) {
+    const exports = [...new Set(module.usedExports.filter((name) => name !== "__esModule"))];
+    return {
+      exports,
+      precision: exports.length === 1 ? "exact" : exports.length ? "conservative" : "unavailable",
+    };
+  }
+  if (module.usedExports === true && Array.isArray(module.providedExports)) {
+    const exports = [...new Set(module.providedExports.filter((name) => name !== "__esModule"))];
+    return { exports, precision: exports.length ? "conservative" : "unavailable" };
+  }
+  return { exports: [], precision: "unavailable" };
+}
+
 function coverageStatus(
   line: SourceLineState | undefined,
 ): "executed" | "unexecuted" | "not-emitted" | "unloaded" | "unknown" {
@@ -152,6 +188,15 @@ function coverageStatus(
   if (line.runtimeState === "not-executed") return "unexecuted";
   if (line.runtimeState === "not-loaded") return "unloaded";
   return "unknown";
+}
+
+function sourceEvidenceScore(file: SourceFileReport, lineNumber: number): number {
+  const line = file.lines[lineNumber - 1];
+  if (!line) return 0;
+  if (line.buildState !== "retained") return line.buildState === "unknown" ? 1 : 0;
+  if (line.runtimeState === "executed") return 5;
+  if (line.runtimeState === "not-executed") return 4;
+  return line.runtimeState === "not-loaded" ? 3 : 2;
 }
 
 export class InvestigationModel {
@@ -407,6 +452,85 @@ export class InvestigationModel {
     };
   }
 
+  exportImporterChain(moduleId: string, exportedName: string): ExportImporterChainResponse | null {
+    const module = this.#modules.get(moduleId);
+    if (!module) return null;
+    const normalizedExport = exportedName.trim();
+    if (!normalizedExport) return null;
+
+    type PendingState = {
+      moduleId: string;
+      exportedName: string;
+      depth: number;
+      parentId: string | null;
+    };
+    const queue: PendingState[] = [
+      { moduleId, exportedName: normalizedExport, depth: 0, parentId: null },
+    ];
+    const visited = new Set<string>();
+    const steps: ExportImporterChainStep[] = [];
+    let truncated = false;
+
+    for (
+      let cursor = 0;
+      cursor < queue.length && steps.length < EXPORT_CHAIN_MAX_STEPS;
+      cursor += 1
+    ) {
+      const state = queue[cursor];
+      if (!state) continue;
+      const stateKey = `${state.moduleId}\0${state.exportedName}`;
+      if (visited.has(stateKey)) continue;
+      visited.add(stateKey);
+      if (state.depth >= EXPORT_CHAIN_MAX_DEPTH) {
+        if (this.#referenceStore.count(state.moduleId, "in") > 0) truncated = true;
+        continue;
+      }
+
+      const incomingCount = this.#referenceStore.count(state.moduleId, "in");
+      const incomingLimit = Math.min(incomingCount, EXPORT_CHAIN_MAX_INCOMING_PER_STATE);
+      if (incomingCount > incomingLimit) truncated = true;
+      const incoming = this.#referenceStore.page(state.moduleId, "in", 0, incomingLimit);
+      for (const edge of referencesForExport(incoming, state.exportedName)) {
+        if (steps.length >= EXPORT_CHAIN_MAX_STEPS) {
+          truncated = true;
+          break;
+        }
+        const origin = this.#modules.get(edge.originId);
+        const target = this.#modules.get(edge.targetId);
+        if (!origin || !target) continue;
+        const importer = importerExportCandidates(origin);
+        const id = `${edge.id}:${state.exportedName}:${state.depth + 1}`;
+        steps.push({
+          id,
+          parentId: state.parentId,
+          depth: state.depth + 1,
+          importedExport: state.exportedName,
+          importerExports: importer.exports,
+          relationPrecision: importer.precision,
+          edge: { ...edge, origin, target },
+        });
+        for (const importerExport of importer.exports) {
+          queue.push({
+            moduleId: origin.id,
+            exportedName: importerExport,
+            depth: state.depth + 1,
+            parentId: id,
+          });
+        }
+      }
+    }
+    if (queue.some((state) => !visited.has(`${state.moduleId}\0${state.exportedName}`))) {
+      truncated = true;
+    }
+    return {
+      module,
+      exportedName: normalizedExport,
+      steps,
+      truncated,
+      maxDepth: EXPORT_CHAIN_MAX_DEPTH,
+    };
+  }
+
   snippet(referenceId: string, _contextLines = 3): ReferenceSnippetResponse | null {
     const edge = this.#referenceStore.get(referenceId);
     if (!edge) return null;
@@ -454,12 +578,22 @@ export class InvestigationModel {
     const starts = lineStarts(content);
     const start = (starts[location.start.line - 1] ?? 0) + location.start.column;
     const end = Math.max(start + 1, (starts[location.end.line - 1] ?? start) + location.end.column);
+    const selectedFilename = normalizeBuildSourcePath(
+      selected.path,
+      this.snapshot.manifest.context,
+    );
     const detailedOrigin = origin
       ? (this.#filesForModule(origin.id)
           .map((file) => this.source(file.id))
-          .find((file) => file?.content === content) ?? null)
+          .filter((file): file is SourceFileReport => file?.content === content)
+          .sort(
+            (left, right) =>
+              sourceEvidenceScore(right, location.start.line) -
+                sourceEvidenceScore(left, location.start.line) ||
+              Number(right.path === selectedFilename) - Number(left.path === selectedFilename),
+          )[0] ?? null)
       : null;
-    const filename = normalizeBuildSourcePath(selected.path, this.snapshot.manifest.context);
+    const filename = detailedOrigin?.path ?? selectedFilename;
     const code: CodeViewResponse = {
       view: "source",
       sourceId: detailedOrigin?.id ?? null,

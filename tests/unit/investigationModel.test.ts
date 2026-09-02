@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { InvestigationModel } from "../../src/server/InvestigationModel.js";
 import type {
   BuildManifest,
+  BuildModule,
   BuildSnapshot,
   CoverageReport,
   SourceFileReport,
@@ -259,6 +260,106 @@ describe("InvestigationModel", () => {
     );
   });
 
+  it("walks importer export names through the bounded reference graph", () => {
+    const target = {
+      ...(manifest().modules.find((module) => module.id === "target") as BuildModule),
+      name: "./app-config.js",
+      resource: "/project/app-config.js",
+      usedExports: ["createWebAppConfigImpl"],
+      providedExports: ["createWebAppConfigImpl"],
+    };
+    const suite: BuildModule = {
+      ...target,
+      id: "suite",
+      identifier: "/project/suite.js",
+      name: "./suite.js",
+      resource: "/project/suite.js",
+      usedExports: ["createWebSuite"],
+      providedExports: ["createWebSuite"],
+    };
+    const barrel: BuildModule = {
+      ...suite,
+      id: "barrel",
+      identifier: "/project/index.js",
+      name: "./index.js",
+      resource: "/project/index.js",
+    };
+    const entry: BuildModule = {
+      ...suite,
+      id: "entry",
+      identifier: "/project/entry.js",
+      name: "./entry.js",
+      resource: "/project/entry.js",
+      entry: true,
+      usedExports: true,
+      providedExports: null,
+    };
+    const build = snapshot([]);
+    build.manifest.modules = [target, suite, barrel, entry];
+    const edge = (
+      id: string,
+      originId: string,
+      targetId: string,
+      exports: string[] | null,
+      active = true,
+      request = "./dependency.js",
+    ) => ({
+      id,
+      originId,
+      targetId,
+      dependencyType: "esm import specifier",
+      request,
+      exports,
+      active,
+      location: null,
+    });
+    build.references = [
+      edge("suite-app-config", "suite", "target", ["createWebAppConfigImpl"]),
+      edge("barrel-app-config-generic", "barrel", "target", null, true, "./app-config.js"),
+      edge(
+        "barrel-app-config-inactive",
+        "barrel",
+        "target",
+        ["createWebAppConfigImpl"],
+        false,
+        "./app-config.js",
+      ),
+      edge("barrel-suite", "barrel", "suite", ["createWebSuite"]),
+      edge("entry-barrel", "entry", "barrel", ["createWebSuite"]),
+    ];
+    const model = new InvestigationModel(build);
+
+    const chain = model.exportImporterChain("target", "createWebAppConfigImpl");
+    expect(
+      chain?.steps.map((step) => ({
+        edge: step.edge.id,
+        depth: step.depth,
+        importedExport: step.importedExport,
+        importerExports: step.importerExports,
+      })),
+    ).toEqual([
+      {
+        edge: "suite-app-config",
+        depth: 1,
+        importedExport: "createWebAppConfigImpl",
+        importerExports: ["createWebSuite"],
+      },
+      {
+        edge: "barrel-suite",
+        depth: 2,
+        importedExport: "createWebSuite",
+        importerExports: ["createWebSuite"],
+      },
+      {
+        edge: "entry-barrel",
+        depth: 3,
+        importedExport: "createWebSuite",
+        importerExports: [],
+      },
+    ]);
+    expect(chain?.truncated).toBe(false);
+  });
+
   it("finds the dependency request when Rspack does not expose a usable location", () => {
     const consumer = source(
       "src/consumer.js",
@@ -314,5 +415,46 @@ describe("InvestigationModel", () => {
     expect(snippet?.code?.content.slice(snippet.highlight?.start, snippet.highlight?.end)).toBe(
       "TARGET",
     );
+  });
+
+  it("prefers retained evidence when duplicate source identities have the same content", () => {
+    const content = 'import { value } from "./target.js";';
+    const duplicate = source("project/node_modules/pkg/consumer.js", "consumer", content);
+    duplicate.metrics = metrics();
+    const duplicateLine = duplicate.lines[0];
+    if (!duplicateLine) throw new Error("Missing duplicate source line");
+    duplicate.lines[0] = {
+      ...duplicateLine,
+      buildState: "not-emitted",
+      runtimeState: "not-loaded",
+      emittedBytes: 0,
+      loadedBytes: 0,
+      executedBytes: 0,
+      ranges: [],
+    };
+    const retained = source("node_modules/pkg/consumer.js", "consumer", content);
+    const retainedLine = retained.lines[0];
+    if (!retainedLine) throw new Error("Missing retained source line");
+    retained.lines[0] = {
+      ...retainedLine,
+      runtimeState: "not-loaded",
+      loadedBytes: 0,
+      executedBytes: 0,
+      ranges: [],
+    };
+    const target = source("src/target.js", "target", "export const value = 1;");
+    const build = snapshot([duplicate, retained, target]);
+    build.manifest.context = "/project/packages/app";
+    const edge = build.references[0];
+    if (!edge) throw new Error("Missing reference fixture");
+    edge.sourcePath = "/project/node_modules/pkg/consumer.js";
+    const model = new InvestigationModel(build, report([duplicate, retained, target]), new Map());
+
+    expect(model.snippet("edge")).toMatchObject({
+      available: true,
+      filename: "node_modules/pkg/consumer.js",
+      highlight: { coverageStatus: "unloaded" },
+      code: { sourceId: "node_modules/pkg/consumer.js" },
+    });
   });
 });

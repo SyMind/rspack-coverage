@@ -1,7 +1,9 @@
-import { useEffect, useRef } from "react";
+import { type CSSProperties, useEffect, useRef, useState } from "react";
 import type {
   CodeCoverageState,
   CodeViewResponse,
+  ExportImporterChainResponse,
+  ExportImporterChainStep,
   ExportModuleInstance,
   ExportUsagePrecision,
   ExportUsageState,
@@ -47,6 +49,23 @@ function edgeNeighbor(edge: ReferenceEdgeReport, selectedId: string) {
 function referenceLocation(line: number | null, column: number | null): string {
   if (line === null) return "location unavailable";
   return column === null ? `line ${line}` : `${line}:${column + 1}`;
+}
+
+function edgeLocation(edge: ReferenceEdgeReport): string {
+  const location = edge.sourceLocation ?? edge.location;
+  return referenceLocation(location?.start.line ?? null, location?.start.column ?? null);
+}
+
+function chainStepPath(step: ExportImporterChainStep): string {
+  return step.edge.sourcePath ?? step.edge.origin.resource ?? step.edge.origin.name;
+}
+
+function chainStepRelation(step: ExportImporterChainStep): string {
+  if (!step.importerExports.length) return "module execution";
+  const exports = step.importerExports.join(", ");
+  return step.relationPrecision === "exact"
+    ? `via export ${exports}`
+    : `via candidate exports ${exports}`;
 }
 
 function legacySnippetCode(snippet: ReferenceSnippetResponse): CodeViewResponse | null {
@@ -105,6 +124,27 @@ function emptyDirectionLabel(direction: "in" | "out" | "both"): string {
     : direction === "out"
       ? "No dependency edges captured"
       : "No module edges captured";
+}
+
+function edgeForExportReference(
+  edges: ReferenceEdgeReport[],
+  reference: SourceExportUsage["references"][number],
+): ReferenceEdgeReport | undefined {
+  if (reference.line === null) return edges[0];
+  const lineMatches = edges.filter(
+    (edge) => (edge.sourceLocation ?? edge.location)?.start.line === reference.line,
+  );
+  const referenceColumn = reference.column;
+  if (lineMatches.length <= 1 || referenceColumn === null) return lineMatches[0] ?? edges[0];
+  return lineMatches.reduce((closest, edge) => {
+    const closestColumn = (closest.sourceLocation ?? closest.location)?.start.column;
+    const edgeColumn = (edge.sourceLocation ?? edge.location)?.start.column;
+    if (edgeColumn === undefined) return closest;
+    if (closestColumn === undefined) return edge;
+    return Math.abs(edgeColumn - referenceColumn) < Math.abs(closestColumn - referenceColumn)
+      ? edge
+      : closest;
+  });
 }
 
 function SnippetCard(props: {
@@ -192,9 +232,12 @@ export function ReferencePanel(props: {
   exportUsage: SourceExportUsage | null;
   moduleInstance: ExportModuleInstance | null;
   references: ModuleReferencesResponse | null;
+  importerChain?: ExportImporterChainResponse | null;
   direction: "in" | "out" | "both";
   loading: boolean;
+  importerChainLoading?: boolean;
   error: string | null;
+  importerChainError?: string | null;
   snippet: ReferenceSnippetResponse | null;
   snippetFlashKey: number;
   onDirectionChange: (direction: "in" | "out" | "both") => void;
@@ -204,6 +247,7 @@ export function ReferencePanel(props: {
   onClose?: () => void;
   onCloseSnippet: () => void;
 }) {
+  const [expandedChainKey, setExpandedChainKey] = useState<string | null>(null);
   const references = props.references;
   const exportUsage = props.exportUsage;
   const selectedModuleId = references?.module.id ?? props.moduleInstance?.moduleId ?? "";
@@ -236,12 +280,15 @@ export function ReferencePanel(props: {
             directReferenceModules.has(edge.originId) &&
             !explicitReferenceModules.has(edge.originId))),
     );
-  const matchingEdge = (originModuleId: string) =>
-    references?.edges.find(
-      (edge) =>
-        edge.originId === originModuleId &&
-        edge.targetId === selectedModuleId &&
-        edgeMatchesExport(edge),
+  const matchingEdge = (reference: SourceExportUsage["references"][number]) =>
+    edgeForExportReference(
+      references?.edges.filter(
+        (edge) =>
+          edge.originId === reference.moduleId &&
+          edge.targetId === selectedModuleId &&
+          edgeMatchesExport(edge),
+      ) ?? [],
+      reference,
     );
   const displayedEdges =
     props.direction === "in" && exportUsage
@@ -253,6 +300,15 @@ export function ReferencePanel(props: {
     (props.moduleInstance ? shortName(props.moduleInstance.identifier, 44) : "Module unavailable");
   const directionCounts = references ? { ...references.counts, in: selectedReferenceCount } : null;
   const currentDirectionCount = directionCounts?.[props.direction] ?? null;
+  const importerChain =
+    props.importerChain?.module.id === selectedModuleId &&
+    props.importerChain.exportedName === exportUsage?.exportedName
+      ? props.importerChain
+      : null;
+  const chainSteps = importerChain?.steps ?? [];
+  const chainKey = `${selectedModuleId}:${exportUsage?.exportedName ?? ""}`;
+  const chainExpanded = expandedChainKey === chainKey;
+  const visibleChainSteps = chainExpanded ? chainSteps : chainSteps.slice(0, 6);
   return (
     <aside className="reference-workbench" aria-label="Export references and module graph">
       <div className="reference-toolbar">
@@ -302,10 +358,58 @@ export function ReferencePanel(props: {
               {exportUsage.moduleInstances.length.toLocaleString()}
             </span>
           </div>
+          {props.importerChainLoading ? (
+            <div className="export-chain-loading">Tracing importer exports…</div>
+          ) : importerChain?.steps.length ? (
+            <section
+              className="export-importer-chain-list"
+              aria-label="Transitive export importer chain"
+            >
+              {visibleChainSteps.map((step) => {
+                const path = chainStepPath(step);
+                return (
+                  <button
+                    type="button"
+                    key={step.id}
+                    style={{ "--chain-depth": step.depth } as CSSProperties}
+                    onClick={() => props.onSelectEdge(step.edge.id)}
+                    aria-label={`Open importer chain usage ${path}`}
+                  >
+                    <span>{step.depth === 1 ? "direct importer" : `depth ${step.depth}`}</span>
+                    <strong title={path}>{path}</strong>
+                    <small>
+                      {chainStepRelation(step)} · uses {step.importedExport} ·{" "}
+                      {edgeLocation(step.edge)}
+                    </small>
+                  </button>
+                );
+              })}
+              {chainSteps.length > 6 ? (
+                <button
+                  type="button"
+                  className="export-chain-toggle"
+                  onClick={() => setExpandedChainKey(chainExpanded ? null : chainKey)}
+                >
+                  {chainExpanded
+                    ? "Show first 6 chain steps"
+                    : `Show all ${chainSteps.length.toLocaleString()} chain steps`}
+                </button>
+              ) : null}
+              {importerChain.truncated ? (
+                <div className="export-chain-note">
+                  The importer chain reached its bounded {importerChain.maxDepth}-level preview.
+                </div>
+              ) : null}
+            </section>
+          ) : props.importerChainError ? (
+            <div className="export-chain-note">
+              Importer chain unavailable: {props.importerChainError}
+            </div>
+          ) : null}
           {selectedExportReferences.length ? (
             <div className="export-reference-list">
               {selectedExportReferences.map((reference, index) => {
-                const edge = matchingEdge(reference.moduleId);
+                const edge = matchingEdge(reference);
                 const key = `${reference.moduleId}:${reference.line}:${reference.column}:${index}`;
                 const content = (
                   <>

@@ -385,7 +385,9 @@ export class AnalysisServer {
       sendJson(response, 200, this.#investigation?.evidenceGaps() ?? []);
       return;
     }
-    const moduleMatch = pathname.match(/\/api\/modules\/([^/]+)(?:\/(code|references|context))?$/);
+    const moduleMatch = pathname.match(
+      /\/api\/modules\/([^/]+)(?:\/(code|references|export-chain|context))?$/,
+    );
     if (moduleMatch) {
       const moduleId = moduleMatch[1] ?? "";
       const action = moduleMatch[2] ?? "detail";
@@ -421,6 +423,16 @@ export class AnalysisServer {
         sendJson(response, references ? 200 : 404, references ?? { error: "Unknown module" });
         return;
       }
+      if (action === "export-chain") {
+        const exportedName = url.searchParams.get("export")?.trim() ?? "";
+        if (!exportedName) {
+          sendJson(response, 400, { error: "export is required" });
+          return;
+        }
+        const chain = this.#investigation?.exportImporterChain(moduleId, exportedName) ?? null;
+        sendJson(response, chain ? 200 : 404, chain ?? { error: "Unknown module or export" });
+        return;
+      }
       const context = this.#investigation?.aiContext(moduleId) ?? null;
       sendJson(response, context ? 200 : 404, context ?? { error: "Unknown module" });
       return;
@@ -434,10 +446,17 @@ export class AnalysisServer {
         ) ?? null;
       if (snippet?.available && snippet.code) {
         const fileId = snippet.code.sourceId ?? snippet.code.filename;
+        const usageLine = snippet.location?.start.line;
         try {
-          const detail = await this.#coverageAnalysis.source(snapshot.manifest.hash, fileId);
+          const detail = await this.#coverageAnalysis.source(
+            snapshot.manifest.hash,
+            fileId,
+            snippet.edge.originId,
+            usageLine,
+          );
+          snippet.code.sourceId = detail.id;
+          snippet.code.filename = detail.id;
           snippet.code.spans = sourceLinesCoverageSpans(snippet.code.content, detail.lines);
-          const usageLine = snippet.location?.start.line;
           if (snippet.highlight && usageLine) {
             const line = detail.lines[usageLine - 1];
             if (line) snippet.highlight.coverageStatus = sourceLineCoverageStatus(line);

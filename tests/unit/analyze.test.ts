@@ -22,6 +22,91 @@ function hash(text: string): string {
 }
 
 describe("coverage analysis", () => {
+  it("merges webpack parent paths with the captured resource identity", async () => {
+    const generated = "withField();";
+    const source = "withField(Component);";
+    const build: BuildManifest = {
+      hash: "build-parent-source",
+      mode: "production",
+      context: "/repo/packages/L4-Entry/app-flow-chat",
+      publicPath: "/",
+      builtAt: 1,
+      assets: [
+        {
+          id: "main",
+          name: "main.js",
+          urlPath: "/main.js",
+          size: generated.length,
+          contentHash: hash(generated),
+          chunks: ["main"],
+          mapAvailable: true,
+        },
+      ],
+      chunks: [
+        {
+          id: "main",
+          names: ["main"],
+          files: ["main.js"],
+          initial: true,
+          entry: true,
+          moduleIds: ["field"],
+          emittedBytes: generated.length,
+        },
+      ],
+      modules: [
+        {
+          id: "field",
+          identifier: "/repo/node_modules/pkg/form/field.js",
+          name: "../../../node_modules/pkg/form/field.js",
+          resource: "/repo/node_modules/pkg/form/field.js",
+          moduleType: "javascript/auto",
+          chunks: ["main"],
+          issuer: null,
+          size: source.length,
+          usedExports: true,
+          providedExports: null,
+          optimizationBailout: [],
+          nested: false,
+        },
+      ],
+      entrypoints: [{ name: "main", chunks: ["main"], assets: ["main.js"] }],
+      diagnostics: [],
+      capabilities: FULL_CAPABILITIES,
+      counts: { assets: 1, javascriptAssets: 1, chunks: 1, modules: 1, sourceMaps: 1 },
+      previewAvailable: true,
+      publicPathSupported: true,
+    };
+
+    const report = await analyzeCoverage({
+      build,
+      coverage: [
+        { url: "/main.js", text: generated, ranges: [{ start: 0, end: generated.length }] },
+      ],
+      maps: {
+        main: {
+          version: 3,
+          sources: ["webpack://app-flow-chat/../../../node_modules/pkg/form/field.js"],
+          sourcesContent: [source],
+          names: [],
+          mappings: "AAAA",
+        },
+      },
+      generatedAssets: { main: generated },
+      originalSources: { "repo/node_modules/pkg/form/field.js": source },
+      precision: "per-block",
+    });
+
+    expect(
+      report.files.filter((file) => file.path.endsWith("node_modules/pkg/form/field.js")),
+    ).toEqual([
+      expect.objectContaining({
+        id: "repo/node_modules/pkg/form/field.js",
+        moduleIds: ["field"],
+        metrics: expect.objectContaining({ emittedBytes: generated.length }),
+      }),
+    ]);
+  });
+
   it("maps executed, unexecuted, not-loaded, not-emitted, and unmapped bytes", async () => {
     const main = "aaaaabbbbbrrrrr";
     const lazy = "ccccc";

@@ -278,6 +278,26 @@ export interface ModuleReferencesResponse {
   entryPath: BuildModule[];
 }
 
+export interface ExportImporterChainStep {
+  id: string;
+  parentId: string | null;
+  depth: number;
+  /** Export consumed from the target module at this hop. */
+  importedExport: string;
+  /** Used exports of the importer that can carry this dependency further upstream. */
+  importerExports: string[];
+  relationPrecision: "exact" | "conservative" | "unavailable";
+  edge: ReferenceEdgeReport;
+}
+
+export interface ExportImporterChainResponse {
+  module: BuildModule;
+  exportedName: string;
+  steps: ExportImporterChainStep[];
+  truncated: boolean;
+  maxDepth: number;
+}
+
 export interface ReferenceSnippetResponse {
   edge: BuildReference;
   available: boolean;

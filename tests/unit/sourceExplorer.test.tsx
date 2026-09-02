@@ -187,6 +187,68 @@ describe("SourceExplorer", () => {
     expect(screen.getByRole("button", { name: "Collapse directory node_modules" })).toBeVisible();
   });
 
+  it("sorts module rows from each column header and toggles direction", () => {
+    const { files, tree } = fixture();
+    render(
+      <SourceExplorer
+        tree={tree}
+        files={files}
+        selectedFileId={null}
+        selectedModuleId={null}
+        onSelectFile={vi.fn()}
+      />,
+    );
+
+    const rowPaths = () =>
+      screen
+        .getAllByRole("button", { name: /^Open module / })
+        .map((row) => row.getAttribute("aria-label")?.replace("Open module ", ""));
+
+    const loaded = screen.getByRole("button", { name: /Sort modules by Loaded/ });
+    fireEvent.click(loaded);
+    expect(rowPaths()).toEqual([
+      "src/heavy.js",
+      "src/alpha.js",
+      "src/zeta.js",
+      "node_modules/pkg/index.js",
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: /Sort modules by Loaded/ }));
+    expect(rowPaths()).toEqual([
+      "node_modules/pkg/index.js",
+      "src/alpha.js",
+      "src/zeta.js",
+      "src/heavy.js",
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: /Sort modules by Usage/ }));
+    expect(rowPaths()).toEqual([
+      "node_modules/pkg/index.js",
+      "src/alpha.js",
+      "src/zeta.js",
+      "src/heavy.js",
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: /Sort modules by Chunks/ }));
+    expect(rowPaths()).toEqual([
+      "src/heavy.js",
+      "node_modules/pkg/index.js",
+      "src/alpha.js",
+      "src/zeta.js",
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: /Sort modules by Path/ }));
+    expect(rowPaths()).toEqual([
+      "node_modules/pkg/index.js",
+      "src/alpha.js",
+      "src/heavy.js",
+      "src/zeta.js",
+    ]);
+    expect(screen.getByRole("button", { name: /Sort modules by Path, ascending/ })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
   it("keeps separate Rspack module identities for one mapped source", () => {
     const file = {
       ...source("src/shared.ts", 100),

@@ -1,3 +1,5 @@
+import { posix, win32 } from "node:path";
+
 const SCHEME_RE = /^(?:webpack|rspack|file):\/\//;
 const RESOURCE_REQUEST_RE = /^(?:[a-z][a-z\d+.-]*:\/\/|\/|\.\.?\/|[a-z]:[\\/])/i;
 
@@ -44,8 +46,23 @@ export function normalizeSourcePath(value: string): string {
   return normalized || "[unknown source]";
 }
 
+function resolveSourcePathForContext(value: string, context: string): string {
+  let source = stripQueryAndFragment(stripLoaderPrefix(value)).replace(/\\/g, "/");
+  source = source.replace(/^webpack:\/\/[^/]*\//, "");
+  source = source.replace(/^rspack:\/\/[^/]*\//, "");
+  if (!/^\.\.?\//.test(source)) return value;
+
+  const base = stripQueryAndFragment(stripLoaderPrefix(context)).replace(/\\/g, "/");
+  if (/^[a-z]:\//i.test(base)) {
+    return win32
+      .resolve(base.replace(/\//g, "\\"), source.replace(/\//g, "\\"))
+      .replace(/\\/g, "/");
+  }
+  return base.startsWith("/") ? posix.resolve(base, source) : value;
+}
+
 export function normalizeSourcePathForContext(value: string, context: string): string {
-  const source = normalizeSourcePath(value);
+  const source = normalizeSourcePath(resolveSourcePathForContext(value, context));
   const normalizedContext = normalizeSourcePath(context);
   if (source === normalizedContext) return source.split("/").at(-1) ?? source;
   if (source.startsWith(`${normalizedContext}/`)) return source.slice(normalizedContext.length + 1);

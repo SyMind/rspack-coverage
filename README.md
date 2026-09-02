@@ -179,7 +179,9 @@ As with any local build tool, the report can display source paths and `sourcesCo
 - No request timing, cache status, transfer size, waterfall, gzip, or Brotli module estimate.
 - Per-function recordings can be imported but are explicitly marked lower precision.
 - Source-to-generated attribution follows source-map mapping boundaries. Poor or missing maps lower mapping coverage rather than inventing precision.
-- Export reference details describe direct ModuleGraph edges, not a complete re-export propagation chain.
+- Export reference details retain direct ModuleGraph evidence and derive a bounded, on-demand
+  importer-export chain from active dependency edges plus each importer's used exports. A single
+  carrying export is shown as exact; multi-export branches remain explicitly conservative.
 - The Opportunities view ranks factual signals. It never labels unexecuted bytes as guaranteed savings.
 
 ## Development

@@ -610,8 +610,38 @@ input:focus {
   letter-spacing: 0.09em;
   text-transform: uppercase;
 }
-.tree-table-head span:not(:first-child) {
+.tree-table-head > :not(:first-child) {
   text-align: right;
+}
+.tree-sort-button {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+.tree-sort-button:not(:first-child) {
+  justify-content: flex-end;
+}
+.tree-sort-button:hover,
+.tree-sort-button.is-active {
+  color: var(--ink);
+}
+.tree-sort-button i {
+  min-width: 9px;
+  font-style: normal;
+  opacity: 0.42;
+}
+.tree-sort-button.is-active i {
+  opacity: 1;
 }
 .tree-scroll {
   height: 510px;

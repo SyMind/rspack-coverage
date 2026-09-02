@@ -6,6 +6,11 @@ import { formatBytes, formatPercent, usageColor } from "../lib/format.js";
 
 type SourceView = "modules" | "directory";
 type FlatNode = { node: TreeNodeReport; depth: number; moduleId: string | null };
+type ModuleSortKey = "path" | "loaded" | "unused" | "usage" | "chunks";
+type SortDirection = "asc" | "desc";
+type ModuleSort = { key: ModuleSortKey; direction: SortDirection };
+
+const DEFAULT_MODULE_SORT: ModuleSort = { key: "unused", direction: "desc" };
 
 function displayedModuleMetrics(
   file: SourceFileSummary,
@@ -20,6 +25,39 @@ function compareByUnusedBytesAndPath(
 ): number {
   return (
     right.metrics.unusedBytes - left.metrics.unusedBytes || left.path.localeCompare(right.path)
+  );
+}
+
+function compareModuleRows(left: FlatNode, right: FlatNode, sort: ModuleSort): number {
+  let compared = 0;
+  switch (sort.key) {
+    case "path":
+      compared = left.node.path.localeCompare(right.node.path);
+      break;
+    case "loaded":
+      compared = left.node.metrics.loadedBytes - right.node.metrics.loadedBytes;
+      break;
+    case "unused":
+      compared = left.node.metrics.unusedBytes - right.node.metrics.unusedBytes;
+      break;
+    case "usage": {
+      const leftUsage = left.node.metrics.usageRatio;
+      const rightUsage = right.node.metrics.usageRatio;
+      if (leftUsage === null || rightUsage === null) {
+        if (leftUsage !== rightUsage) return leftUsage === null ? 1 : -1;
+      } else {
+        compared = leftUsage - rightUsage;
+      }
+      break;
+    }
+    case "chunks":
+      compared = left.node.chunks.length - right.node.chunks.length;
+      break;
+  }
+  if (compared !== 0) return sort.direction === "asc" ? compared : -compared;
+  return (
+    left.node.path.localeCompare(right.node.path) ||
+    (left.moduleId ?? "").localeCompare(right.moduleId ?? "")
   );
 }
 
@@ -70,6 +108,7 @@ function moduleRows(
   modulesById: ReadonlyMap<string, BuildModule>,
   category: string,
   search: string,
+  sort: ModuleSort,
 ): FlatNode[] {
   return sortModuleSources(files)
     .filter(
@@ -98,7 +137,7 @@ function moduleRows(
         };
       }),
     )
-    .sort((left, right) => compareByUnusedBytesAndPath(left.node, right.node));
+    .sort((left, right) => compareModuleRows(left, right, sort));
 }
 
 export function SourceExplorer(props: {
@@ -115,6 +154,7 @@ export function SourceExplorer(props: {
   );
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState("all");
+  const [moduleSort, setModuleSort] = useState<ModuleSort>(DEFAULT_MODULE_SORT);
   const scrollRef = useRef<HTMLDivElement>(null);
   const normalizedSearch = search.trim().toLowerCase();
   const modulesById = useMemo(
@@ -124,9 +164,9 @@ export function SourceExplorer(props: {
   const rows = useMemo(
     () =>
       view === "modules"
-        ? moduleRows(props.files, modulesById, category, normalizedSearch)
+        ? moduleRows(props.files, modulesById, category, normalizedSearch, moduleSort)
         : flattenTree(props.tree, expanded, category, normalizedSearch),
-    [props.files, props.tree, modulesById, view, expanded, category, normalizedSearch],
+    [props.files, props.tree, modulesById, view, expanded, category, normalizedSearch, moduleSort],
   );
   const virtualizer = useVirtualizer({
     count: rows.length,
@@ -142,6 +182,32 @@ export function SourceExplorer(props: {
   const selectView = (nextView: SourceView) => {
     setView(nextView);
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
+  };
+
+  const selectModuleSort = (key: ModuleSortKey) => {
+    setModuleSort((current) =>
+      current.key === key
+        ? { key, direction: current.direction === "desc" ? "asc" : "desc" }
+        : { key, direction: key === "path" ? "asc" : "desc" },
+    );
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
+  };
+
+  const sortHeader = (key: ModuleSortKey, label: string) => {
+    const active = moduleSort.key === key;
+    const direction = active ? moduleSort.direction : null;
+    return (
+      <button
+        type="button"
+        className={`tree-sort-button ${active ? "is-active" : ""}`}
+        aria-label={`Sort modules by ${label}${direction ? `, ${direction === "asc" ? "ascending" : "descending"}` : ""}`}
+        aria-pressed={active}
+        onClick={() => selectModuleSort(key)}
+      >
+        {label}
+        <i aria-hidden="true">{direction === "asc" ? "↑" : direction === "desc" ? "↓" : "↕"}</i>
+      </button>
+    );
   };
 
   return (
@@ -192,11 +258,23 @@ export function SourceExplorer(props: {
         </div>
       </div>
       <div className="tree-table-head">
-        <span>Path</span>
-        <span>Loaded</span>
-        <span>{view === "modules" ? "Unused" : "Unexecuted"}</span>
-        <span>Usage</span>
-        <span>Chunks</span>
+        {view === "modules" ? (
+          <>
+            {sortHeader("path", "Path")}
+            {sortHeader("loaded", "Loaded")}
+            {sortHeader("unused", "Unused")}
+            {sortHeader("usage", "Usage")}
+            {sortHeader("chunks", "Chunks")}
+          </>
+        ) : (
+          <>
+            <span>Path</span>
+            <span>Loaded</span>
+            <span>Unexecuted</span>
+            <span>Usage</span>
+            <span>Chunks</span>
+          </>
+        )}
       </div>
       <div className="tree-scroll" ref={scrollRef}>
         <div className="virtual-canvas" style={{ height: `${virtualizer.getTotalSize()}px` }}>

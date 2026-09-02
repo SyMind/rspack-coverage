@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { normalizeSourcePath, normalizeUrlPath, sourceCategory } from "../../src/shared/path.js";
+import {
+  normalizeSourcePath,
+  normalizeSourcePathForContext,
+  normalizeUrlPath,
+  sourceCategory,
+} from "../../src/shared/path.js";
 
 describe("path normalization", () => {
   it("normalizes webpack URLs, loader queries, and URL fragments", () => {
@@ -16,6 +21,19 @@ describe("path normalization", () => {
       ),
     ).toBe("project/src/page.tsx");
     expect(normalizeSourcePath("/loader.js?value!=x#fragment")).toBe("loader.js");
+  });
+
+  it("resolves webpack parent paths against the compilation context", () => {
+    const context = "/repo/packages/L4-Entry/app-flow-chat";
+    expect(
+      normalizeSourcePathForContext(
+        "webpack://app-flow-chat/../../../node_modules/pkg/form/field.js",
+        context,
+      ),
+    ).toBe(normalizeSourcePathForContext("/repo/node_modules/pkg/form/field.js", context));
+    expect(normalizeSourcePathForContext("webpack:///./src/page.tsx", context)).toBe(
+      "src/page.tsx",
+    );
   });
 
   it("classifies dependency and runtime sources", () => {

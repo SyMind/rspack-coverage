@@ -129,7 +129,7 @@ describe("RspackCoveragePlugin", () => {
       headers,
     }).then((response) => response.json())) as {
       hash: string;
-      counts: { sourceMaps: number; references: number };
+      counts: { sourceMaps: number; references: number; codeGenerationSources?: number };
       capabilities: {
         usedExports: string;
         sourceMap: string;
@@ -140,6 +140,7 @@ describe("RspackCoveragePlugin", () => {
     };
     expect(manifest.counts.sourceMaps).toBeGreaterThan(0);
     expect(manifest.counts.references).toBeGreaterThan(0);
+    expect(manifest.counts.codeGenerationSources).toBeGreaterThan(0);
     expect(manifest.capabilities).toEqual({
       usedExports: "enabled",
       sourceMap: "full",

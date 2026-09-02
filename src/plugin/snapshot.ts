@@ -486,6 +486,34 @@ function collectModules(rawModules: any[], entryIdentifiers: Set<string>): Build
   return modules;
 }
 
+/**
+ * Rspack's native CodeGenerationResults#get panics when the requested module
+ * has no entry. Stats marks modules only after their code-generation result is
+ * inserted, so use that marker as the native-call eligibility boundary.
+ *
+ * Older Rspack releases may omit the field entirely. Returning null preserves
+ * the legacy best-effort path for those bindings instead of disabling generated
+ * output for every module.
+ */
+export function collectCodeGeneratedModuleIdentifiers(rawModules: any[]): Set<string> | null {
+  const identifiers = new Set<string>();
+  let markerAvailable = false;
+
+  const visit = (raw: any): void => {
+    if (!raw || typeof raw !== "object") return;
+    if (Object.hasOwn(raw, "codeGenerated")) {
+      markerAvailable = true;
+      if (raw.codeGenerated === true) {
+        identifiers.add(String(raw.identifier ?? raw.name ?? "[unknown module]"));
+      }
+    }
+    for (const child of raw.modules ?? []) visit(child);
+  };
+
+  for (const raw of rawModules) visit(raw);
+  return markerAvailable ? identifiers : null;
+}
+
 function moduleLookup(modules: BuildModule[]): Map<string, BuildModule[]> {
   const lookup = new Map<string, BuildModule[]>();
   for (const module of modules) {
@@ -835,16 +863,22 @@ function createCodeGenerationStore(
   compilation: Stats["compilation"],
   records: RawModuleRecord[],
   lookup: Map<string, BuildModule[]>,
+  codeGeneratedIdentifiers: ReadonlySet<string> | null,
 ): {
   cache: Map<string, ModuleCodeGeneration[]>;
   load: (moduleId: string) => ModuleCodeGeneration[];
   release: (moduleId: string) => void;
 } {
   const rawModules = new Map<string, { raw: any; module: BuildModule }>();
+  const nestedIdentifiers = new Set(
+    records.filter((record) => record.nested).map((record) => moduleIdentifier(record.module)),
+  );
   for (const { module: raw, nested } of records) {
     // Concatenated children do not own code-generation entries. Asking older
     // Rspack bindings for one panics in native code instead of returning null.
-    if (nested) continue;
+    const identifier = moduleIdentifier(raw);
+    if (nested || nestedIdentifiers.has(identifier)) continue;
+    if (codeGeneratedIdentifiers && !codeGeneratedIdentifiers.has(identifier)) continue;
     const module = buildModuleFor(raw, lookup);
     if (module && !rawModules.has(module.id)) rawModules.set(module.id, { raw, module });
   }
@@ -1030,6 +1064,7 @@ export function createBuildSnapshot(
       compilation,
       rawModuleRecords,
       modulesByIdentifier,
+      collectCodeGeneratedModuleIdentifiers(json.modules ?? []),
     );
     const moduleIdsByChunk = new Map<string, string[]>();
     for (const module of modules) {
