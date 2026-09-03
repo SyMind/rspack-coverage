@@ -11,6 +11,8 @@ import type {
   ExportGraphModule,
   ExportGraphStore,
   ExportReferenceEdge,
+  ExportUsageEdge,
+  ExportUsageStore,
   ModuleCodeGeneration,
   RawSourceMapPayload,
   ReferenceDirection,
@@ -494,6 +496,86 @@ class SqliteExportGraphStore implements ExportGraphStore {
   }
 }
 
+function decodeExportUsageEdge(row: Record<string, unknown>): ExportUsageEdge {
+  return parseJson<ExportUsageEdge>(
+    bufferValue(row.payload, "export usage edge"),
+    "export usage edge",
+  );
+}
+
+class SqliteExportUsageStore implements ExportUsageStore {
+  readonly #byId;
+  readonly #targetCount;
+  readonly #targetPage;
+  readonly #all;
+  readonly #count;
+  readonly #cache = new Map<string, ExportUsageEdge>();
+
+  constructor(database: DatabaseSync) {
+    this.#byId = database.prepare("SELECT payload FROM export_usage_edges WHERE id = ?");
+    const hasPrefixIndex = hasTable(database, "export_usage_targets");
+    this.#targetCount = database.prepare(
+      hasPrefixIndex
+        ? "SELECT count(*) AS count FROM export_usage_targets WHERE target_id = ? AND target_export = ?"
+        : "SELECT count(*) AS count FROM export_usage_edges WHERE target_id = ? AND target_export = ?",
+    );
+    this.#targetPage = database.prepare(
+      hasPrefixIndex
+        ? "SELECT edge.payload FROM export_usage_targets AS target JOIN export_usage_edges AS edge USING (sequence) WHERE target.target_id = ? AND target.target_export = ? ORDER BY target.sequence LIMIT ? OFFSET ?"
+        : "SELECT payload FROM export_usage_edges WHERE target_id = ? AND target_export = ? ORDER BY sequence LIMIT ? OFFSET ?",
+    );
+    this.#all = database.prepare("SELECT payload FROM export_usage_edges ORDER BY sequence");
+    this.#count = database.prepare("SELECT count(*) AS count FROM export_usage_edges");
+  }
+
+  get size(): number {
+    return Number(this.#count.get()?.count ?? 0);
+  }
+
+  get(id: string): ExportUsageEdge | undefined {
+    const cached = this.#cache.get(id);
+    if (cached) {
+      this.#cache.delete(id);
+      this.#cache.set(id, cached);
+      return cached;
+    }
+    const row = this.#byId.get(id);
+    if (!row) return undefined;
+    const edge = decodeExportUsageEdge(row);
+    cacheSet(this.#cache, id, edge, 128);
+    return edge;
+  }
+
+  countTarget(moduleId: string, exportPath: readonly string[]): number {
+    return Number(this.#targetCount.get(moduleId, JSON.stringify(exportPath))?.count ?? 0);
+  }
+
+  pageTarget(
+    moduleId: string,
+    exportPath: readonly string[],
+    cursor: number,
+    limit: number,
+  ): ExportUsageEdge[] {
+    return this.#targetPage.all(moduleId, JSON.stringify(exportPath), limit, cursor).map((row) => {
+      const edge = decodeExportUsageEdge(row);
+      cacheSet(this.#cache, edge.id, edge, 128);
+      return edge;
+    });
+  }
+
+  *entries(): IterableIterator<ExportUsageEdge> {
+    for (const row of this.#all.iterate()) yield decodeExportUsageEdge(row);
+  }
+}
+
+function hasTable(database: DatabaseSync, table: string): boolean {
+  return Boolean(
+    database
+      .prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(table),
+  );
+}
+
 function configureReader(database: DatabaseSync): void {
   database.exec(`
     PRAGMA query_only = ON;
@@ -540,6 +622,20 @@ function createPayloadDatabase(file: string): DatabaseSync {
       target_id TEXT NOT NULL,
       payload BLOB NOT NULL
     );
+    CREATE TABLE export_usage_edges (
+      sequence INTEGER PRIMARY KEY,
+      id TEXT NOT NULL UNIQUE,
+      origin_id TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      target_export TEXT NOT NULL,
+      payload BLOB NOT NULL
+    );
+    CREATE TABLE export_usage_targets (
+      sequence INTEGER NOT NULL,
+      target_id TEXT NOT NULL,
+      target_export TEXT NOT NULL,
+      PRIMARY KEY (sequence, target_export)
+    ) WITHOUT ROWID;
   `);
   return database;
 }
@@ -585,6 +681,12 @@ function writePayloads(
   );
   const insertReference = database.prepare(
     "INSERT INTO refs (sequence, id, origin_id, target_id, payload) VALUES (?, ?, ?, ?, ?)",
+  );
+  const insertExportUsageEdge = database.prepare(
+    "INSERT INTO export_usage_edges (sequence, id, origin_id, target_id, target_export, payload) VALUES (?, ?, ?, ?, ?, ?)",
+  );
+  const insertExportUsageTarget = database.prepare(
+    "INSERT INTO export_usage_targets (sequence, target_id, target_export) VALUES (?, ?, ?)",
   );
 
   let codeGenerationSources = 0;
@@ -640,6 +742,31 @@ function writePayloads(
       updateDigest(digest, "reference", String(referenceIndex), payload);
       referenceIndex += 1;
     }
+    let exportUsageIndex = 0;
+    const exportUsageEdges =
+      snapshot.exportUsageStore?.entries() ??
+      snapshot.exportUsageEdges?.values() ??
+      [][Symbol.iterator]();
+    for (const edge of exportUsageEdges) {
+      const payload = jsonPayload("export usage edge", edge.id, edge);
+      insertExportUsageEdge.run(
+        exportUsageIndex,
+        edge.id,
+        edge.originModuleId,
+        edge.targetModuleId,
+        JSON.stringify(edge.targetExport),
+        payload,
+      );
+      for (let length = 1; length <= (edge.targetExport?.length ?? 0); length += 1) {
+        insertExportUsageTarget.run(
+          exportUsageIndex,
+          edge.targetModuleId,
+          JSON.stringify(edge.targetExport?.slice(0, length)),
+        );
+      }
+      updateDigest(digest, "export-usage-edge", String(exportUsageIndex), payload);
+      exportUsageIndex += 1;
+    }
     database.exec("COMMIT");
   } catch (error) {
     database.exec("ROLLBACK");
@@ -649,6 +776,8 @@ function writePayloads(
     CREATE INDEX export_edges_target ON export_edges (target_id, sequence);
     CREATE INDEX refs_origin ON refs (origin_id, sequence);
     CREATE INDEX refs_target ON refs (target_id, sequence);
+    CREATE INDEX export_usage_target
+      ON export_usage_targets (target_id, target_export, sequence);
     PRAGMA optimize;
   `);
   return codeGenerationSources;
@@ -741,6 +870,10 @@ function createStoredSnapshot(
     originalSources,
     exportGraph: { modules: [], edges: [], sourceToModuleIds: {} },
     exportGraphStore: new SqliteExportGraphStore(database),
+    exportUsageEdges: [],
+    ...(hasTable(database, "export_usage_edges")
+      ? { exportUsageStore: new SqliteExportUsageStore(database) }
+      : {}),
     references: [],
     referenceStore: new SqliteReferenceStore(database),
     codeGeneration,
@@ -983,6 +1116,7 @@ export async function persistBuildSnapshot(
       counts: {
         ...snapshot.manifest.counts,
         references: snapshot.referenceStore?.size ?? snapshot.references.length,
+        exportUsageEdges: snapshot.exportUsageStore?.size ?? snapshot.exportUsageEdges?.length ?? 0,
         codeGenerationSources,
       },
     };

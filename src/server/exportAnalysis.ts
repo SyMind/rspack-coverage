@@ -14,13 +14,24 @@ import type {
 } from "../shared/types.js";
 
 const MAX_REFERENCES = 50;
+const MAX_PARSED_IMPORT_USAGES = 4_096;
 
 interface ParsedExport {
   id: string;
   exportedName: string;
   localName: string | null;
   range: SourceRange;
+  /** Full declaration or forwarding specifier that can carry an imported value. */
+  declarationRange: SourceRange | null;
   typeOnly: boolean;
+}
+
+export interface ParsedImportUsage {
+  request: string;
+  importedName: string;
+  range: SourceRange;
+  /** Exports whose declaration contains this concrete imported-binding use. */
+  importerExports: string[];
 }
 
 interface InferredCommonJsUsage {
@@ -43,6 +54,16 @@ function nodeRange(node: any): SourceRange | null {
     start: { line: node.loc.start.line, column: node.loc.start.column },
     end: { line: node.loc.end.line, column: node.loc.end.column },
   };
+}
+
+function comparePosition(left: SourceRange["start"], right: SourceRange["start"]): number {
+  return left.line - right.line || left.column - right.column;
+}
+
+function rangeContains(outer: SourceRange, inner: SourceRange): boolean {
+  return (
+    comparePosition(outer.start, inner.start) <= 0 && comparePosition(outer.end, inner.end) >= 0
+  );
 }
 
 function bindingIdentifiers(pattern: any): any[] {
@@ -248,6 +269,7 @@ function addParsed(
   localName: string | null,
   range: SourceRange | null,
   typeOnly: boolean,
+  declarationRange: SourceRange | null = range,
 ): void {
   if (!range) return;
   output.push({
@@ -255,6 +277,7 @@ function addParsed(
     exportedName,
     localName,
     range,
+    declarationRange,
     typeOnly,
   });
 }
@@ -262,8 +285,11 @@ function addParsed(
 export function parseExports(
   source: string,
   path: string,
+  options: { includeImportUsages?: boolean } = {},
 ): {
   exports: ParsedExport[];
+  importUsages: ParsedImportUsage[];
+  importUsagesTruncated: boolean;
   diagnostics: string[];
 } {
   const plugins: ParserPlugin[] = ["decorators", "importAttributes", "explicitResourceManagement"];
@@ -281,6 +307,8 @@ export function parseExports(
   } catch (error) {
     return {
       exports: [],
+      importUsages: [],
+      importUsagesTruncated: false,
       diagnostics: [
         `Could not parse exports: ${error instanceof Error ? error.message : String(error)}`,
       ],
@@ -288,6 +316,27 @@ export function parseExports(
   }
 
   const output: ParsedExport[] = [];
+  const localDeclarationRanges = new Map<string, SourceRange>();
+  const recordLocalDeclaration = (statement: any): void => {
+    const declaration =
+      statement?.type === "ExportNamedDeclaration" ? statement.declaration : statement;
+    if (!declaration) return;
+    if (declaration.type === "VariableDeclaration") {
+      for (const item of declaration.declarations ?? []) {
+        const declarationRange = nodeRange(item);
+        if (!declarationRange) continue;
+        for (const identifier of bindingIdentifiers(item.id)) {
+          localDeclarationRanges.set(identifier.name, declarationRange);
+        }
+      }
+      return;
+    }
+    const name = nodeName(declaration.id);
+    const declarationRange = nodeRange(declaration);
+    if (name && declarationRange) localDeclarationRanges.set(name, declarationRange);
+  };
+  for (const statement of ast.program.body ?? []) recordLocalDeclaration(statement);
+
   const commonJsExports = new Map<string, { item: ParsedExport; placeholder: boolean }>();
   const addCommonJsExport = (
     exportedName: string,
@@ -301,6 +350,7 @@ export function parseExports(
       exportedName,
       localName,
       range,
+      declarationRange: range,
       typeOnly: false,
     };
     const previous = commonJsExports.get(exportedName);
@@ -365,19 +415,30 @@ export function parseExports(
       const statementTypeOnly = statement.exportKind === "type";
       for (const specifier of statement.specifiers ?? []) {
         const exportedName = nodeName(specifier.exported) ?? nodeName(specifier.local) ?? "*";
+        const localName = nodeName(specifier.local);
         addParsed(
           output,
           exportedName,
-          nodeName(specifier.local),
+          localName,
           nodeRange(specifier.exported ?? specifier),
           statementTypeOnly || specifier.exportKind === "type",
+          statement.source
+            ? (nodeRange(specifier) ?? nodeRange(statement))
+            : ((localName ? localDeclarationRanges.get(localName) : null) ?? nodeRange(statement)),
         );
       }
       if (!declaration) continue;
       if (declaration.type === "VariableDeclaration") {
         for (const item of declaration.declarations ?? []) {
           for (const identifier of bindingIdentifiers(item.id)) {
-            addParsed(output, identifier.name, identifier.name, nodeRange(identifier), false);
+            addParsed(
+              output,
+              identifier.name,
+              identifier.name,
+              nodeRange(identifier),
+              false,
+              nodeRange(item),
+            );
           }
         }
       } else if (declaration.id) {
@@ -388,7 +449,14 @@ export function parseExports(
             declaration.type === "TSInterfaceDeclaration" ||
             declaration.type === "TSTypeAliasDeclaration" ||
             declaration.type === "TSDeclareFunction";
-          addParsed(output, name, name, nodeRange(declaration.id), typeOnly);
+          addParsed(
+            output,
+            name,
+            name,
+            nodeRange(declaration.id),
+            typeOnly,
+            nodeRange(declaration),
+          );
         }
       }
     } else if (statement.type === "ExportDefaultDeclaration") {
@@ -401,6 +469,7 @@ export function parseExports(
           ? nodeRange(statement.declaration.id)
           : keywordRange(source, statement, "default"),
         false,
+        nodeRange(statement.declaration) ?? nodeRange(statement),
       );
     } else if (statement.type === "ExportAllDeclaration") {
       const star = keywordRange(
@@ -408,13 +477,135 @@ export function parseExports(
         { ...statement, declaration: { start: statement.end } },
         "*",
       );
-      addParsed(output, "*", null, star ?? nodeRange(statement), false);
+      addParsed(output, "*", null, star ?? nodeRange(statement), false, nodeRange(statement));
     } else if (statement.type === "ExpressionStatement") {
       scanCommonJsExpression(statement.expression);
     }
   }
   output.push(...[...commonJsExports.values()].map(({ item }) => item));
-  return { exports: output, diagnostics };
+  if (!options.includeImportUsages) {
+    return { exports: output, importUsages: [], importUsagesTruncated: false, diagnostics };
+  }
+
+  const importUsages: ParsedImportUsage[] = [];
+  let importUsagesTruncated = false;
+  const addImportUsage = (usage: ParsedImportUsage): void => {
+    if (importUsages.length >= MAX_PARSED_IMPORT_USAGES) {
+      importUsagesTruncated = true;
+      return;
+    }
+    importUsages.push(usage);
+  };
+  const importedBindings = new Map<
+    string,
+    { request: string; importedName: string; bindingNode: any }
+  >();
+  for (const statement of ast.program.body ?? []) {
+    if (statement.type !== "ImportDeclaration" || statement.importKind === "type") continue;
+    const request = nodeName(statement.source);
+    if (!request) continue;
+    for (const specifier of statement.specifiers ?? []) {
+      if (specifier.importKind === "type" || !specifier.local?.name) continue;
+      const importedName =
+        specifier.type === "ImportDefaultSpecifier"
+          ? "default"
+          : specifier.type === "ImportNamespaceSpecifier"
+            ? "*"
+            : (nodeName(specifier.imported) ?? specifier.local.name);
+      importedBindings.set(specifier.local.name, {
+        request,
+        importedName,
+        bindingNode: specifier.local,
+      });
+    }
+  }
+
+  const carrierExports = (range: SourceRange): string[] => [
+    ...new Set(
+      output.flatMap((item) =>
+        !item.typeOnly && item.declarationRange && rangeContains(item.declarationRange, range)
+          ? [item.exportedName]
+          : [],
+      ),
+    ),
+  ];
+  for (const statement of ast.program.body ?? []) {
+    if (
+      statement.type === "ExportNamedDeclaration" &&
+      statement.source &&
+      statement.exportKind !== "type"
+    ) {
+      const request = nodeName(statement.source);
+      if (!request) continue;
+      for (const specifier of statement.specifiers ?? []) {
+        if (specifier.exportKind === "type") continue;
+        const range = nodeRange(specifier);
+        const exportedName = nodeName(specifier.exported);
+        if (!range || !exportedName) continue;
+        addImportUsage({
+          request,
+          importedName:
+            specifier.type === "ExportNamespaceSpecifier"
+              ? "*"
+              : (nodeName(specifier.local) ?? exportedName),
+          range,
+          importerExports: [exportedName],
+        });
+      }
+    } else if (statement.type === "ExportAllDeclaration" && statement.exportKind !== "type") {
+      const request = nodeName(statement.source);
+      const range = nodeRange(statement);
+      if (request && range) {
+        addImportUsage({ request, importedName: "*", range, importerExports: ["*"] });
+      }
+    }
+  }
+
+  visitAst(ast.program, null, (node, parent) => {
+    if (node.type !== "Identifier" && node.type !== "JSXIdentifier") return;
+    const binding = importedBindings.get(node.name);
+    if (!binding || node === binding.bindingNode) return;
+    if (
+      parent?.type === "ImportSpecifier" ||
+      parent?.type === "ImportDefaultSpecifier" ||
+      parent?.type === "ImportNamespaceSpecifier"
+    ) {
+      return;
+    }
+    if (parent?.type === "MemberExpression" && parent.property === node && !parent.computed) {
+      return;
+    }
+    if (parent?.type === "ObjectProperty" && parent.key === node && !parent.computed) {
+      if (!parent.shorthand) return;
+    }
+    const range = nodeRange(node);
+    if (!range) return;
+    let importedName = binding.importedName;
+    if (importedName === "*" && parent?.type === "MemberExpression" && parent.object === node) {
+      importedName = staticProperty(source, parent)?.name ?? "*";
+    }
+    addImportUsage({
+      request: binding.request,
+      importedName,
+      range,
+      importerExports: carrierExports(range),
+    });
+  });
+
+  const uniqueImportUsages = [
+    ...new Map(
+      importUsages.map((usage) => [
+        `${usage.request}\0${usage.importedName}\0${usage.range.start.line}:${usage.range.start.column}\0${usage.importerExports.join("\0")}`,
+        usage,
+      ]),
+    ).values(),
+  ];
+  return {
+    exports: output,
+    importUsages: uniqueImportUsages,
+    importUsagesTruncated,
+    diagnostics,
+  };
 }
 
 function stateForModule(

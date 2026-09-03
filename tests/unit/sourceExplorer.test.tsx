@@ -175,7 +175,7 @@ describe("SourceExplorer", () => {
     expect(screen.getByRole("button", { name: "Open source src/alpha.js" })).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Search sources"), { target: { value: "" } });
-    fireEvent.click(screen.getByRole("button", { name: "Collapse directory src" }));
+    expect(screen.getByRole("button", { name: "Expand directory src" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Open source src/heavy.js" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Expand directory src" }));
     expect(screen.getByRole("button", { name: "Open source src/heavy.js" })).toBeInTheDocument();
@@ -184,7 +184,54 @@ describe("SourceExplorer", () => {
       target: { value: "node_modules" },
     });
     expect(screen.queryByRole("button", { name: /directory src/ })).toBeNull();
-    expect(screen.getByRole("button", { name: "Collapse directory node_modules" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Expand directory node_modules" })).toBeVisible();
+  });
+
+  it("defaults the directory tree to collapsed and sorts siblings by aggregated columns", () => {
+    const { files, tree } = fixture();
+    render(
+      <SourceExplorer
+        tree={tree}
+        files={files}
+        selectedFileId={null}
+        selectedModuleId={null}
+        onSelectFile={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Directory" }));
+    const directoryPaths = () =>
+      screen
+        .getAllByRole("button", { name: /^(?:Expand|Collapse) directory / })
+        .map((row) =>
+          row.getAttribute("aria-label")?.replace(/^(?:Expand|Collapse) directory /, ""),
+        );
+
+    expect(directoryPaths()).toEqual(["src", "node_modules"]);
+    expect(screen.queryByRole("button", { name: /^Open source / })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Sort directory tree by Unexecuted, descending" }),
+    ).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Sort directory tree by Path" }));
+    expect(directoryPaths()).toEqual(["node_modules", "src"]);
+    fireEvent.click(screen.getByRole("button", { name: "Sort directory tree by Loaded" }));
+    expect(directoryPaths()).toEqual(["src", "node_modules"]);
+    fireEvent.click(screen.getByRole("button", { name: "Sort directory tree by Usage" }));
+    expect(directoryPaths()).toEqual(["node_modules", "src"]);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sort directory tree by Usage, descending" }),
+    );
+    expect(directoryPaths()).toEqual(["src", "node_modules"]);
+    fireEvent.click(screen.getByRole("button", { name: "Sort directory tree by Chunks" }));
+    expect(directoryPaths()).toEqual(["src", "node_modules"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand directory src" }));
+    expect(
+      screen
+        .getAllByRole("button", { name: /^Open source / })
+        .map((row) => row.getAttribute("aria-label")?.replace("Open source ", "")),
+    ).toEqual(["src/heavy.js", "src/alpha.js", "src/zeta.js"]);
   });
 
   it("sorts module rows from each column header and toggles direction", () => {

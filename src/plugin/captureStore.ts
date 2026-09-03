@@ -3,7 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertSnapshotRecordSize } from "../shared/snapshotLimits.js";
-import type { BuildReference, BuildReferenceStore, ReferenceDirection } from "../shared/types.js";
+import type {
+  BuildReference,
+  BuildReferenceStore,
+  ExportUsageEdge,
+  ExportUsageStore,
+  ReferenceDirection,
+} from "../shared/types.js";
 
 function payload(value: unknown): Buffer {
   if (Buffer.isBuffer(value)) return value;
@@ -20,6 +26,11 @@ export interface MutableCaptureSourceMap extends ReadonlyMap<string, string> {
 
 export interface MutableCaptureReferenceStore extends BuildReferenceStore {
   add(reference: BuildReference): boolean;
+  finish(): void;
+}
+
+export interface MutableCaptureExportUsageStore extends ExportUsageStore {
+  add(edge: ExportUsageEdge): boolean;
   finish(): void;
 }
 
@@ -238,11 +249,114 @@ class CaptureReferenceStore implements MutableCaptureReferenceStore {
   }
 }
 
+function decodeExportUsageEdge(row: Record<string, unknown>): ExportUsageEdge {
+  return JSON.parse(payload(row.payload).toString("utf8")) as ExportUsageEdge;
+}
+
+class CaptureExportUsageStore implements MutableCaptureExportUsageStore {
+  readonly #insert;
+  readonly #insertTarget;
+  readonly #byId;
+  readonly #targetCount;
+  readonly #targetPage;
+  readonly #all;
+  readonly #count;
+  #sequence = 0;
+  #started = false;
+  #finished = false;
+
+  constructor(private readonly database: DatabaseSync) {
+    this.#insert = database.prepare(
+      "INSERT OR IGNORE INTO export_usage_edges (sequence, id, origin_id, target_id, target_export, payload) VALUES (?, ?, ?, ?, ?, ?)",
+    );
+    this.#insertTarget = database.prepare(
+      "INSERT OR IGNORE INTO export_usage_targets (sequence, target_id, target_export) VALUES (?, ?, ?)",
+    );
+    this.#byId = database.prepare("SELECT payload FROM export_usage_edges WHERE id = ?");
+    this.#targetCount = database.prepare(
+      "SELECT count(*) AS count FROM export_usage_targets WHERE target_id = ? AND target_export = ?",
+    );
+    this.#targetPage = database.prepare(
+      "SELECT edge.payload FROM export_usage_targets AS target JOIN export_usage_edges AS edge USING (sequence) WHERE target.target_id = ? AND target.target_export = ? ORDER BY target.sequence LIMIT ? OFFSET ?",
+    );
+    this.#all = database.prepare("SELECT payload FROM export_usage_edges ORDER BY sequence");
+    this.#count = database.prepare("SELECT count(*) AS count FROM export_usage_edges");
+  }
+
+  get size(): number {
+    return Number(this.#count.get()?.count ?? 0);
+  }
+
+  add(edge: ExportUsageEdge): boolean {
+    if (this.#finished) throw new Error("Export usage capture is already finalized.");
+    if (!this.#started) {
+      this.database.exec("BEGIN IMMEDIATE;");
+      this.#started = true;
+    }
+    const serialized = Buffer.from(JSON.stringify(edge));
+    assertSnapshotRecordSize("export usage edge", edge.id, serialized.byteLength);
+    const result = this.#insert.run(
+      this.#sequence,
+      edge.id,
+      edge.originModuleId,
+      edge.targetModuleId,
+      JSON.stringify(edge.targetExport),
+      serialized,
+    );
+    if (Number(result.changes) === 0) return false;
+    for (let length = 1; length <= (edge.targetExport?.length ?? 0); length += 1) {
+      this.#insertTarget.run(
+        this.#sequence,
+        edge.targetModuleId,
+        JSON.stringify(edge.targetExport?.slice(0, length)),
+      );
+    }
+    this.#sequence += 1;
+    return true;
+  }
+
+  finish(): void {
+    if (this.#finished) return;
+    this.#finished = true;
+    if (this.#started) this.database.exec("COMMIT;");
+    this.database.exec(`
+      CREATE INDEX IF NOT EXISTS capture_export_usage_target
+        ON export_usage_targets (target_id, target_export, sequence);
+      PRAGMA optimize;
+    `);
+  }
+
+  get(id: string): ExportUsageEdge | undefined {
+    const row = this.#byId.get(id);
+    return row ? decodeExportUsageEdge(row) : undefined;
+  }
+
+  countTarget(moduleId: string, exportPath: readonly string[]): number {
+    return Number(this.#targetCount.get(moduleId, JSON.stringify(exportPath))?.count ?? 0);
+  }
+
+  pageTarget(
+    moduleId: string,
+    exportPath: readonly string[],
+    cursor: number,
+    limit: number,
+  ): ExportUsageEdge[] {
+    return this.#targetPage
+      .all(moduleId, JSON.stringify(exportPath), limit, cursor)
+      .map(decodeExportUsageEdge);
+  }
+
+  *entries(): IterableIterator<ExportUsageEdge> {
+    for (const row of this.#all.iterate()) yield decodeExportUsageEdge(row);
+  }
+}
+
 export class CapturePayloadStore {
   readonly directory = mkdtempSync(join(tmpdir(), "rspack-coverage-capture-"));
   readonly database = new DatabaseSync(join(this.directory, "capture.sqlite"));
   readonly sources: MutableCaptureSourceMap;
   readonly references: MutableCaptureReferenceStore;
+  readonly exportUsage: MutableCaptureExportUsageStore;
   #disposed = false;
 
   constructor() {
@@ -263,10 +377,25 @@ export class CapturePayloadStore {
         target_id TEXT NOT NULL,
         payload BLOB NOT NULL
       );
+      CREATE TABLE export_usage_edges (
+        sequence INTEGER PRIMARY KEY,
+        id TEXT NOT NULL UNIQUE,
+        origin_id TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        target_export TEXT NOT NULL,
+        payload BLOB NOT NULL
+      );
+      CREATE TABLE export_usage_targets (
+        sequence INTEGER NOT NULL,
+        target_id TEXT NOT NULL,
+        target_export TEXT NOT NULL,
+        PRIMARY KEY (sequence, target_export)
+      ) WITHOUT ROWID;
       BEGIN IMMEDIATE;
     `);
     this.sources = new CaptureSourceMap(this.database);
     this.references = new CaptureReferenceStore(this.database);
+    this.exportUsage = new CaptureExportUsageStore(this.database);
   }
 
   dispose(): void {

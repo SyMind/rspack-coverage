@@ -21,7 +21,7 @@ import { intersectRanges, mergeRanges } from "./ranges.js";
 import { buildGeneratedSpans } from "./sourceMap.js";
 import { buildLineStarts, buildUtf8Prefix, splitSourceLines, utf8BytesBetween } from "./utf.js";
 
-interface MatchedCoverage {
+export interface MatchedCoverage {
   asset: BuildAsset;
   text: string;
   ranges: ChromeCoverageRange[];
@@ -107,8 +107,8 @@ function pathMatches(entryUrl: string, asset: BuildAsset): boolean {
   return entryPath === assetPath || entryPath === plainName || entryPath.endsWith(plainName);
 }
 
-async function matchCoverage(
-  build: BuildManifest,
+export async function matchCoverage(
+  build: Pick<BuildManifest, "hash" | "assets">,
   coverage: ChromeCoverageEntry[],
 ): Promise<{
   matched: Map<string, MatchedCoverage>;

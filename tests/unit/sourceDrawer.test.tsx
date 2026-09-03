@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ModuleReferencesResponse,
   SourceExportAnalysisStatus,
@@ -15,10 +15,13 @@ import { SourceDrawer } from "../../src/ui/components/SourceDrawer.js";
 
 const api = vi.hoisted(() => ({
   loadCoverageSource: vi.fn(),
+  loadExportDeclaration: vi.fn(),
   loadExportImporterChain: vi.fn(),
+  loadGeneratedSource: vi.fn(),
   loadReferenceSnippet: vi.fn(),
   loadReferences: vi.fn(),
   loadSourceExportStatus: vi.fn(),
+  openInEditor: vi.fn(),
 }));
 
 vi.mock("../../src/ui/lib/api.js", () => api);
@@ -39,10 +42,17 @@ vi.mock("@tanstack/react-virtual", () => ({
 afterEach(() => {
   cleanup();
   api.loadCoverageSource.mockReset();
+  api.loadExportDeclaration.mockReset();
   api.loadExportImporterChain.mockReset();
+  api.loadGeneratedSource.mockReset();
   api.loadReferenceSnippet.mockReset();
   api.loadReferences.mockReset();
   api.loadSourceExportStatus.mockReset();
+  api.openInEditor.mockReset();
+});
+
+beforeEach(() => {
+  api.loadExportDeclaration.mockRejectedValue(new Error("Declaration fixture unavailable"));
 });
 
 const file: SourceFileSummary = {
@@ -299,6 +309,7 @@ describe("SourceDrawer export usage", () => {
       truncated: false,
     };
     const onSelectEdge = vi.fn();
+    const onSelectCarrier = vi.fn();
     const upstream = {
       ...consumer,
       id: "upstream",
@@ -324,6 +335,7 @@ describe("SourceDrawer export usage", () => {
         importerChain={{
           module: target,
           exportedName: "default",
+          binding: { exportedName: "default", localName: "withField" },
           truncated: false,
           maxDepth: 12,
           steps: [
@@ -332,7 +344,9 @@ describe("SourceDrawer export usage", () => {
               parentId: null,
               depth: 1,
               importedExport: "default",
+              importedBinding: { exportedName: "default", localName: "withField" },
               importerExports: ["createWebSuite"],
+              importerBindings: [{ exportedName: "createWebSuite", localName: "createWebSuite" }],
               relationPrecision: "exact",
               edge: references.edges[0] as NonNullable<(typeof references.edges)[number]>,
             },
@@ -341,7 +355,12 @@ describe("SourceDrawer export usage", () => {
               parentId: "chain-direct",
               depth: 2,
               importedExport: "createWebSuite",
+              importedBinding: {
+                exportedName: "createWebSuite",
+                localName: "createWebSuite",
+              },
               importerExports: [],
+              importerBindings: [],
               relationPrecision: "unavailable",
               edge: upstreamEdge,
             },
@@ -354,24 +373,41 @@ describe("SourceDrawer export usage", () => {
         snippetFlashKey={0}
         onDirectionChange={vi.fn()}
         onSelectEdge={onSelectEdge}
+        onSelectCarrier={onSelectCarrier}
         onLoadMore={vi.fn()}
         onModuleChange={vi.fn()}
         onCloseSnippet={vi.fn()}
       />,
     );
 
+    fireEvent.click(screen.getByRole("button", { name: "Chain" }));
     const importerButtons = screen.getAllByRole("button", {
       name: "Open importer usage src/consumer.ts",
     });
     fireEvent.click(importerButtons[0] as HTMLElement);
     fireEvent.click(importerButtons[1] as HTMLElement);
     expect(screen.getByLabelText("Transitive export importer chain")).toHaveTextContent(
-      "via export createWebSuite · uses default",
+      "uses withField (default) → continues as createWebSuite",
     );
+    fireEvent.click(screen.getByText("Carried by 1 symbol"));
+    fireEvent.click(screen.getByRole("button", { name: /createWebSuite/ }));
+    expect(onSelectCarrier).toHaveBeenCalledWith("consumer", "createWebSuite");
     fireEvent.click(
       screen.getByRole("button", { name: "Open importer chain usage /project/src/index.ts" }),
     );
-    expect(onSelectEdge.mock.calls).toEqual([["edge-21"], ["edge-34"], ["upstream-edge"]]);
+    fireEvent.click(screen.getByRole("button", { name: "Graph" }));
+    expect(screen.getByRole("img", { name: "Complete importer export chain" })).toBeVisible();
+    expect(document.querySelectorAll(".reference-graph.is-chain .is-chain-step")).toHaveLength(2);
+    expect(screen.getByLabelText("Show usage ./src/index.ts")).toBeVisible();
+    fireEvent.click(screen.getByLabelText("Show usage ./src/index.ts"));
+    fireEvent.click(screen.getByRole("button", { name: "Module Graph" }));
+    expect(screen.getByRole("button", { name: "Importers: 2 edges" })).toHaveClass("active");
+    expect(onSelectEdge.mock.calls).toEqual([
+      ["edge-21"],
+      ["edge-34"],
+      ["upstream-edge"],
+      ["upstream-edge"],
+    ]);
   });
 
   it("keeps source available and opens export chains with their module graphs", async () => {
@@ -558,7 +594,24 @@ describe("SourceDrawer export usage", () => {
       return Promise.resolve({
         module: graph.module,
         exportedName,
-        steps: [],
+        binding: { exportedName, localName: exportedName },
+        steps:
+          moduleId === "target"
+            ? [
+                {
+                  id: `chain:${exportedName}`,
+                  parentId: null,
+                  depth: 1,
+                  importedExport: exportedName,
+                  importedBinding: { exportedName, localName: exportedName },
+                  importerExports: [],
+                  importerBindings: [],
+                  relationPrecision: "unavailable" as const,
+                  edge: originalEdge,
+                },
+              ]
+            : [],
+        precision: "source-inferred" as const,
         truncated: false,
         maxDepth: 12,
       });
@@ -602,6 +655,11 @@ describe("SourceDrawer export usage", () => {
         end: { line: 2, column: 6 },
       },
     });
+    api.openInEditor.mockResolvedValue({
+      opened: true,
+      method: "code",
+      url: "vscode://file/project/src/exports.ts:1:1",
+    });
     const onClose = vi.fn();
     render(<SourceDrawer buildHash="build" file={file} moduleId="target" onClose={onClose} />);
 
@@ -623,6 +681,13 @@ describe("SourceDrawer export usage", () => {
     const drawerHeader = document.querySelector(".coverage-source-drawer > header");
     expect(drawerHeader).toHaveTextContent("src/exports.ts");
     expect(drawerHeader).not.toHaveTextContent("Original source");
+    fireEvent.click(screen.getByRole("button", { name: "Open src/exports.ts in VS Code" }));
+    expect(api.openInEditor).toHaveBeenCalledWith({
+      moduleId: "target",
+      sourceId: "src/exports.ts",
+      line: 1,
+      column: 1,
+    });
     expect(document.querySelector(".source-columns")).toHaveTextContent("LineSource");
     expect(document.querySelector(".source-line")?.children).toHaveLength(2);
     expect(document.querySelector(".source-line .coverage-executed")).toHaveTextContent(
@@ -632,6 +697,13 @@ describe("SourceDrawer export usage", () => {
       "const cold = 'unused';",
     );
     expect(document.querySelector(".source-line .syntax-keyword")).toHaveTextContent("export");
+    const sourceScroll = document.querySelector(".source-scroll");
+    const wrapLines = screen.getByRole("button", { name: "Wrap lines" });
+    expect(sourceScroll).not.toHaveClass("is-wrapped");
+    expect(wrapLines).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(wrapLines);
+    expect(sourceScroll).toHaveClass("is-wrapped");
+    expect(wrapLines).toHaveAttribute("aria-pressed", "true");
     const sourceSearch = screen.getByRole("searchbox", { name: "Search source code" });
     fireEvent.change(sourceSearch, { target: { value: "unused" } });
     expect(document.querySelector(".code-search-status")).toHaveTextContent("1 / 1");
@@ -668,21 +740,20 @@ describe("SourceDrawer export usage", () => {
     expect(screen.getByLabelText("Export importer chain")).toHaveTextContent("ACTIONS");
     expect(screen.getByLabelText("Export importer chain")).toHaveTextContent("Exact");
     expect(screen.getByLabelText("Export importer chain")).toHaveTextContent("Direct refs1");
+    expect(screen.getByRole("button", { name: "Export Usage" })).toHaveClass("active");
+    expect(screen.getByText("ACTIONS", { selector: ".graph-export-center" })).toBeVisible();
+    expect(await screen.findAllByLabelText("Show usage ./src/consumer.ts")).toHaveLength(1);
+    expect(document.querySelectorAll(".graph-node.is-export-edge")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Chain" }));
     expect(
       screen.getByRole("button", { name: "Open importer usage src/consumer.ts" }),
     ).toBeVisible();
-    expect(screen.getByText("Corresponding module graph")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Graph" }));
     expect(document.querySelector(".source-code-panel")).toContainElement(
       document.querySelector(".export-dependency-graph"),
     );
     expect(api.loadReferences).toHaveBeenCalledWith("target", "in");
     expect(api.loadExportImporterChain).toHaveBeenCalledWith("target", "ACTIONS");
-    expect(screen.getByText("ACTIONS", { selector: ".graph-export-center" })).toBeVisible();
-    expect(await screen.findAllByLabelText("Show usage ./src/consumer.ts")).toHaveLength(1);
-    expect(document.querySelectorAll(".graph-node.is-export-edge")).toHaveLength(1);
-    expect(screen.getByRole("button", { name: "Importers: 1 edge" })).toHaveClass("active");
-    expect(screen.getByRole("button", { name: "All: 3 edges" })).toBeVisible();
-    expect(screen.getByRole("button", { name: "Dependencies: 0 edges" })).toBeVisible();
 
     const usageNodes = await screen.findAllByLabelText("Show usage ./src/consumer.ts");
     const usageNode = usageNodes[0];
@@ -699,7 +770,23 @@ describe("SourceDrawer export usage", () => {
     expect(document.querySelector(".reference-coverage-detail .usage-highlight")).toHaveTextContent(
       "unused",
     );
+    const referenceWorkspace = document.querySelector(".reference-workspace");
+    expect(referenceWorkspace).toHaveClass("has-snippet");
+    expect(referenceWorkspace?.firstElementChild).toHaveClass("reference-navigation");
+    expect(referenceWorkspace?.lastElementChild).toHaveClass(
+      "reference-snippet",
+      "reference-coverage-detail",
+    );
 
+    fireEvent.click(screen.getByRole("button", { name: "Close usage location" }));
+    expect(referenceWorkspace).not.toHaveClass("has-snippet");
+    expect(document.querySelector(".reference-snippet")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Module Graph" }));
+    expect(screen.getByText("Corresponding module graph")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Importers: 3 edges" })).toHaveClass("active");
+    expect(screen.getByRole("button", { name: "All: 3 edges" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Dependencies: 0 edges" })).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "All: 3 edges" }));
     expect(await screen.findAllByLabelText("Show usage ./src/consumer.ts")).toHaveLength(3);
     expect(api.loadReferences).toHaveBeenCalledWith("target", "both");
@@ -713,13 +800,16 @@ describe("SourceDrawer export usage", () => {
     expect(new URL(location.href).searchParams.has("module")).toBe(false);
 
     fireEvent.click(screen.getByRole("button", { name: "EVENTS" }));
-    expect(await screen.findByText("No importer uses this export")).toBeVisible();
+    fireEvent.click(await screen.findByRole("button", { name: "Chain" }));
+    expect(await screen.findByText(/No importer uses this export in the selected/)).toBeVisible();
     expect(screen.getByLabelText("Export importer chain")).toHaveTextContent(
       "No importer uses this export",
     );
+    fireEvent.click(screen.getByRole("button", { name: "Graph" }));
     expect(screen.getByText("EVENTS", { selector: ".graph-export-center" })).toBeVisible();
     expect(api.loadReferences).toHaveBeenCalledWith("unused-target", "in");
 
+    fireEvent.click(screen.getByRole("button", { name: "Module Graph" }));
     const graphPicker = screen.getByLabelText("Module graph");
     expect(graphPicker).toHaveTextContent("Chunk graph async");
     expect(graphPicker).toHaveTextContent("Unchunked graph");
@@ -747,5 +837,64 @@ describe("SourceDrawer export usage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Dependencies: 1 edge" }));
     expect(await screen.findByLabelText("Show usage ./src/dependency.ts")).toBeVisible();
     expect(api.loadReferences).toHaveBeenCalledWith("unused-target-source", "out");
+  });
+
+  it("falls back to paged generated output for an unmapped runtime file", async () => {
+    const runtimeFile: SourceFileSummary = {
+      ...file,
+      id: "[rspack runtime / unmapped]/static/js/main.js",
+      path: "[rspack runtime / unmapped]/static/js/main.js",
+      displayPath: "[rspack runtime / unmapped]/static/js/main.js",
+      category: "runtime",
+      moduleIds: [],
+      metrics: {
+        ...file.metrics,
+        mappedBytes: 0,
+        unmappedBytes: 20,
+      },
+    };
+    api.loadGeneratedSource.mockImplementation(
+      (_buildHash: string, sourceId: string, offset: number) =>
+        Promise.resolve({
+          view: "output",
+          sourceId,
+          filename: "static/js/main.js",
+          language: "javascript",
+          content: "runtime();mapped();",
+          spans: [{ start: 0, end: 10, status: "executed" }],
+          offset,
+          endOffset: offset + 19,
+          startLine: 1,
+          totalCharacters: 300_000,
+          hasPrevious: offset > 0,
+          hasNext: offset + 19 < 300_000,
+          provenance: "final generated asset / unmapped fallback",
+          gap: "Only unmapped bytes are colored; mapped source bytes remain neutral context.",
+        }),
+    );
+
+    render(<SourceDrawer buildHash="build" file={runtimeFile} moduleId={null} onClose={vi.fn()} />);
+
+    expect(await screen.findByText("Generated output fallback")).toBeVisible();
+    expect(screen.queryByText("Export analysis")).toBeNull();
+    expect(api.loadCoverageSource).not.toHaveBeenCalled();
+    expect(api.loadSourceExportStatus).not.toHaveBeenCalled();
+    const generated = await screen.findByLabelText("output code coverage");
+    expect(generated.querySelector(".coverage-executed")).toHaveTextContent("runtime();");
+    expect(generated.querySelector(".coverage-neutral")).toHaveTextContent("mapped();");
+    expect(screen.getByText(/Only unmapped bytes are colored/)).toBeVisible();
+    expect(screen.getByText("static/js/main.js")).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Next generated code page" }));
+    await waitFor(() => {
+      expect(api.loadGeneratedSource).toHaveBeenLastCalledWith(
+        "build",
+        runtimeFile.id,
+        19,
+        240_000,
+        expect.anything(),
+        0,
+      );
+    });
   });
 });

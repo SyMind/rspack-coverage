@@ -1204,6 +1204,33 @@ input:focus {
   overflow: hidden;
   text-overflow: clip;
 }
+.source-scroll:not(.is-wrapped) .source-line {
+  width: max-content;
+  min-width: 100%;
+  grid-template-columns: 52px minmax(max-content, 1fr);
+}
+.source-scroll:not(.is-wrapped) .source-line code {
+  overflow: visible;
+}
+.source-scroll:not(.is-wrapped) .source-line .line-number {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+}
+.source-scroll.is-wrapped {
+  overflow-x: hidden;
+}
+.source-scroll.is-wrapped .source-line {
+  height: auto;
+}
+.source-scroll.is-wrapped .source-line code {
+  min-width: 0;
+  padding-block: 2px;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  line-height: 20px;
+  white-space: pre-wrap;
+}
 .export-marker {
   position: relative;
   display: inline;
@@ -1914,6 +1941,26 @@ input {
   overflow: auto;
   background: #0c131d;
 }
+.reference-workspace {
+  display: contents;
+}
+.reference-workbench.has-snippet {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.reference-workspace.has-snippet {
+  min-height: 0;
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(360px, 41%) minmax(0, 1fr);
+  overflow: hidden;
+}
+.reference-workspace.has-snippet .reference-navigation {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
 .reference-toolbar {
   display: flex;
   align-items: center;
@@ -1999,6 +2046,20 @@ input {
   width: 100%;
   max-height: 330px;
 }
+.reference-graph-wrap.is-chain {
+  place-items: start;
+  max-height: min(46vh, 460px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.reference-graph.is-chain {
+  width: auto;
+  min-width: 100%;
+  max-width: none;
+  max-height: none;
+  display: block;
+}
 .graph-center {
   fill: #173128;
   stroke: #36c98e;
@@ -2014,6 +2075,7 @@ input {
   stroke: #63dba8;
 }
 .graph-edge {
+  fill: none;
   stroke: #3b4b61;
   stroke-width: 1.2;
 }
@@ -2029,6 +2091,14 @@ input {
   font-weight: 700;
 }
 .graph-export {
+  fill: #718298;
+  font:
+    8px "SFMono-Regular",
+    Consolas,
+    monospace;
+  pointer-events: none;
+}
+.graph-chain-summary {
   fill: #718298;
   font:
     8px "SFMono-Regular",
@@ -2193,6 +2263,17 @@ input {
   padding: 16px;
   color: #d7a86a;
   font-size: 10px;
+}
+.reference-workspace.has-snippet .reference-snippet {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.reference-workspace.has-snippet .reference-coverage-scroll {
+  min-height: 0;
+  flex: 1;
+  max-height: none;
 }
 .usage-highlight {
   color: #fff;
@@ -2401,5 +2482,19 @@ input {
   }
   .reference-workbench {
     min-height: 620px;
+  }
+  .reference-workbench.has-snippet {
+    display: block;
+    overflow: auto;
+  }
+  .reference-workspace.has-snippet {
+    display: block;
+    overflow: visible;
+  }
+  .reference-workspace.has-snippet .reference-navigation {
+    overflow: visible;
+  }
+  .reference-workspace.has-snippet .reference-snippet {
+    min-height: 65vh;
   }
 }

@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -8,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import type { ResolvedRspackCoveragePluginOptions } from "../plugin/types.js";
 import { sourceLineCoverageStatus, sourceLinesCoverageSpans } from "../shared/codeCoverage.js";
 import { MAX_PORTABLE_SNAPSHOT_BYTES } from "../shared/snapshotLimits.js";
-import type { BuildSnapshot } from "../shared/types.js";
+import type { BuildSnapshot, ReferenceSnippetResponse } from "../shared/types.js";
 import {
   CoverageAnalysisService,
   type CoverageAnalysisView,
@@ -65,6 +66,44 @@ function safeDecode(value: string): string {
   } catch {
     return value;
   }
+}
+
+async function requestJson(request: IncomingMessage, maximumBytes = 64 * 1024): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.byteLength;
+    if (bytes > maximumBytes) {
+      throw new TypeError("Request body exceeds the local editor action limit");
+    }
+    chunks.push(buffer);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+}
+
+function vscodeUrl(target: { path: string; line: number; column: number }): string {
+  const normalized = target.path.replace(/\\/g, "/");
+  const encoded = normalized
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+  return `vscode://file${encoded.startsWith("/") ? encoded : `/${encoded}`}:${target.line}:${target.column}`;
+}
+
+function openEditor(target: { path: string; line: number; column: number }) {
+  const editor = process.env.RSPACK_COVERAGE_EDITOR?.trim() || "code";
+  const result = spawnSync(editor, ["--goto", `${target.path}:${target.line}:${target.column}`], {
+    stdio: "ignore",
+    timeout: 5_000,
+  });
+  const url = vscodeUrl(target);
+  if (result.status === 0) return { opened: true, method: editor, url };
+  if (process.platform === "darwin") {
+    const fallback = spawnSync("open", [url], { stdio: "ignore", timeout: 5_000 });
+    return { opened: fallback.status === 0, method: "vscode-url", url };
+  }
+  return { opened: false, method: null, url };
 }
 
 export class AnalysisServer {
@@ -167,6 +206,38 @@ export class AnalysisServer {
       this.#server.closeIdleConnections();
     });
     this.#port = null;
+  }
+
+  async #hydrateSnippetCoverage(
+    snippet: ReferenceSnippetResponse | null,
+  ): Promise<ReferenceSnippetResponse | null> {
+    const snapshot = this.#snapshot;
+    if (!snapshot || !snippet?.available || !snippet.code) return snippet;
+    const fileId = snippet.code.sourceId ?? snippet.code.filename;
+    const focusLine = snippet.location?.start.line;
+    try {
+      const detail = await this.#coverageAnalysis.source(
+        snapshot.manifest.hash,
+        fileId,
+        snippet.edge.originId,
+        focusLine,
+      );
+      snippet.code.sourceId = detail.id;
+      snippet.code.filename = detail.id;
+      snippet.code.spans = sourceLinesCoverageSpans(snippet.code.content, detail.lines);
+      if (snippet.highlight && focusLine) {
+        const line = detail.lines[focusLine - 1];
+        if (line) snippet.highlight.coverageStatus = sourceLineCoverageStatus(line);
+      }
+    } catch (error) {
+      if (
+        !(error instanceof CoverageReportNotReadyError) &&
+        !(error instanceof MissingCoverageSourceError)
+      ) {
+        throw error;
+      }
+    }
+    return snippet;
   }
 
   async #snapshotDataDirectory(): Promise<string> {
@@ -349,6 +420,56 @@ export class AnalysisServer {
       sendJson(response, 200, source);
       return;
     }
+    if (pathname === `${ANALYSIS_PREFIX}api/coverage-analysis/generated-source`) {
+      if (request.method !== "GET") {
+        response.writeHead(405, { Allow: "GET" });
+        response.end();
+        return;
+      }
+      const buildHash = url.searchParams.get("buildHash");
+      const fileId = url.searchParams.get("fileId");
+      if (!buildHash || !fileId) {
+        sendJson(response, 400, { error: "buildHash and fileId are required" });
+        return;
+      }
+      const source = await this.#coverageAnalysis.generatedSource(
+        buildHash,
+        fileId,
+        Number(url.searchParams.get("offset") ?? 0),
+        Number(url.searchParams.get("limit") ?? 240_000),
+      );
+      sendJson(response, 200, source);
+      return;
+    }
+    if (pathname === `${ANALYSIS_PREFIX}api/open-in-editor`) {
+      if (request.method !== "POST") {
+        response.writeHead(405, { Allow: "POST" });
+        response.end();
+        return;
+      }
+      if (!this.#investigation) {
+        sendJson(response, 409, { error: "Build data is not ready for source navigation" });
+        return;
+      }
+      const body = (await requestJson(request)) as {
+        moduleId?: unknown;
+        sourceId?: unknown;
+        line?: unknown;
+        column?: unknown;
+      };
+      const target = this.#investigation.editorTarget(
+        typeof body.moduleId === "string" ? body.moduleId : "",
+        typeof body.sourceId === "string" ? body.sourceId : null,
+        Number(body.line ?? 1),
+        Number(body.column ?? 1),
+      );
+      if (!target) {
+        sendJson(response, 400, { error: "The selected module has no local absolute source path" });
+        return;
+      }
+      sendJson(response, 200, { target, ...openEditor(target) });
+      return;
+    }
     if (request.method !== "GET" && request.method !== "HEAD") {
       response.writeHead(405, { Allow: "GET, HEAD" });
       response.end();
@@ -386,7 +507,7 @@ export class AnalysisServer {
       return;
     }
     const moduleMatch = pathname.match(
-      /\/api\/modules\/([^/]+)(?:\/(code|references|export-chain|context))?$/,
+      /\/api\/modules\/([^/]+)(?:\/(code|references|export-chain|export-declaration|context))?$/,
     );
     if (moduleMatch) {
       const moduleId = moduleMatch[1] ?? "";
@@ -433,43 +554,34 @@ export class AnalysisServer {
         sendJson(response, chain ? 200 : 404, chain ?? { error: "Unknown module or export" });
         return;
       }
+      if (action === "export-declaration") {
+        const exportedName = url.searchParams.get("export")?.trim() ?? "";
+        if (!exportedName) {
+          sendJson(response, 400, { error: "export is required" });
+          return;
+        }
+        const declaration = await this.#hydrateSnippetCoverage(
+          this.#investigation?.exportDeclaration(moduleId, exportedName) ?? null,
+        );
+        sendJson(
+          response,
+          declaration ? 200 : 404,
+          declaration ?? { error: "Export declaration is unavailable" },
+        );
+        return;
+      }
       const context = this.#investigation?.aiContext(moduleId) ?? null;
       sendJson(response, context ? 200 : 404, context ?? { error: "Unknown module" });
       return;
     }
     const snippetMatch = pathname.match(/\/api\/references\/([^/]+)\/snippet$/);
     if (snippetMatch) {
-      const snippet =
+      const snippet = await this.#hydrateSnippetCoverage(
         this.#investigation?.snippet(
           snippetMatch[1] ?? "",
           Number(url.searchParams.get("context") ?? 3),
-        ) ?? null;
-      if (snippet?.available && snippet.code) {
-        const fileId = snippet.code.sourceId ?? snippet.code.filename;
-        const usageLine = snippet.location?.start.line;
-        try {
-          const detail = await this.#coverageAnalysis.source(
-            snapshot.manifest.hash,
-            fileId,
-            snippet.edge.originId,
-            usageLine,
-          );
-          snippet.code.sourceId = detail.id;
-          snippet.code.filename = detail.id;
-          snippet.code.spans = sourceLinesCoverageSpans(snippet.code.content, detail.lines);
-          if (snippet.highlight && usageLine) {
-            const line = detail.lines[usageLine - 1];
-            if (line) snippet.highlight.coverageStatus = sourceLineCoverageStatus(line);
-          }
-        } catch (error) {
-          if (
-            !(error instanceof CoverageReportNotReadyError) &&
-            !(error instanceof MissingCoverageSourceError)
-          ) {
-            throw error;
-          }
-        }
-      }
+        ) ?? null,
+      );
       sendJson(response, snippet ? 200 : 404, snippet ?? { error: "Unknown reference" });
       return;
     }

@@ -8,19 +8,33 @@ import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { materializeSourceFileDetail, type StoredSourceFileDetail } from "../analyzer/analyze.js";
+import { intersectRanges } from "../analyzer/ranges.js";
+import { buildGeneratedSpans } from "../analyzer/sourceMap.js";
 import { MAX_COVERAGE_ANALYSIS_BYTES } from "../shared/snapshotLimits.js";
 import type {
   BuildSnapshot,
+  ChromeCoverageRange,
+  CodeCoverageSpan,
+  CodeViewResponse,
   CoverageAnalysisStatus,
   CoverageImportSummary,
+  RawSourceMapPayload,
   SourceFileDetail,
 } from "../shared/types.js";
 import {
   type CoverageAnalysisWorkerData,
   type CoverageFileDetailIndex,
+  type CoverageRangeIndex,
+  type CoverageRangeIndexWorkerData,
+  loadCoverageRangeIndex,
   runCoverageAnalysisJob,
   type StagedCoverageSnapshot,
 } from "./coverageAnalysisRunner.js";
+
+interface CoverageEvidence {
+  available: boolean;
+  ranges: Map<string, ChromeCoverageRange[]>;
+}
 
 interface StagedBuild {
   hash: string;
@@ -29,6 +43,10 @@ interface StagedBuild {
   directory: Promise<string>;
   recordingFile: string | null;
   persistent: boolean;
+  assets: ReadonlyMap<string, Buffer>;
+  maps: ReadonlyMap<string, RawSourceMapPayload>;
+  manifest: Pick<BuildSnapshot["manifest"], "hash" | "assets">;
+  coverageEvidence: Promise<CoverageEvidence> | undefined;
 }
 
 interface AnalysisJob {
@@ -49,6 +67,10 @@ type WorkerMessage =
   | { type: "complete"; id: string }
   | { type: "error"; id: string; message: string };
 
+type CoverageRangeWorkerMessage =
+  | { type: "coverage-range-index-complete"; ranges: CoverageRangeIndex }
+  | { type: "error"; id: string; message: string };
+
 export type CoverageAnalysisView =
   | CoverageAnalysisStatus
   | { status: "complete-file"; reportFile: string };
@@ -60,6 +82,9 @@ export class CoverageReportNotReadyError extends Error {}
 export class MissingCoverageSourceError extends Error {}
 
 const MAX_SOURCE_DETAIL_ALIASES = 16;
+const UNMAPPED_SOURCE_PREFIX = "[rspack runtime / unmapped]/";
+const DEFAULT_GENERATED_SOURCE_LIMIT = 240_000;
+const MAX_GENERATED_SOURCE_LIMIT = 500_000;
 
 function sourceIdsMayAlias(left: string, right: string): boolean {
   const normalizedLeft = left.replace(/\\/g, "/").replace(/^\/+/, "");
@@ -109,6 +134,85 @@ function precision(value: string | null): CoverageImportSummary["precision"] {
 
 export function parseCoveragePrecision(value: string | null): CoverageImportSummary["precision"] {
   return precision(value);
+}
+
+function mergeCodeSpans(spans: CodeCoverageSpan[]): CodeCoverageSpan[] {
+  const sorted = spans
+    .filter((span) => span.end > span.start)
+    .sort((left, right) => left.start - right.start || left.end - right.end);
+  const merged: CodeCoverageSpan[] = [];
+  for (const span of sorted) {
+    const previous = merged.at(-1);
+    if (previous && span.start <= previous.end && previous.status === span.status) {
+      previous.end = Math.max(previous.end, span.end);
+    } else if (previous && span.start < previous.end) {
+      if (span.end > previous.end) merged.push({ ...span, start: previous.end });
+    } else {
+      merged.push({ ...span });
+    }
+  }
+  return merged;
+}
+
+function coverageParts(
+  start: number,
+  end: number,
+  ranges: ChromeCoverageRange[] | undefined,
+  recordingAvailable: boolean,
+): CodeCoverageSpan[] {
+  if (!recordingAvailable) return [{ start, end, status: "unknown" }];
+  if (!ranges) return [{ start, end, status: "unloaded" }];
+  const executed = intersectRanges(ranges, start, end);
+  const result: CodeCoverageSpan[] = [];
+  let cursor = start;
+  for (const range of executed) {
+    if (range.start > cursor) {
+      result.push({ start: cursor, end: range.start, status: "unexecuted" });
+    }
+    if (range.end > range.start) {
+      result.push({ start: range.start, end: range.end, status: "executed" });
+    }
+    cursor = Math.max(cursor, range.end);
+  }
+  if (cursor < end) result.push({ start: cursor, end, status: "unexecuted" });
+  return result;
+}
+
+function sliceGeneratedCode(
+  response: Omit<
+    CodeViewResponse,
+    "offset" | "endOffset" | "startLine" | "totalCharacters" | "hasPrevious" | "hasNext"
+  >,
+  requestedOffset: number,
+  requestedLimit: number,
+): CodeViewResponse {
+  const totalCharacters = response.content.length;
+  const offset = Math.max(0, Math.min(totalCharacters, Math.trunc(requestedOffset || 0)));
+  const limit = Math.max(
+    1,
+    Math.min(
+      MAX_GENERATED_SOURCE_LIMIT,
+      Math.trunc(requestedLimit || DEFAULT_GENERATED_SOURCE_LIMIT),
+    ),
+  );
+  const endOffset = Math.min(totalCharacters, offset + limit);
+  return {
+    ...response,
+    content: response.content.slice(offset, endOffset),
+    spans: response.spans
+      .filter((span) => span.end > offset && span.start < endOffset)
+      .map((span) => ({
+        ...span,
+        start: Math.max(0, span.start - offset),
+        end: Math.min(endOffset, span.end) - offset,
+      })),
+    offset,
+    endOffset,
+    startLine: response.content.slice(0, offset).split("\n").length,
+    totalCharacters,
+    hasPrevious: offset > 0,
+    hasNext: endOffset < totalCharacters,
+  };
 }
 
 async function stageSnapshot(snapshot: BuildSnapshot): Promise<string> {
@@ -184,6 +288,7 @@ export class CoverageAnalysisService {
   #build: StagedBuild | null = null;
   #job: AnalysisJob | null = null;
   #worker: Worker | null = null;
+  #rangeWorker: Worker | null = null;
 
   update(snapshot: BuildSnapshot, force = false): void {
     const identity =
@@ -193,6 +298,7 @@ export class CoverageAnalysisService {
     const previous = this.#build;
     this.#generation += 1;
     this.#cancelWorker();
+    this.#cancelRangeWorker();
     this.#job = null;
     const persistentDirectory = snapshot.storage?.directory ?? null;
     const persistent = persistentDirectory !== null;
@@ -208,6 +314,10 @@ export class CoverageAnalysisService {
       directory,
       recordingFile: recordingFile && existsSync(recordingFile) ? recordingFile : null,
       persistent,
+      assets: snapshot.assets,
+      maps: snapshot.maps,
+      manifest: { hash: snapshot.manifest.hash, assets: snapshot.manifest.assets },
+      coverageEvidence: undefined,
     };
     if (persistentDirectory) {
       const reportFile = join(persistentDirectory, "report.json");
@@ -236,6 +346,9 @@ export class CoverageAnalysisService {
     const worker = this.#worker;
     this.#worker = null;
     if (worker) await worker.terminate();
+    const rangeWorker = this.#rangeWorker;
+    this.#rangeWorker = null;
+    if (rangeWorker) await rangeWorker.terminate();
     const build = this.#build;
     this.#build = null;
     if (build && !build.persistent) {
@@ -263,6 +376,8 @@ export class CoverageAnalysisService {
     await rm(recordingFile, { force: true });
     await rename(temporaryFile, recordingFile);
     build.recordingFile = recordingFile;
+    build.coverageEvidence = undefined;
+    this.#cancelRangeWorker();
     return this.#start(build, analysisPrecision);
   }
 
@@ -369,6 +484,79 @@ export class CoverageAnalysisService {
       if (score === 5) break;
     }
     return materializeSourceFileDetail(selected, moduleId);
+  }
+
+  async generatedSource(
+    buildHash: string,
+    fileId: string,
+    offset = 0,
+    limit = DEFAULT_GENERATED_SOURCE_LIMIT,
+  ): Promise<CodeViewResponse> {
+    const build = this.#requireBuild(buildHash);
+    const job = this.#job;
+    if (!job || job.generation !== build.generation || job.status.status !== "complete") {
+      throw new CoverageReportNotReadyError("Coverage analysis has not completed yet.");
+    }
+    if (!fileId.startsWith(UNMAPPED_SOURCE_PREFIX)) {
+      throw new MissingCoverageSourceError(
+        `Generated output fallback is unavailable for ${fileId}.`,
+      );
+    }
+    const assetName = fileId.slice(UNMAPPED_SOURCE_PREFIX.length);
+    const matchingAssets = build.manifest.assets.filter((asset) => asset.name === assetName);
+    if (matchingAssets.length !== 1) {
+      throw new MissingCoverageSourceError(
+        matchingAssets.length === 0
+          ? `Generated asset not found for ${fileId}.`
+          : `Generated asset is ambiguous for ${fileId}.`,
+      );
+    }
+    const asset = matchingAssets[0];
+    if (!asset) throw new MissingCoverageSourceError(`Generated asset not found for ${fileId}.`);
+    const generated = build.assets.get(asset.id)?.toString("utf8");
+    if (generated === undefined) {
+      throw new MissingCoverageSourceError(`Generated content is unavailable for ${asset.name}.`);
+    }
+    const evidence = await this.#coverageEvidence(build);
+    if (build !== this.#build || build.generation !== this.#generation) {
+      throw new CoverageBuildChangedError("The build changed while generated output was loading.");
+    }
+    const sourceMap = build.maps.get(asset.id);
+    const generatedSpans = sourceMap
+      ? buildGeneratedSpans(generated, sourceMap)
+      : [
+          {
+            start: 0,
+            end: generated.length,
+            source: null,
+            sourceContent: null,
+            originalLine: null,
+            originalColumn: null,
+            originalEndColumn: null,
+          },
+        ];
+    const runtimeSpans = generatedSpans.flatMap((span) =>
+      span.source === null
+        ? coverageParts(span.start, span.end, evidence.ranges.get(asset.id), evidence.available)
+        : [],
+    );
+    const coverageGap = evidence.available
+      ? "Only generated bytes without stable source-map attribution are colored. Mapped source bytes remain neutral context; the metrics above describe only this unmapped bucket."
+      : "The original Coverage recording is unavailable. Unmapped generated bytes are marked unknown, while mapped source bytes remain neutral context.";
+    return sliceGeneratedCode(
+      {
+        view: "output",
+        sourceId: fileId,
+        filename: asset.name,
+        language: "javascript",
+        content: generated,
+        spans: mergeCodeSpans(runtimeSpans),
+        provenance: "final generated asset / unmapped fallback",
+        gap: coverageGap,
+      },
+      offset,
+      limit,
+    );
   }
 
   #requireBuild(buildHash: string): StagedBuild {
@@ -517,6 +705,76 @@ export class CoverageAnalysisService {
   #cancelWorker(): void {
     const worker = this.#worker;
     this.#worker = null;
+    if (worker) void worker.terminate();
+  }
+
+  #coverageEvidence(build: StagedBuild): Promise<CoverageEvidence> {
+    if (build.coverageEvidence) return build.coverageEvidence;
+    const pending = this.#loadCoverageEvidence(build);
+    build.coverageEvidence = pending;
+    void pending.catch(() => {
+      if (build.coverageEvidence === pending) build.coverageEvidence = undefined;
+    });
+    return pending;
+  }
+
+  async #loadCoverageEvidence(build: StagedBuild): Promise<CoverageEvidence> {
+    if (!build.recordingFile || !existsSync(build.recordingFile)) {
+      return { available: false, ranges: new Map() };
+    }
+    const input: CoverageRangeIndexWorkerData = {
+      kind: "coverage-range-index",
+      build: build.manifest,
+      recordingFile: build.recordingFile,
+    };
+    const currentFile = fileURLToPath(import.meta.url);
+    const extension = extname(currentFile) === ".cjs" ? ".cjs" : ".js";
+    const workerFile = resolve(dirname(currentFile), `coverage-analysis-worker${extension}`);
+    const ranges = existsSync(workerFile)
+      ? await this.#loadCoverageRangeIndexInWorker(workerFile, input)
+      : await loadCoverageRangeIndex(input);
+    return { available: true, ranges: new Map(ranges) };
+  }
+
+  #loadCoverageRangeIndexInWorker(
+    workerFile: string,
+    input: CoverageRangeIndexWorkerData,
+  ): Promise<CoverageRangeIndex> {
+    this.#cancelRangeWorker();
+    return new Promise((resolvePromise, reject) => {
+      const worker = new Worker(workerFile, {
+        workerData: input,
+        execArgv: process.execArgv.filter((argument) => !argument.startsWith("--input-type")),
+      });
+      this.#rangeWorker = worker;
+      let settled = false;
+      const finish = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        if (this.#rangeWorker === worker) this.#rangeWorker = null;
+        callback();
+      };
+      worker.on("message", (message: CoverageRangeWorkerMessage) => {
+        if (message.type === "coverage-range-index-complete") {
+          finish(() => resolvePromise(message.ranges));
+        } else {
+          finish(() => reject(new Error(message.message)));
+        }
+      });
+      worker.on("error", (error) => finish(() => reject(error)));
+      worker.on("exit", (code) => {
+        if (!settled) {
+          finish(() =>
+            reject(new Error(`Coverage range worker exited before completion with code ${code}.`)),
+          );
+        }
+      });
+    });
+  }
+
+  #cancelRangeWorker(): void {
+    const worker = this.#rangeWorker;
+    this.#rangeWorker = null;
     if (worker) void worker.terminate();
   }
 }

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -130,5 +131,81 @@ describe("CoverageAnalysisService", () => {
         },
       ],
     });
+  });
+
+  it("pages the containing generated asset for an unmapped runtime source", async () => {
+    directory = await mkdtemp(join(tmpdir(), "rspack-coverage-generated-fallback-"));
+    const generated = "const hot = 1;\nconst cold = 2;\n";
+    const executedEnd = generated.indexOf("\n") + 1;
+    const build = manifest();
+    build.assets = [
+      {
+        id: "main",
+        name: "static/js/main.js",
+        urlPath: "/static/js/main.js",
+        size: Buffer.byteLength(generated),
+        contentHash: createHash("sha256").update(generated).digest("hex").slice(0, 20),
+        chunks: ["main"],
+        mapAvailable: false,
+      },
+    ];
+    const fileId = "[rspack runtime / unmapped]/static/js/main.js";
+    await Promise.all([
+      writeDetails(directory, [
+        {
+          id: fileId,
+          content: null,
+          sourceMapAvailable: false,
+          chunks: ["main"],
+          mappedLines: [],
+        },
+      ]),
+      writeFile(
+        join(directory, "coverage.json"),
+        JSON.stringify([
+          {
+            url: "http://localhost/static/js/main.js",
+            text: generated,
+            ranges: [{ start: 0, end: executedEnd }],
+          },
+        ]),
+      ),
+    ]);
+    const storedSnapshot: BuildSnapshot = {
+      ...snapshot(directory),
+      manifest: build,
+      assets: new Map([["main", Buffer.from(generated)]]),
+    };
+    service = new CoverageAnalysisService();
+    service.update(storedSnapshot);
+
+    const code = await service.generatedSource("build", fileId);
+    expect(code).toMatchObject({
+      view: "output",
+      sourceId: fileId,
+      filename: "static/js/main.js",
+      content: generated,
+      offset: 0,
+      endOffset: generated.length,
+      startLine: 1,
+      totalCharacters: generated.length,
+      hasPrevious: false,
+      hasNext: false,
+    });
+    expect(code.spans).toEqual([
+      { start: 0, end: executedEnd, status: "executed" },
+      { start: executedEnd, end: generated.length, status: "unexecuted" },
+    ]);
+
+    const page = await service.generatedSource("build", fileId, executedEnd, 5);
+    expect(page).toMatchObject({
+      content: generated.slice(executedEnd, executedEnd + 5),
+      offset: executedEnd,
+      endOffset: executedEnd + 5,
+      startLine: 2,
+      hasPrevious: true,
+      hasNext: true,
+    });
+    expect(page.spans).toEqual([{ start: 0, end: 5, status: "unexecuted" }]);
   });
 });

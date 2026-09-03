@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { RspackCoveragePlugin } from "../../src/plugin/RspackCoveragePlugin.js";
 import type { AnalysisServer } from "../../src/server/AnalysisServer.js";
 import { startStoredCoverage } from "../../src/server/startStoredCoverage.js";
-import type { CoverageAnalysisStatus } from "../../src/shared/types.js";
+import type { CodeViewResponse, CoverageAnalysisStatus } from "../../src/shared/types.js";
 
 async function waitForCoverageAnalysis(
   origin: string,
@@ -129,22 +129,30 @@ describe("RspackCoveragePlugin", () => {
       headers,
     }).then((response) => response.json())) as {
       hash: string;
-      counts: { sourceMaps: number; references: number; codeGenerationSources?: number };
+      counts: {
+        sourceMaps: number;
+        references: number;
+        exportUsageEdges?: number;
+        codeGenerationSources?: number;
+      };
       capabilities: {
         usedExports: string;
         sourceMap: string;
         originalLocations: string;
+        exportUsageGraph?: string;
       };
       previewAvailable: boolean;
       assets: Array<{ id: string; urlPath: string }>;
     };
     expect(manifest.counts.sourceMaps).toBeGreaterThan(0);
     expect(manifest.counts.references).toBeGreaterThan(0);
+    expect(manifest.counts.exportUsageEdges).toBeGreaterThan(0);
     expect(manifest.counts.codeGenerationSources).toBeGreaterThan(0);
     expect(manifest.capabilities).toEqual({
       usedExports: "enabled",
       sourceMap: "full",
       originalLocations: "exact",
+      exportUsageGraph: "native",
     });
     expect(manifest.previewAvailable).toBe(true);
     expect(await fetch(`${origin}/`).then((response) => response.text())).toContain("<script");
@@ -195,6 +203,21 @@ describe("RspackCoveragePlugin", () => {
         { headers },
       ).then((response) => response.status),
     ).toBe(404);
+    const generatedFallback = (await fetch(
+      `${origin}/__rspack_coverage__/api/coverage-analysis/generated-source?buildHash=${encodeURIComponent(manifest.hash)}&fileId=${encodeURIComponent("[rspack runtime / unmapped]/main.js")}&limit=128`,
+      { headers },
+    ).then((response) => response.json())) as CodeViewResponse;
+    expect(generatedFallback).toMatchObject({
+      view: "output",
+      sourceId: "[rspack runtime / unmapped]/main.js",
+      filename: "main.js",
+      offset: 0,
+      endOffset: generated.length,
+      hasPrevious: false,
+      hasNext: false,
+    });
+    expect(generatedFallback.content).toBe(generated);
+    expect(generatedFallback.provenance).toContain("unmapped fallback");
 
     const dependencySource = completed.report.files.find((file) =>
       file.path.endsWith("dependency.js"),
@@ -216,6 +239,27 @@ describe("RspackCoveragePlugin", () => {
     expect(references.entryPath.at(-1)?.entry).toBe(true);
     const liveReference = references.edges.find((edge) => edge.exports?.includes("live"));
     expect(liveReference).toBeTruthy();
+    const liveChain = (await fetch(
+      `${origin}/__rspack_coverage__/api/modules/${encodeURIComponent(moduleId)}/export-chain?export=live`,
+      { headers },
+    ).then((response) => response.json())) as {
+      precision: string;
+      steps: Array<{
+        importedExport: string;
+        importerExports: string[];
+        relationPrecision: string;
+      }>;
+    };
+    expect(liveChain.precision).toBe("native");
+    expect(liveChain.steps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          importedExport: "live",
+          importerExports: [],
+          relationPrecision: "exact",
+        }),
+      ]),
+    );
     const snippet = (await fetch(
       `${origin}/__rspack_coverage__/api/references/${encodeURIComponent(liveReference?.id ?? "")}/snippet`,
       { headers },

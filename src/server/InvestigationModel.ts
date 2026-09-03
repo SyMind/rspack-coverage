@@ -9,8 +9,11 @@ import type {
   BuildSnapshot,
   CodeViewResponse,
   CoverageReport,
+  ExportImporterBinding,
   ExportImporterChainResponse,
   ExportImporterChainStep,
+  ExportUsageEdge,
+  ExportUsageStore,
   ModuleInvestigationDetail,
   ModuleReferencesResponse,
   ReferenceLocation,
@@ -20,12 +23,17 @@ import type {
   SourceLineState,
   UsageMetrics,
 } from "../shared/types.js";
+import { parseExports } from "./exportAnalysis.js";
+import { createInMemoryExportUsageStore } from "./exportUsageStore.js";
 import { createInMemoryReferenceStore } from "./referenceStore.js";
 
 const DEFAULT_CODE_LIMIT = 240_000;
 const EXPORT_CHAIN_MAX_DEPTH = 12;
 const EXPORT_CHAIN_MAX_STEPS = 120;
 const EXPORT_CHAIN_MAX_INCOMING_PER_STATE = 250;
+const EXPORT_BINDING_MAX_SOURCE_CHARACTERS = 512_000;
+const EXPORT_BINDING_CACHE_LIMIT = 256;
+const PARSED_EXPORT_CACHE_LIMIT = 128;
 
 function normalizeBuildSourcePath(value: string, context: string): string {
   return normalizeSourcePathForContext(value, context);
@@ -161,22 +169,23 @@ function referencesForExport(references: BuildReference[], exportedName: string)
   });
 }
 
-function importerExportCandidates(module: BuildModule): {
-  exports: string[];
-  precision: ExportImporterChainStep["relationPrecision"];
-} {
-  if (Array.isArray(module.usedExports)) {
-    const exports = [...new Set(module.usedExports.filter((name) => name !== "__esModule"))];
-    return {
-      exports,
-      precision: exports.length === 1 ? "exact" : exports.length ? "conservative" : "unavailable",
-    };
+function rangeDistance(range: ReferenceLocation, location: ReferenceLocation | null): number {
+  if (!location) return 0;
+  const point = location.start;
+  if (
+    (point.line > range.start.line ||
+      (point.line === range.start.line && point.column >= range.start.column)) &&
+    (point.line < range.end.line ||
+      (point.line === range.end.line && point.column <= range.end.column))
+  ) {
+    return 0;
   }
-  if (module.usedExports === true && Array.isArray(module.providedExports)) {
-    const exports = [...new Set(module.providedExports.filter((name) => name !== "__esModule"))];
-    return { exports, precision: exports.length ? "conservative" : "unavailable" };
-  }
-  return { exports: [], precision: "unavailable" };
+  const startDistance =
+    Math.abs(point.line - range.start.line) * 1_000_000 +
+    Math.abs(point.column - range.start.column);
+  const endDistance =
+    Math.abs(point.line - range.end.line) * 1_000_000 + Math.abs(point.column - range.end.column);
+  return Math.min(startDistance, endDistance);
 }
 
 function coverageStatus(
@@ -205,7 +214,10 @@ export class InvestigationModel {
   readonly #files = new Map<string, SourceFileSummary>();
   readonly #filesByModule = new Map<string, SourceFileSummary[]>();
   readonly #referenceStore: BuildReferenceStore;
+  readonly #exportUsageStore: ExportUsageStore | null;
   readonly #entryPathCache = new Map<string, BuildModule[]>();
+  readonly #exportBindingCache = new Map<string, Map<string, ExportImporterBinding>>();
+  readonly #parsedExportCache = new Map<string, ReturnType<typeof parseExports>>();
 
   #cacheEntryPath(moduleId: string, path: BuildModule[]): void {
     this.#entryPathCache.delete(moduleId);
@@ -215,6 +227,37 @@ export class InvestigationModel {
       if (oldest === undefined) break;
       this.#entryPathCache.delete(oldest);
     }
+  }
+
+  #cacheExportBindings(moduleId: string, bindings: Map<string, ExportImporterBinding>): void {
+    this.#exportBindingCache.delete(moduleId);
+    this.#exportBindingCache.set(moduleId, bindings);
+    while (this.#exportBindingCache.size > EXPORT_BINDING_CACHE_LIMIT) {
+      const oldest = this.#exportBindingCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.#exportBindingCache.delete(oldest);
+    }
+  }
+
+  #parsedExports(
+    module: BuildModule,
+    source: { path: string; content: string },
+  ): ReturnType<typeof parseExports> {
+    const key = `${module.id}\0${source.path}`;
+    const cached = this.#parsedExportCache.get(key);
+    if (cached) {
+      this.#parsedExportCache.delete(key);
+      this.#parsedExportCache.set(key, cached);
+      return cached;
+    }
+    const parsed = parseExports(source.content, source.path, { includeImportUsages: true });
+    this.#parsedExportCache.set(key, parsed);
+    while (this.#parsedExportCache.size > PARSED_EXPORT_CACHE_LIMIT) {
+      const oldest = this.#parsedExportCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.#parsedExportCache.delete(oldest);
+    }
+    return parsed;
   }
 
   constructor(
@@ -236,6 +279,11 @@ export class InvestigationModel {
     }
     this.#referenceStore =
       snapshot.referenceStore ?? createInMemoryReferenceStore(snapshot.references);
+    this.#exportUsageStore =
+      snapshot.manifest.capabilities.exportUsageGraph === "native"
+        ? (snapshot.exportUsageStore ??
+          createInMemoryExportUsageStore(snapshot.exportUsageEdges ?? []))
+        : null;
   }
 
   #sourceCandidates(path: string): Array<{ key: string; path: string }> {
@@ -261,6 +309,153 @@ export class InvestigationModel {
   #sourceContent(path: string): string | null {
     const candidate = this.#sourceCandidates(path)[0];
     return candidate ? (this.snapshot.originalSources.get(candidate.key) ?? null) : null;
+  }
+
+  #sourceForModule(module: BuildModule): { path: string; content: string } | null {
+    const requestedPaths = [...(module.sourcePaths ?? []), module.resource].filter(
+      (path): path is string => Boolean(path),
+    );
+    for (const requestedPath of requestedPaths) {
+      const normalized = normalizeBuildSourcePath(requestedPath, this.snapshot.manifest.context);
+      for (const key of [requestedPath, normalized]) {
+        if (!this.snapshot.originalSources.has(key)) continue;
+        const content = this.snapshot.originalSources.get(key);
+        if (content !== undefined) return { path: normalized, content };
+      }
+    }
+    for (const requestedPath of requestedPaths) {
+      const candidate = this.#sourceCandidates(requestedPath)[0];
+      if (!candidate) continue;
+      const content = this.snapshot.originalSources.get(candidate.key);
+      if (content !== undefined) return { path: candidate.path, content };
+    }
+    return null;
+  }
+
+  #sourceForReference(
+    module: BuildModule,
+    reference: BuildReference,
+  ): { path: string; content: string } | null {
+    if (reference.sourcePath) {
+      const candidate = this.#sourceCandidates(reference.sourcePath)[0];
+      if (candidate) {
+        const content = this.snapshot.originalSources.get(candidate.key);
+        if (content !== undefined) return { path: candidate.path, content };
+      }
+    }
+    return this.#sourceForModule(module);
+  }
+
+  #exportBindings(module: BuildModule): Map<string, ExportImporterBinding> {
+    const cached = this.#exportBindingCache.get(module.id);
+    if (cached) {
+      this.#exportBindingCache.delete(module.id);
+      this.#exportBindingCache.set(module.id, cached);
+      return cached;
+    }
+    const bindings = new Map<string, ExportImporterBinding>();
+    for (const exportedName of module.providedExports ?? []) {
+      if (exportedName === "__esModule") continue;
+      bindings.set(exportedName, {
+        exportedName,
+        localName: null,
+        exportPath: [exportedName],
+        declaration: null,
+      });
+    }
+    const source = this.#sourceForModule(module);
+    if (source && source.content.length <= EXPORT_BINDING_MAX_SOURCE_CHARACTERS) {
+      for (const item of this.#parsedExports(module, source).exports) {
+        if (item.typeOnly) continue;
+        const existing = bindings.get(item.exportedName);
+        bindings.set(item.exportedName, {
+          exportedName: item.exportedName,
+          localName: existing?.localName ?? item.localName,
+          exportPath: [item.exportedName],
+          declaration: item.declarationRange
+            ? { sourcePath: source.path, range: item.declarationRange }
+            : (existing?.declaration ?? null),
+        });
+      }
+    }
+    this.#cacheExportBindings(module.id, bindings);
+    return bindings;
+  }
+
+  #exportBinding(module: BuildModule, value: string | readonly string[]): ExportImporterBinding {
+    const exportPath = typeof value === "string" ? [value] : [...value];
+    const exportedName = exportPath.join(".");
+    const rootName = exportPath[0] ?? exportedName;
+    const root = this.#exportBindings(module).get(rootName);
+    if (root && exportPath.length === 1) return root;
+    return {
+      exportedName,
+      localName:
+        root?.localName && exportPath.length > 1
+          ? [root.localName, ...exportPath.slice(1)].join(".")
+          : null,
+      exportPath,
+      declaration: root?.declaration ?? null,
+    };
+  }
+
+  #importerExportCandidates(
+    module: BuildModule,
+    reference: BuildReference,
+    importedExport: string,
+  ): {
+    exports: string[];
+    precision: ExportImporterChainStep["relationPrecision"];
+  } {
+    const source = this.#sourceForReference(module, reference);
+    if (!source || source.content.length > EXPORT_BINDING_MAX_SOURCE_CHARACTERS) {
+      return { exports: [], precision: "unavailable" };
+    }
+    const parsed = this.#parsedExports(module, source);
+    if (parsed.importUsagesTruncated) return { exports: [], precision: "unavailable" };
+    const matching = parsed.importUsages.filter(
+      (usage) =>
+        usage.request === reference.request &&
+        (usage.importedName === importedExport || usage.importedName === "*"),
+    );
+    if (!matching.length) return { exports: [], precision: "unavailable" };
+
+    const hint = reference.sourceLocation ?? reference.location;
+    let selected = matching;
+    if (hint && matching.length > 1) {
+      const minimumDistance = Math.min(
+        ...matching.map((usage) => rangeDistance(usage.range, hint)),
+      );
+      if (minimumDistance === 0) {
+        selected = matching.filter((usage) => rangeDistance(usage.range, hint) === 0);
+      } else {
+        const line = source.content.split(/\r?\n/)[hint.start.line - 1] ?? "";
+        if (line.includes(importedExport)) {
+          selected = matching.filter(
+            (usage) => rangeDistance(usage.range, hint) === minimumDistance,
+          );
+        }
+      }
+    }
+    const exports = [
+      ...new Set(
+        selected.flatMap((usage) =>
+          usage.importerExports.map((name) => (name === "*" ? importedExport : name)),
+        ),
+      ),
+    ];
+    const signatures = new Set(
+      selected.map((usage) =>
+        usage.importerExports
+          .map((name) => (name === "*" ? importedExport : name))
+          .sort()
+          .join("\0"),
+      ),
+    );
+    return {
+      exports,
+      precision: signatures.size <= 1 ? "exact" : "conservative",
+    };
   }
 
   #filesForModule(moduleId: string): SourceFileSummary[] {
@@ -452,11 +647,134 @@ export class InvestigationModel {
     };
   }
 
+  #nativeExportImporterChain(
+    module: BuildModule,
+    exportedName: string,
+  ): ExportImporterChainResponse {
+    const store = this.#exportUsageStore as ExportUsageStore;
+    type PendingState = {
+      moduleId: string;
+      exportPath: string[];
+      depth: number;
+      parentId: string | null;
+      ancestors: ReadonlySet<string>;
+    };
+    const rootPath = [exportedName];
+    const rootKey = `${module.id}\0${JSON.stringify(rootPath)}`;
+    const queue: PendingState[] = [
+      {
+        moduleId: module.id,
+        exportPath: rootPath,
+        depth: 0,
+        parentId: null,
+        ancestors: new Set([rootKey]),
+      },
+    ];
+    const steps: ExportImporterChainStep[] = [];
+    let truncated = false;
+    let cursor = 0;
+
+    while (cursor < queue.length && steps.length < EXPORT_CHAIN_MAX_STEPS) {
+      const state = queue[cursor];
+      cursor += 1;
+      if (!state) continue;
+      const incomingCount = store.countTarget(state.moduleId, state.exportPath);
+      if (state.depth >= EXPORT_CHAIN_MAX_DEPTH) {
+        if (incomingCount > 0) truncated = true;
+        continue;
+      }
+      const incomingLimit = Math.min(incomingCount, EXPORT_CHAIN_MAX_INCOMING_PER_STATE);
+      if (incomingCount > incomingLimit) truncated = true;
+      const incoming = store.pageTarget(state.moduleId, state.exportPath, 0, incomingLimit);
+      const grouped = new Map<string, ExportUsageEdge[]>();
+      for (const edge of incoming) {
+        const key = `${edge.originModuleId}\0${edge.targetModuleId}\0${edge.dependencyId}\0${JSON.stringify(
+          edge.targetExport,
+        )}\0${JSON.stringify(edge.sourceLocation ?? edge.location)}`;
+        const values = grouped.get(key) ?? [];
+        values.push(edge);
+        grouped.set(key, values);
+      }
+
+      for (const group of grouped.values()) {
+        if (steps.length >= EXPORT_CHAIN_MAX_STEPS) {
+          truncated = true;
+          break;
+        }
+        const first = group[0];
+        if (!first) continue;
+        const origin = this.#modules.get(first.originModuleId);
+        const target = this.#modules.get(first.targetModuleId);
+        if (!origin || !target) continue;
+        const carrierPaths = [
+          ...new Map(
+            group.flatMap((edge) =>
+              edge.originExport
+                ? [[JSON.stringify(edge.originExport), edge.originExport] as const]
+                : [],
+            ),
+          ).values(),
+        ];
+        const importerBindings = carrierPaths.map((path) => this.#exportBinding(origin, path));
+        const id = `${first.id}:${state.depth + 1}:${steps.length}`;
+        const reference: BuildReference = {
+          id: first.id,
+          originId: origin.id,
+          targetId: target.id,
+          dependencyType: "export usage",
+          request: target.resource,
+          exports: first.targetExport ? [...first.targetExport] : [...state.exportPath],
+          active: true,
+          location: first.location,
+          sourcePath: first.sourcePath ?? origin.resource,
+          sourceLocation: first.sourceLocation ?? first.location,
+        };
+        steps.push({
+          id,
+          parentId: state.parentId,
+          depth: state.depth + 1,
+          importedExport: (first.targetExport ?? state.exportPath).join("."),
+          importedBinding: this.#exportBinding(target, first.targetExport ?? state.exportPath),
+          importerExports: importerBindings.map((binding) => binding.exportedName),
+          importerBindings,
+          relationPrecision: "exact",
+          usageEdgeId: first.id,
+          edge: { ...reference, origin, target },
+        });
+        for (const carrierPath of carrierPaths) {
+          const carrierKey = `${origin.id}\0${JSON.stringify(carrierPath)}`;
+          if (state.ancestors.has(carrierKey)) continue;
+          queue.push({
+            moduleId: origin.id,
+            exportPath: [...carrierPath],
+            depth: state.depth + 1,
+            parentId: id,
+            ancestors: new Set([...state.ancestors, carrierKey]),
+          });
+        }
+      }
+    }
+    if (cursor < queue.length) truncated = true;
+    return {
+      module,
+      exportedName,
+      binding: this.#exportBinding(module, rootPath),
+      steps,
+      precision: "native",
+      diagnostics: [],
+      truncated,
+      maxDepth: EXPORT_CHAIN_MAX_DEPTH,
+    };
+  }
+
   exportImporterChain(moduleId: string, exportedName: string): ExportImporterChainResponse | null {
     const module = this.#modules.get(moduleId);
     if (!module) return null;
     const normalizedExport = exportedName.trim();
     if (!normalizedExport) return null;
+    if (this.#exportUsageStore) {
+      return this.#nativeExportImporterChain(module, normalizedExport);
+    }
 
     type PendingState = {
       moduleId: string;
@@ -498,14 +816,16 @@ export class InvestigationModel {
         const origin = this.#modules.get(edge.originId);
         const target = this.#modules.get(edge.targetId);
         if (!origin || !target) continue;
-        const importer = importerExportCandidates(origin);
+        const importer = this.#importerExportCandidates(origin, edge, state.exportedName);
         const id = `${edge.id}:${state.exportedName}:${state.depth + 1}`;
         steps.push({
           id,
           parentId: state.parentId,
           depth: state.depth + 1,
           importedExport: state.exportedName,
+          importedBinding: this.#exportBinding(target, state.exportedName),
           importerExports: importer.exports,
+          importerBindings: importer.exports.map((name) => this.#exportBinding(origin, name)),
           relationPrecision: importer.precision,
           edge: { ...edge, origin, target },
         });
@@ -525,15 +845,22 @@ export class InvestigationModel {
     return {
       module,
       exportedName: normalizedExport,
+      binding: this.#exportBinding(module, normalizedExport),
       steps,
+      precision: "source-inferred",
+      diagnostics: [
+        "This snapshot does not contain Rspack's native export usage graph. The visible chain is inferred from captured source and stops when ownership is unavailable.",
+      ],
       truncated,
       maxDepth: EXPORT_CHAIN_MAX_DEPTH,
     };
   }
 
-  snippet(referenceId: string, _contextLines = 3): ReferenceSnippetResponse | null {
-    const edge = this.#referenceStore.get(referenceId);
-    if (!edge) return null;
+  #snippetForEdge(
+    edge: BuildReference,
+    kind: "usage" | "declaration",
+    title?: string,
+  ): ReferenceSnippetResponse {
     const origin = this.#modules.get(edge.originId);
     const requestedPath = edge.sourcePath ?? origin?.resource ?? null;
     const compilerLocation = edge.sourceLocation ?? edge.location;
@@ -567,6 +894,8 @@ export class InvestigationModel {
     if (!selected || !content || !location) {
       return {
         edge,
+        kind,
+        ...(title ? { title } : {}),
         available: false,
         gap:
           candidates.length > 0
@@ -614,6 +943,8 @@ export class InvestigationModel {
     };
     return {
       edge,
+      kind,
+      ...(title ? { title } : {}),
       available: true,
       gap: null,
       code,
@@ -628,6 +959,51 @@ export class InvestigationModel {
       coverage: origin ? this.#metrics(origin.id) : emptyMetrics(),
       location,
     };
+  }
+
+  snippet(referenceId: string, _contextLines = 3): ReferenceSnippetResponse | null {
+    const reference = this.#referenceStore.get(referenceId);
+    if (reference) return this.#snippetForEdge(reference, "usage");
+    const usage = this.#exportUsageStore?.get(referenceId);
+    if (!usage) return null;
+    const target = this.#modules.get(usage.targetModuleId);
+    const edge: BuildReference = {
+      id: usage.id,
+      originId: usage.originModuleId,
+      targetId: usage.targetModuleId,
+      dependencyType: "export usage",
+      request: target?.resource ?? null,
+      exports: usage.targetExport,
+      active: true,
+      location: usage.location,
+      sourcePath: usage.sourcePath ?? null,
+      sourceLocation: usage.sourceLocation ?? usage.location,
+    };
+    return this.#snippetForEdge(edge, "usage");
+  }
+
+  exportDeclaration(moduleId: string, exportedName: string): ReferenceSnippetResponse | null {
+    const module = this.#modules.get(moduleId);
+    if (!module) return null;
+    const binding = this.#exportBinding(module, exportedName);
+    if (!binding.declaration) return null;
+    const edge: BuildReference = {
+      id: `declaration:${module.id}:${exportedName}`,
+      originId: module.id,
+      targetId: module.id,
+      dependencyType: "export declaration",
+      request: null,
+      exports: [exportedName],
+      active: true,
+      location: binding.declaration.range,
+      sourcePath: binding.declaration.sourcePath,
+      sourceLocation: binding.declaration.range,
+    };
+    return this.#snippetForEdge(
+      edge,
+      "declaration",
+      `Definition of ${binding.localName ?? binding.exportedName}`,
+    );
   }
 
   aiContext(moduleId: string): unknown | null {

@@ -5,6 +5,7 @@ import { metricsForModuleInstance } from "../../shared/metrics.js";
 import type {
   BuildModule,
   CodeCoverageState,
+  CodeViewResponse,
   ExportImporterChainResponse,
   ModuleReferencesResponse,
   ReferenceSnippetResponse,
@@ -16,14 +17,20 @@ import type {
 } from "../../shared/types.js";
 import {
   loadCoverageSource,
+  loadExportDeclaration,
   loadExportImporterChain,
+  loadGeneratedSource,
   loadReferenceSnippet,
   loadReferences,
   loadSourceExportStatus,
+  openInEditor,
 } from "../lib/api.js";
 import { formatBytes, formatPercent } from "../lib/format.js";
-import { SyntaxText } from "./CoverageCode.js";
+import { CoverageCode, SyntaxText } from "./CoverageCode.js";
 import { ReferencePanel } from "./ReferencePanel.js";
+
+const GENERATED_CODE_PAGE = 240_000;
+const UNMAPPED_SOURCE_PREFIX = "[rspack runtime / unmapped]/";
 
 function buildLabel(line: SourceLineState): string {
   if (line.buildState === "not-emitted") return "Removed from final generated output";
@@ -107,6 +114,46 @@ function useSourceDetail(
       });
     return () => controller.abort();
   }, [buildHash, file, moduleId, retry]);
+  return status;
+}
+
+type GeneratedSourceStatus =
+  | { status: "loading" }
+  | { status: "complete"; code: CodeViewResponse }
+  | { status: "error"; message: string };
+
+function useGeneratedSource(
+  buildHash: string,
+  file: SourceFileSummary | null,
+  offset: number,
+  retry: number,
+) {
+  const [status, setStatus] = useState<GeneratedSourceStatus | null>(null);
+  useEffect(() => {
+    setStatus(file ? { status: "loading" } : null);
+    if (!file) return;
+    const controller = new AbortController();
+    void loadGeneratedSource(
+      buildHash,
+      file.id,
+      offset,
+      GENERATED_CODE_PAGE,
+      controller.signal,
+      retry,
+    )
+      .then((code) => {
+        if (!controller.signal.aborted) setStatus({ status: "complete", code });
+      })
+      .catch((error) => {
+        if ((error as Error).name !== "AbortError") {
+          setStatus({
+            status: "error",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      });
+    return () => controller.abort();
+  }, [buildHash, file, offset, retry]);
   return status;
 }
 
@@ -353,8 +400,11 @@ export function SourceDrawer(props: {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [retry, setRetry] = useState(0);
   const [detailRetry, setDetailRetry] = useState(0);
+  const [generatedRetry, setGeneratedRetry] = useState(0);
+  const [generatedOffset, setGeneratedOffset] = useState(0);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchIndex, setSearchIndex] = useState(0);
+  const [wrapLines, setWrapLines] = useState(false);
   const [activeExportId, setActiveExportId] = useState<string | null>(null);
   const [moduleId, setModuleId] = useState<string | null>(null);
   const [direction, setDirection] = useState<"in" | "out" | "both">("in");
@@ -362,12 +412,28 @@ export function SourceDrawer(props: {
   const [importerChain, setImporterChain] = useState<ExportImporterChainResponse | null>(null);
   const [snippet, setSnippet] = useState<ReferenceSnippetResponse | null>(null);
   const [snippetFlashKey, setSnippetFlashKey] = useState(0);
+  const snippetRequestRef = useRef(0);
   const [loadingReferences, setLoadingReferences] = useState(false);
   const [loadingImporterChain, setLoadingImporterChain] = useState(false);
   const [referenceError, setReferenceError] = useState<string | null>(null);
   const [importerChainError, setImporterChainError] = useState<string | null>(null);
-  const analysis = useExportAnalysis(props.buildHash, props.file, retry);
-  const detailStatus = useSourceDetail(props.buildHash, props.file, props.moduleId, detailRetry);
+  const [editorError, setEditorError] = useState<string | null>(null);
+  const generatedFallback = Boolean(
+    props.file && !props.moduleId && props.file.path.startsWith(UNMAPPED_SOURCE_PREFIX),
+  );
+  const analysis = useExportAnalysis(props.buildHash, generatedFallback ? null : props.file, retry);
+  const detailStatus = useSourceDetail(
+    props.buildHash,
+    generatedFallback ? null : props.file,
+    props.moduleId,
+    detailRetry,
+  );
+  const generatedStatus = useGeneratedSource(
+    props.buildHash,
+    generatedFallback ? props.file : null,
+    generatedOffset,
+    generatedRetry,
+  );
   const report = analysis?.status === "complete" ? analysis.report : null;
   const rawLines = detailStatus?.status === "complete" ? detailStatus.detail.lines : [];
   const selectedModuleLoaded =
@@ -430,9 +496,15 @@ export function SourceDrawer(props: {
     overscan: 30,
   });
   useEffect(() => {
+    if (wrapLines && scrollRef.current) scrollRef.current.scrollLeft = 0;
+    virtualizer.measure?.();
+  }, [virtualizer, wrapLines]);
+  useEffect(() => {
     if (!props.file?.id) return;
     setSearchQuery("");
     setSearchIndex(0);
+    setGeneratedOffset(0);
+    setEditorError(null);
   }, [props.file?.id]);
   useEffect(() => {
     if (!activeSearchMatch) return;
@@ -486,6 +558,16 @@ export function SourceDrawer(props: {
     setLoadingImporterChain(Boolean(moduleId && selectedExport));
     if (!moduleId || !selectedExport) return;
     let cancelled = false;
+    const snippetRequest = ++snippetRequestRef.current;
+    setSnippet(null);
+    void loadExportDeclaration(moduleId, selectedExport.exportedName)
+      .then((next) => {
+        if (!cancelled && snippetRequestRef.current === snippetRequest) {
+          setSnippet(next);
+          setSnippetFlashKey((value) => value + 1);
+        }
+      })
+      .catch(() => undefined);
     void loadExportImporterChain(moduleId, selectedExport.exportedName)
       .then((next) => {
         if (!cancelled) setImporterChain(next);
@@ -514,6 +596,7 @@ export function SourceDrawer(props: {
     setReferences(null);
     setImporterChain(null);
     setSnippet(null);
+    snippetRequestRef.current += 1;
     setReferenceError(null);
     setImporterChainError(null);
     const url = new URL(location.href);
@@ -522,6 +605,7 @@ export function SourceDrawer(props: {
     history.replaceState(null, "", url);
   };
   const closeDependencyGraph = () => {
+    snippetRequestRef.current += 1;
     setModuleId(null);
     setActiveExportId(null);
     setReferences(null);
@@ -538,7 +622,10 @@ export function SourceDrawer(props: {
   };
   if (!props.file) return null;
   const file = props.file;
+  const editorModuleId = props.moduleId ?? file.moduleIds[0] ?? null;
+  const editorPath = String(props.module?.resource ?? file.path).split("?", 1)[0] ?? file.path;
   const metrics = props.moduleId ? metricsForModuleInstance(file, props.module) : file.metrics;
+  const generatedCode = generatedStatus?.status === "complete" ? generatedStatus.code : null;
   const activeExport = report?.exports.find((candidate) => candidate.id === activeExportId) ?? null;
   const activeModuleInstance =
     activeExport?.moduleInstances.find((candidate) => candidate.moduleId === moduleId) ?? null;
@@ -549,7 +636,47 @@ export function SourceDrawer(props: {
         aria-label={`Source details for ${file.path}`}
       >
         <header>
-          <h2 title={file.path}>{file.path}</h2>
+          <div className="source-title">
+            <h2>
+              {editorModuleId ? (
+                <button
+                  type="button"
+                  className="source-path-button"
+                  title={`Open ${editorPath} in VS Code`}
+                  aria-label={`Open ${file.path} in VS Code`}
+                  onClick={() => {
+                    setEditorError(null);
+                    void openInEditor({
+                      moduleId: editorModuleId,
+                      sourceId: file.id,
+                      line: 1,
+                      column: 1,
+                    })
+                      .then((result) => {
+                        if (!result.opened) {
+                          setEditorError("VS Code could not be opened on this machine.");
+                        }
+                      })
+                      .catch((error) => {
+                        setEditorError(error instanceof Error ? error.message : String(error));
+                      });
+                  }}
+                >
+                  <span>{file.path}</span>
+                  <span className="source-path-icon" aria-hidden="true">
+                    ↗
+                  </span>
+                </button>
+              ) : (
+                file.path
+              )}
+            </h2>
+            {editorError ? (
+              <span className="source-editor-error" role="status">
+                {editorError}
+              </span>
+            ) : null}
+          </div>
           <button
             type="button"
             className="close-button"
@@ -559,7 +686,16 @@ export function SourceDrawer(props: {
             ×
           </button>
         </header>
-        <ExportStatus status={analysis} onRetry={() => setRetry((value) => value + 1)} />
+        {generatedFallback ? (
+          <div className="export-analysis-status is-ready generated-fallback-status">
+            <span>
+              <b>Generated output fallback</b>
+              <small>Final asset context for bytes without stable source-map attribution</small>
+            </span>
+          </div>
+        ) : (
+          <ExportStatus status={analysis} onRetry={() => setRetry((value) => value + 1)} />
+        )}
         <div className="drawer-metrics">
           <span>
             <small>Loaded</small>
@@ -586,116 +722,209 @@ export function SourceDrawer(props: {
                 )}
           </span>
         </div>
-        <div className="source-legend">
-          <span>
-            <i className="swatch executed" /> executed
-          </span>
-          <span>
-            <i className="swatch unused" />
-            {props.moduleId ? "retained + loaded, not executed" : "loaded / unexecuted"}
-          </span>
-          <span>
-            <i className="swatch not-loaded" /> not loaded
-          </span>
-          <span>
-            <i className="swatch not-emitted" /> not emitted
-          </span>
-          <span>
-            <i className="swatch export-used" /> clickable export
-          </span>
-        </div>
-        <div className="source-code-panel">
-          <div className="source-columns">
-            <span>Line</span>
-            <span>Source</span>
-          </div>
-          <search className="code-search-toolbar" aria-label="Search source code">
-            <input
-              ref={searchInputRef}
-              type="search"
-              aria-label="Search source code"
-              placeholder="Search in file…"
-              value={searchQuery}
-              onChange={(event) => {
-                setSearchQuery(event.target.value);
-                setSearchIndex(0);
-              }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  moveSearch(event.shiftKey ? -1 : 1);
-                } else if (event.key === "Escape") {
-                  setSearchQuery("");
-                  setSearchIndex(0);
-                }
-              }}
-            />
-            <span className="code-search-status" aria-live="polite">
-              {searchQuery
-                ? sourceSearch.matches.length
-                  ? `${activeSearchIndex + 1} / ${sourceSearch.matches.length}${sourceSearch.truncated ? "+" : ""}`
-                  : "No matches"
-                : "⌘F"}
+        {generatedFallback ? (
+          <div className="source-legend">
+            <span>
+              <i className="swatch executed" /> executed unmapped output
             </span>
-            <button
-              type="button"
-              aria-label="Previous search match"
-              disabled={sourceSearch.matches.length === 0}
-              onClick={() => moveSearch(-1)}
-            >
-              ↑
-            </button>
-            <button
-              type="button"
-              aria-label="Next search match"
-              disabled={sourceSearch.matches.length === 0}
-              onClick={() => moveSearch(1)}
-            >
-              ↓
-            </button>
-          </search>
-          <div className="source-scroll" ref={scrollRef}>
-            {detailStatus?.status === "loading" ? (
-              <div className="source-detail-status" aria-live="polite">
-                <span className="spinner" /> Loading source details from Node…
-              </div>
-            ) : detailStatus?.status === "error" ? (
-              <div className="source-detail-status is-error" role="status">
-                <span>{detailStatus.message}</span>
-                <button type="button" onClick={() => setDetailRetry((value) => value + 1)}>
-                  Retry
-                </button>
-              </div>
-            ) : null}
-            <div className="virtual-canvas" style={{ height: `${virtualizer.getTotalSize()}px` }}>
-              {virtualizer.getVirtualItems().map((virtualRow) => {
-                const line = lines[virtualRow.index];
-                if (!line) return null;
-                return (
-                  <div
-                    className={`source-line build-${line.buildState} runtime-${line.runtimeState} ${activeSearchMatch?.line === line.line ? "is-search-active" : ""}`}
-                    key={line.line}
-                    style={{ transform: `translateY(${virtualRow.start}px)` }}
-                    title={`${buildLabel(line)} · generated ${formatBytes(line.emittedBytes)} · executed ${formatBytes(line.executedBytes)} · chunks ${line.chunks.join(", ") || "none"}`}
-                  >
-                    <span className="line-number">{line.line}</span>
-                    <SourceCode
-                      text={line.text || " "}
-                      status={sourceLineCoverageStatus(line)}
-                      markers={markerLines.get(line.line) ?? []}
-                      onMarkerClick={openDependencyGraph}
-                      activeExportId={activeExportId}
-                      searchMatches={searchMatchesByLine.get(line.line) ?? []}
-                      activeSearchIndex={activeSearchIndex}
-                    />
-                  </div>
-                );
-              })}
-            </div>
+            <span>
+              <i className="swatch unused" /> loaded / unexecuted unmapped output
+            </span>
+            <span>
+              <i className="swatch generated-unloaded" /> not loaded
+            </span>
+            <span>
+              <i className="swatch generated-unknown" /> recording unavailable
+            </span>
+            <span>
+              <i className="swatch neutral" /> mapped source context
+            </span>
           </div>
+        ) : (
+          <div className="source-legend">
+            <span>
+              <i className="swatch executed" /> executed
+            </span>
+            <span>
+              <i className="swatch unused" />
+              {props.moduleId ? "retained + loaded, not executed" : "loaded / unexecuted"}
+            </span>
+            <span>
+              <i className="swatch not-loaded" /> not loaded
+            </span>
+            <span>
+              <i className="swatch not-emitted" /> not emitted
+            </span>
+            <span>
+              <i className="swatch export-used" /> clickable export
+            </span>
+          </div>
+        )}
+        <div className="source-code-panel">
+          {generatedFallback ? (
+            <>
+              <div className="code-toolbar generated-code-toolbar">
+                <div className="code-provenance">
+                  <strong>{generatedCode?.filename ?? "Loading generated asset…"}</strong>
+                  <small>{generatedCode?.provenance ?? "final generated asset"}</small>
+                </div>
+                {generatedCode && (generatedCode.hasPrevious || generatedCode.hasNext) ? (
+                  <div className="code-pager">
+                    <button
+                      type="button"
+                      aria-label="Previous generated code page"
+                      disabled={!generatedCode.hasPrevious}
+                      onClick={() =>
+                        setGeneratedOffset(Math.max(0, generatedCode.offset - GENERATED_CODE_PAGE))
+                      }
+                    >
+                      Previous
+                    </button>
+                    <span>
+                      {generatedCode.offset.toLocaleString()}–
+                      {generatedCode.endOffset.toLocaleString()} /{" "}
+                      {generatedCode.totalCharacters.toLocaleString()}
+                    </span>
+                    <button
+                      type="button"
+                      aria-label="Next generated code page"
+                      disabled={!generatedCode.hasNext}
+                      onClick={() => setGeneratedOffset(generatedCode.endOffset)}
+                    >
+                      Next
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+              {generatedCode?.gap ? (
+                <div className="mapping-notice">{generatedCode.gap}</div>
+              ) : null}
+              <div className="coverage-code-scroll generated-code-scroll">
+                {generatedStatus?.status === "loading" ? (
+                  <div className="source-detail-status" aria-live="polite">
+                    <span className="spinner" /> Loading generated asset from Node…
+                  </div>
+                ) : generatedStatus?.status === "error" ? (
+                  <div className="source-detail-status is-error" role="status">
+                    <span>{generatedStatus.message}</span>
+                    <button type="button" onClick={() => setGeneratedRetry((value) => value + 1)}>
+                      Retry
+                    </button>
+                  </div>
+                ) : generatedCode ? (
+                  <CoverageCode code={generatedCode} />
+                ) : null}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="source-columns">
+                <span>Line</span>
+                <span>Source</span>
+              </div>
+              <search className="code-search-toolbar" aria-label="Search source code">
+                <input
+                  ref={searchInputRef}
+                  type="search"
+                  aria-label="Search source code"
+                  placeholder="Search in file…"
+                  value={searchQuery}
+                  onChange={(event) => {
+                    setSearchQuery(event.target.value);
+                    setSearchIndex(0);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      moveSearch(event.shiftKey ? -1 : 1);
+                    } else if (event.key === "Escape") {
+                      setSearchQuery("");
+                      setSearchIndex(0);
+                    }
+                  }}
+                />
+                <span className="code-search-status" aria-live="polite">
+                  {searchQuery
+                    ? sourceSearch.matches.length
+                      ? `${activeSearchIndex + 1} / ${sourceSearch.matches.length}${sourceSearch.truncated ? "+" : ""}`
+                      : "No matches"
+                    : "⌘F"}
+                </span>
+                <button
+                  type="button"
+                  aria-label="Previous search match"
+                  disabled={sourceSearch.matches.length === 0}
+                  onClick={() => moveSearch(-1)}
+                >
+                  ↑
+                </button>
+                <button
+                  type="button"
+                  aria-label="Next search match"
+                  disabled={sourceSearch.matches.length === 0}
+                  onClick={() => moveSearch(1)}
+                >
+                  ↓
+                </button>
+                <button
+                  type="button"
+                  className="code-wrap-toggle"
+                  aria-pressed={wrapLines}
+                  onClick={() => setWrapLines((current) => !current)}
+                >
+                  Wrap lines
+                </button>
+              </search>
+              <div className={`source-scroll ${wrapLines ? "is-wrapped" : ""}`} ref={scrollRef}>
+                {detailStatus?.status === "loading" ? (
+                  <div className="source-detail-status" aria-live="polite">
+                    <span className="spinner" /> Loading source details from Node…
+                  </div>
+                ) : detailStatus?.status === "error" ? (
+                  <div className="source-detail-status is-error" role="status">
+                    <span>{detailStatus.message}</span>
+                    <button type="button" onClick={() => setDetailRetry((value) => value + 1)}>
+                      Retry
+                    </button>
+                  </div>
+                ) : null}
+                <div
+                  className="virtual-canvas"
+                  style={{ height: `${virtualizer.getTotalSize()}px` }}
+                >
+                  {virtualizer.getVirtualItems().map((virtualRow) => {
+                    const line = lines[virtualRow.index];
+                    if (!line) return null;
+                    return (
+                      <div
+                        className={`source-line build-${line.buildState} runtime-${line.runtimeState} ${activeSearchMatch?.line === line.line ? "is-search-active" : ""}`}
+                        data-index={virtualRow.index}
+                        key={line.line}
+                        ref={virtualizer.measureElement}
+                        style={{ transform: `translateY(${virtualRow.start}px)` }}
+                        title={`${buildLabel(line)} · generated ${formatBytes(line.emittedBytes)} · executed ${formatBytes(line.executedBytes)} · chunks ${line.chunks.join(", ") || "none"}`}
+                      >
+                        <span className="line-number">{line.line}</span>
+                        <SourceCode
+                          text={line.text || " "}
+                          status={sourceLineCoverageStatus(line)}
+                          markers={markerLines.get(line.line) ?? []}
+                          onMarkerClick={openDependencyGraph}
+                          activeExportId={activeExportId}
+                          searchMatches={searchMatchesByLine.get(line.line) ?? []}
+                          activeSearchIndex={activeSearchIndex}
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </>
+          )}
           {moduleId ? (
             <div className="export-dependency-graph">
               <ReferencePanel
+                key={activeExport?.id ?? "reference-panel"}
                 exportUsage={activeExport}
                 moduleInstance={activeModuleInstance}
                 references={references}
@@ -709,6 +938,7 @@ export function SourceDrawer(props: {
                 snippetFlashKey={snippetFlashKey}
                 onDirectionChange={(nextDirection) => {
                   if (nextDirection === direction) return;
+                  snippetRequestRef.current += 1;
                   setDirection(nextDirection);
                   setReferences((current) =>
                     current
@@ -726,7 +956,17 @@ export function SourceDrawer(props: {
                   setReferenceError(null);
                 }}
                 onSelectEdge={(edgeId) => {
+                  const request = ++snippetRequestRef.current;
                   void loadReferenceSnippet(edgeId).then((next) => {
+                    if (snippetRequestRef.current !== request) return;
+                    setSnippet(next);
+                    setSnippetFlashKey((value) => value + 1);
+                  });
+                }}
+                onSelectCarrier={(carrierModuleId, exportedName) => {
+                  const request = ++snippetRequestRef.current;
+                  void loadExportDeclaration(carrierModuleId, exportedName).then((next) => {
+                    if (snippetRequestRef.current !== request) return;
                     setSnippet(next);
                     setSnippetFlashKey((value) => value + 1);
                   });
@@ -739,6 +979,7 @@ export function SourceDrawer(props: {
                   );
                 }}
                 onModuleChange={(nextModuleId) => {
+                  snippetRequestRef.current += 1;
                   setModuleId(nextModuleId);
                   setDirection("in");
                   setReferences(null);
@@ -751,17 +992,30 @@ export function SourceDrawer(props: {
                   history.replaceState(null, "", url);
                 }}
                 onClose={closeDependencyGraph}
-                onCloseSnippet={() => setSnippet(null)}
+                onCloseSnippet={() => {
+                  snippetRequestRef.current += 1;
+                  setSnippet(null);
+                }}
               />
             </div>
           ) : null}
         </div>
         <footer>
-          Module sizes count retained original-source UTF-8 bytes once, so generated/minified output
-          cannot inflate this module. Unused excludes source lines removed from the final build and
-          code in chunks that were not loaded. Exports with a captured module instance are
-          clickable. The importer chain and module graph retain separate usage evidence; green and
-          red remain runtime Coverage states.
+          {generatedFallback ? (
+            <>
+              This synthetic file groups bytes that the final source map cannot attribute to a
+              stable original source. The containing final asset is loaded on demand and paged; only
+              unmapped bytes receive runtime Coverage colors, while mapped code stays neutral.
+            </>
+          ) : (
+            <>
+              Module sizes count retained original-source UTF-8 bytes once, so generated/minified
+              output cannot inflate this module. Unused excludes source lines removed from the final
+              build and code in chunks that were not loaded. Exports with a captured module instance
+              are clickable. The importer chain and module graph retain separate usage evidence;
+              green and red remain runtime Coverage states.
+            </>
+          )}
         </footer>
       </aside>
     </div>

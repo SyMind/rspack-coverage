@@ -71,6 +71,8 @@ export interface AnalysisCapabilities {
   usedExports: "enabled" | "disabled" | "unknown";
   sourceMap: "full" | "line-only" | "none";
   originalLocations: "exact" | "line-only" | "unavailable";
+  /** Whether transitive export ownership came from Rspack's native usage graph. */
+  exportUsageGraph?: "native" | "source-inferred" | "unavailable";
 }
 
 export interface ReferenceLocation {
@@ -133,6 +135,7 @@ export interface BuildManifest {
     modules: number;
     sourceMaps: number;
     references?: number;
+    exportUsageEdges?: number;
     codeGenerationSources?: number;
   };
   previewAvailable: boolean;
@@ -163,6 +166,10 @@ export interface BuildSnapshot {
   referenceStore?: BuildReferenceStore;
   /** Disk-backed export graph access used by persisted snapshots. */
   exportGraphStore?: ExportGraphStore;
+  /** Minimal native export-usage edges retained independently from the module graph. */
+  exportUsageEdges?: ExportUsageEdge[];
+  /** Disk-backed export-usage access used by captured and persisted snapshots. */
+  exportUsageStore?: ExportUsageStore;
   codeGeneration: ReadonlyMap<string, ModuleCodeGeneration[]>;
   loadCodeGeneration?: (moduleId: string) => ModuleCodeGeneration[];
   /** Release a lazily materialized code-generation record after it has been persisted. */
@@ -200,6 +207,40 @@ export interface ExportGraphStore {
   getModule(moduleId: string): ExportGraphModule | undefined;
   moduleIdsForSource(source: string): string[];
   edgesForTargets(targetModuleIds: ReadonlySet<string>): ExportReferenceEdge[];
+}
+
+export interface ExportUsageEdge {
+  id: string;
+  /** Rspack dependency identity shared by carrier exports at one use site. */
+  dependencyId: string;
+  /** Consumer/importer module. */
+  originModuleId: string;
+  /** Export of the consumer that carries the value further, or null for module execution. */
+  originExport: string[] | null;
+  /** Provider/importee module. */
+  targetModuleId: string;
+  /** Export consumed from the provider. */
+  targetExport: string[] | null;
+  /** Post-loader location reported by Rspack. */
+  location: ReferenceLocation | null;
+  /** Original source and location after tracing the consumer's loader source map. */
+  sourcePath?: string | null;
+  sourceLocation?: ReferenceLocation | null;
+}
+
+export interface ExportUsageStore {
+  readonly size: number;
+  get(id: string): ExportUsageEdge | undefined;
+  /** Count edges whose target export is this path or one of its member paths. */
+  countTarget(moduleId: string, exportPath: readonly string[]): number;
+  /** Page edges whose target export is this path or one of its member paths. */
+  pageTarget(
+    moduleId: string,
+    exportPath: readonly string[],
+    cursor: number,
+    limit: number,
+  ): ExportUsageEdge[];
+  entries(): IterableIterator<ExportUsageEdge>;
 }
 
 export type CodeCoverageState =
@@ -278,28 +319,49 @@ export interface ModuleReferencesResponse {
   entryPath: BuildModule[];
 }
 
+export interface ExportImporterBinding {
+  exportedName: string;
+  localName: string | null;
+  exportPath?: string[];
+  declaration?: {
+    sourcePath: string;
+    range: ReferenceLocation;
+  } | null;
+}
+
 export interface ExportImporterChainStep {
   id: string;
   parentId: string | null;
   depth: number;
   /** Export consumed from the target module at this hop. */
   importedExport: string;
+  /** Source-level name carried by the target export, when its source was captured. */
+  importedBinding: ExportImporterBinding;
   /** Used exports of the importer that can carry this dependency further upstream. */
   importerExports: string[];
+  /** Source-level names for the importer exports that carry the chain upstream. */
+  importerBindings: ExportImporterBinding[];
   relationPrecision: "exact" | "conservative" | "unavailable";
+  /** Native usage edge used to open the exact consumer location. */
+  usageEdgeId?: string;
   edge: ReferenceEdgeReport;
 }
 
 export interface ExportImporterChainResponse {
   module: BuildModule;
   exportedName: string;
+  binding: ExportImporterBinding;
   steps: ExportImporterChainStep[];
+  precision?: "native" | "source-inferred";
+  diagnostics?: string[];
   truncated: boolean;
   maxDepth: number;
 }
 
 export interface ReferenceSnippetResponse {
   edge: BuildReference;
+  kind?: "usage" | "declaration";
+  title?: string;
   available: boolean;
   gap: string | null;
   /** Full source code with the same Coverage evidence used by the source detail panel. */

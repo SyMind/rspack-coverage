@@ -76,6 +76,7 @@ function snapshot(context: string, builtAt: number, loadCodeGeneration = vi.fn()
         usedExports: "enabled",
         sourceMap: "full",
         originalLocations: "exact",
+        exportUsageGraph: "native",
       },
       counts: {
         assets: 2,
@@ -84,6 +85,7 @@ function snapshot(context: string, builtAt: number, loadCodeGeneration = vi.fn()
         modules: 1,
         sourceMaps: 1,
         references: 1,
+        exportUsageEdges: 1,
       },
       previewAvailable: true,
       publicPathSupported: true,
@@ -134,6 +136,22 @@ function snapshot(context: string, builtAt: number, loadCodeGeneration = vi.fn()
         exports: ["value"],
         active: true,
         location: null,
+      },
+    ],
+    exportUsageEdges: [
+      {
+        id: "usage-edge",
+        dependencyId: "dependency-1",
+        originModuleId: "module",
+        originExport: ["value"],
+        targetModuleId: "module",
+        targetExport: ["value", "field"],
+        location: { start: { line: 1, column: 13 }, end: { line: 1, column: 18 } },
+        sourcePath: "src/index.js",
+        sourceLocation: {
+          start: { line: 1, column: 13 },
+          end: { line: 1, column: 18 },
+        },
       },
     ],
     codeGeneration: new Map(),
@@ -208,6 +226,9 @@ describe("persistent build snapshots", () => {
     ).toEqual(["value"]);
     expect(loaded.referenceStore?.get("reference")?.id).toBe("reference");
     expect(loaded.referenceStore?.page("module", "in", 0, 10)).toHaveLength(1);
+    expect(loaded.exportUsageStore?.countTarget("module", ["value"])).toBe(1);
+    expect(loaded.exportUsageStore?.countTarget("module", ["value", "field"])).toBe(1);
+    expect(loaded.exportUsageStore?.get("usage-edge")?.originExport).toEqual(["value"]);
     loaded.dispose?.();
   });
 

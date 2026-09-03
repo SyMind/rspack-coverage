@@ -1,5 +1,6 @@
 import type {
   BuildManifest,
+  CodeViewResponse,
   CoverageAnalysisStatus,
   CoverageImportSummary,
   ExportImporterChainResponse,
@@ -95,6 +96,27 @@ export async function loadCoverageSource(
   )) as SourceFileDetail;
 }
 
+export async function loadGeneratedSource(
+  buildHash: string,
+  fileId: string,
+  offset = 0,
+  limit = 240_000,
+  signal?: AbortSignal,
+  attempt = 0,
+): Promise<CodeViewResponse> {
+  const search = new URLSearchParams({
+    buildHash,
+    fileId,
+    offset: String(offset),
+    limit: String(limit),
+    attempt: String(attempt),
+  });
+  return (await request(
+    `/coverage-analysis/generated-source?${search}`,
+    signal ? { signal } : {},
+  ).then((response) => response.json())) as CodeViewResponse;
+}
+
 export async function startCoverageAnalysis(
   buildHash: string,
   precision: CoverageImportSummary["precision"],
@@ -142,4 +164,30 @@ export async function loadReferenceSnippet(referenceId: string): Promise<Referen
   return (await request(`/references/${encodeURIComponent(referenceId)}/snippet`).then((response) =>
     response.json(),
   )) as ReferenceSnippetResponse;
+}
+
+export async function loadExportDeclaration(
+  moduleId: string,
+  exportedName: string,
+): Promise<ReferenceSnippetResponse> {
+  const search = new URLSearchParams({ export: exportedName });
+  return (await request(
+    `/modules/${encodeURIComponent(moduleId)}/export-declaration?${search}`,
+  ).then((response) => response.json())) as ReferenceSnippetResponse;
+}
+
+export async function openInEditor(input: {
+  moduleId: string;
+  sourceId: string | null;
+  line?: number;
+  column?: number;
+}): Promise<{ opened: boolean; method: string | null; url: string }> {
+  return (await request("/open-in-editor", {
+    method: "POST",
+    body: JSON.stringify(input),
+  }).then((response) => response.json())) as {
+    opened: boolean;
+    method: string | null;
+    url: string;
+  };
 }

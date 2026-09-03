@@ -7,6 +7,7 @@ import { openBrowser } from "../server/openBrowser.js";
 import { persistBuildSnapshot, resolveCoverageDataDirectory } from "../server/snapshotStorage.js";
 import { assertSnapshotRecordSize } from "../shared/snapshotLimits.js";
 import type { BuildSnapshot } from "../shared/types.js";
+import { NativeExportUsageCapture } from "./exportUsageCapture.js";
 import { createBuildSnapshot, type PrivateSourceMapCapture } from "./snapshot.js";
 import type { ResolvedRspackCoveragePluginOptions, RspackCoveragePluginOptions } from "./types.js";
 
@@ -129,6 +130,7 @@ export class RspackCoveragePlugin {
   #server: AnalysisServer | null = null;
   #opened = false;
   #privateMaps = new WeakMap<object, PrivateSourceMapCapture>();
+  #exportUsageCaptures = new WeakMap<object, NativeExportUsageCapture>();
 
   constructor(options: RspackCoveragePluginOptions = {}) {
     this.#options = resolveOptions(options);
@@ -138,6 +140,42 @@ export class RspackCoveragePlugin {
   apply(compiler: Compiler): void {
     if (process.env.CI === "true") return;
     const dataDirectory = resolveCoverageDataDirectory(compiler.context, this.#dataDir);
+
+    const RsdoctorPlugin = (compiler.webpack as any).experiments?.RsdoctorPlugin as
+      | {
+          new (options: Record<string, unknown>): { apply(compiler: Compiler): void };
+          getCompilationHooks(compilation: object): {
+            moduleGraph: {
+              tapPromise(name: string, handler: (data: unknown) => Promise<void>): void;
+            };
+          };
+        }
+      | undefined;
+    if (RsdoctorPlugin?.getCompilationHooks) {
+      new RsdoctorPlugin({
+        moduleGraphFeatures: ["graph"],
+        chunkGraphFeatures: false,
+        exportUsageGraph: true,
+      }).apply(compiler);
+      compiler.hooks.thisCompilation.tap(PLUGIN_NAME, (compilation) => {
+        const capture = new NativeExportUsageCapture();
+        this.#exportUsageCaptures.set(compilation, capture);
+        RsdoctorPlugin.getCompilationHooks(compilation).moduleGraph.tapPromise(
+          PLUGIN_NAME,
+          async (data) => {
+            try {
+              capture.capture(data as Parameters<NativeExportUsageCapture["capture"]>[0]);
+            } catch (error) {
+              compilation.warnings.push(
+                new Error(
+                  `Rspack Coverage could not retain the native export-usage graph: ${String(error)}`,
+                ),
+              );
+            }
+          },
+        );
+      });
+    }
 
     const configurationChanges = enableRequiredConfiguration(compiler);
     if (!hasUsableFullSourceMap(compiler.options.devtool)) {
@@ -214,14 +252,17 @@ export class RspackCoveragePlugin {
 
     compiler.hooks.done.tapPromise(PLUGIN_NAME, async (stats: Stats) => {
       const privateMaps = this.#privateMaps.get(stats.compilation);
+      const exportUsageCapture = this.#exportUsageCaptures.get(stats.compilation);
       let capturedSnapshot: BuildSnapshot;
       try {
-        capturedSnapshot = createBuildSnapshot(stats, compiler, privateMaps);
+        capturedSnapshot = createBuildSnapshot(stats, compiler, privateMaps, exportUsageCapture);
       } catch (error) {
         privateMaps?.dispose();
         throw error;
       } finally {
         this.#privateMaps.delete(stats.compilation);
+        exportUsageCapture?.dispose();
+        this.#exportUsageCaptures.delete(stats.compilation);
       }
       let snapshot = capturedSnapshot;
       if (dataDirectory && !stats.hasErrors()) {

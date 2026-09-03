@@ -14,16 +14,19 @@ import type {
   BuildManifest,
   BuildModule,
   BuildSnapshot,
+  ExportUsageEdge,
   ModuleCodeGeneration,
   RawSourceMapPayload,
   ReferenceLocation,
 } from "../shared/types.js";
 import {
   CapturePayloadStore,
+  type MutableCaptureExportUsageStore,
   type MutableCaptureReferenceStore,
   type MutableCaptureSourceMap,
 } from "./captureStore.js";
 import { collectExportGraph } from "./exportGraph.js";
+import type { NativeExportUsageCapture } from "./exportUsageCapture.js";
 
 export interface PrivateSourceMapCapture {
   maps: Map<string, RawSourceMapPayload | Buffer | string | { kind: "file"; path: string }>;
@@ -539,6 +542,20 @@ function buildModuleFor(module: any, lookup: Map<string, BuildModule[]>): BuildM
   );
 }
 
+function buildModuleForIdentifier(
+  identifier: string,
+  layer: string | null,
+  lookup: Map<string, BuildModule[]>,
+): BuildModule | null {
+  const candidates = lookup.get(identifier) ?? [];
+  if (candidates.length <= 1) return candidates[0] ?? null;
+  return (
+    candidates.find((candidate) => String(candidate.layer ?? "") === String(layer ?? "")) ??
+    candidates[0] ??
+    null
+  );
+}
+
 function addMissingNestedModules(
   compilation: Stats["compilation"],
   records: RawModuleRecord[],
@@ -656,6 +673,20 @@ function normalizeLocation(value: any): ReferenceLocation | null {
       column: Math.max(start.column + 1, rawEndColumn - 1),
     },
   };
+}
+
+function parseRspackLocation(value: string | null): ReferenceLocation | null {
+  if (!value) return null;
+  const match = /^(\d+):(\d+)(?:-(?:(\d+):)?(\d+))?$/.exec(value.trim());
+  if (!match) return null;
+  const startLine = Number(match[1]);
+  const startColumn = Number(match[2]);
+  const endLine = match[3] ? Number(match[3]) : startLine;
+  const endColumn = match[4] ? Number(match[4]) : startColumn + 1;
+  return normalizeLocation({
+    start: { line: startLine, column: startColumn },
+    end: { line: endLine, column: endColumn },
+  });
 }
 
 function tracedSourceName(captured: CapturedModuleSource, resolvedSource: string): string | null {
@@ -795,6 +826,75 @@ function collectReferences(
   references.finish();
 }
 
+function collectExportUsageEdges(
+  capture: NativeExportUsageCapture | undefined,
+  records: RawModuleRecord[],
+  lookup: Map<string, BuildModule[]>,
+  originalSources: OriginalSourceCapture,
+  store: MutableCaptureExportUsageStore,
+): { unmapped: number } {
+  if (!capture?.available) {
+    store.finish();
+    return { unmapped: 0 };
+  }
+  const rawLookup = new Map<string, RawModuleRecord[]>();
+  for (const record of records) {
+    const identifier = moduleIdentifier(record.module);
+    const candidates = rawLookup.get(identifier) ?? [];
+    candidates.push(record);
+    rawLookup.set(identifier, candidates);
+  }
+  const rawModuleFor = (identifier: string, layer: string | null): any | null => {
+    const candidates = rawLookup.get(identifier) ?? [];
+    if (candidates.length <= 1) return candidates[0]?.module ?? null;
+    return (
+      candidates.find(
+        (candidate) => String(safeCall(() => candidate.module.layer, "") ?? "") === (layer ?? ""),
+      )?.module ??
+      candidates[0]?.module ??
+      null
+    );
+  };
+
+  let activeRawOrigin: any | null = null;
+  let activeCapturedOrigin: CapturedModuleSource | null = null;
+  let unmapped = 0;
+  for (const rawEdge of capture.entries()) {
+    const origin = buildModuleForIdentifier(rawEdge.originIdentifier, rawEdge.originLayer, lookup);
+    const target = buildModuleForIdentifier(rawEdge.targetIdentifier, rawEdge.targetLayer, lookup);
+    if (!origin || !target) {
+      unmapped += 1;
+      continue;
+    }
+    const rawOrigin = rawModuleFor(rawEdge.originIdentifier, rawEdge.originLayer);
+    if (rawOrigin !== activeRawOrigin) {
+      if (activeRawOrigin) originalSources.release(activeRawOrigin);
+      activeRawOrigin = rawOrigin;
+      activeCapturedOrigin = rawOrigin ? originalSources.capture(rawOrigin, origin) : null;
+    }
+    const location = parseRspackLocation(rawEdge.location);
+    const traced = traceReferenceLocation(activeCapturedOrigin, location);
+    const identity = `${origin.id}\0${JSON.stringify(rawEdge.originExport)}\0${target.id}\0${JSON.stringify(
+      rawEdge.targetExport,
+    )}\0${rawEdge.dependencyId}\0${JSON.stringify(location)}`;
+    const edge: ExportUsageEdge = {
+      id: `usage_${shortHash(identity)}`,
+      dependencyId: rawEdge.dependencyId,
+      originModuleId: origin.id,
+      originExport: rawEdge.originExport,
+      targetModuleId: target.id,
+      targetExport: rawEdge.targetExport,
+      location,
+      sourcePath: traced?.sourcePath ?? origin.resource,
+      sourceLocation: traced?.sourceLocation ?? location,
+    };
+    store.add(edge);
+  }
+  if (activeRawOrigin) originalSources.release(activeRawOrigin);
+  store.finish();
+  return { unmapped };
+}
+
 function moduleRuntimeSpecs(compilation: Stats["compilation"], module: any): string[][] {
   const chunks = safeCall(
     () => asArray((compilation.chunkGraph as any).getModuleChunksIterable(module)),
@@ -905,7 +1005,11 @@ function createCodeGenerationStore(
   };
 }
 
-function capabilities(compiler: Compiler, sourceMapCount: number): AnalysisCapabilities {
+function capabilities(
+  compiler: Compiler,
+  sourceMapCount: number,
+  nativeExportUsage: boolean,
+): AnalysisCapabilities {
   const usedExports = compiler.options.optimization?.usedExports;
   const devtool = compiler.options.devtool;
   const sourceMap =
@@ -924,6 +1028,7 @@ function capabilities(compiler: Compiler, sourceMapCount: number): AnalysisCapab
     sourceMap,
     originalLocations:
       sourceMap === "full" ? "exact" : sourceMap === "line-only" ? "line-only" : "unavailable",
+    exportUsageGraph: nativeExportUsage ? "native" : "source-inferred",
   };
 }
 
@@ -949,6 +1054,7 @@ export function createBuildSnapshot(
   privateMapCapture:
     | PrivateSourceMapCapture
     | Map<string, RawSourceMapPayload | Buffer | string> = new Map(),
+  exportUsageCapture?: NativeExportUsageCapture,
 ): BuildSnapshot {
   const privateMaps = privateMapCapture instanceof Map ? privateMapCapture : privateMapCapture.maps;
   const compilation = stats.compilation;
@@ -1060,6 +1166,13 @@ export function createBuildSnapshot(
       originalSources,
       captureStore.references,
     );
+    const exportUsageResult = collectExportUsageEdges(
+      exportUsageCapture,
+      rawModuleRecords,
+      modulesByIdentifier,
+      originalSources,
+      captureStore.exportUsage,
+    );
     const codeGenerationStore = createCodeGenerationStore(
       compilation,
       rawModuleRecords,
@@ -1106,6 +1219,14 @@ export function createBuildSnapshot(
           "Absolute CDN publicPath is not supported by the local preview. Use publicPath: 'auto', a relative path, or a local path for the analysis build.",
       });
     }
+    const discardedExportUsageEdges =
+      (exportUsageCapture?.discarded ?? 0) + exportUsageResult.unmapped;
+    if (discardedExportUsageEdges > 0) {
+      diagnostics.push({
+        severity: "warning",
+        message: `Rspack Coverage skipped ${discardedExportUsageEdges.toLocaleString()} malformed or unmapped native export-usage edge(s).`,
+      });
+    }
 
     const htmlAssets = compilation
       .getAssets()
@@ -1128,7 +1249,7 @@ export function createBuildSnapshot(
       modules,
       entrypoints: collectEntrypoints(json.entrypoints),
       diagnostics,
-      capabilities: capabilities(compiler, maps.size),
+      capabilities: capabilities(compiler, maps.size, Boolean(exportUsageCapture?.available)),
       counts: {
         assets: compilation.getAssets().length,
         javascriptAssets: manifestAssets.length,
@@ -1136,6 +1257,7 @@ export function createBuildSnapshot(
         modules: modules.length,
         sourceMaps: maps.size,
         references: captureStore.references.size,
+        exportUsageEdges: captureStore.exportUsage.size,
       },
       previewAvailable:
         !stats.hasErrors() &&
@@ -1153,6 +1275,8 @@ export function createBuildSnapshot(
       exportGraph,
       references: [],
       referenceStore: captureStore.references,
+      exportUsageEdges: [],
+      exportUsageStore: captureStore.exportUsage,
       codeGeneration: codeGenerationStore.cache,
       loadCodeGeneration: codeGenerationStore.load,
       releaseCodeGeneration: codeGenerationStore.release,

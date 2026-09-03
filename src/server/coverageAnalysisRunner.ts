@@ -1,11 +1,16 @@
 import { type FileHandle, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
-import { analyzeCoverage, type StoredSourceFileDetail } from "../analyzer/analyze.js";
+import {
+  analyzeCoverage,
+  matchCoverage,
+  type StoredSourceFileDetail,
+} from "../analyzer/analyze.js";
 import { assertSnapshotRecordSize, MAX_COVERAGE_ANALYSIS_BYTES } from "../shared/snapshotLimits.js";
 import type {
   BuildManifest,
   ChromeCoverageEntry,
+  ChromeCoverageRange,
   CoverageAnalysisStatus,
   CoverageImportSummary,
   CoverageReport,
@@ -124,6 +129,26 @@ export interface CoverageAnalysisWorkerData {
   detailsFile: string;
   detailsIndexFile: string;
   precision: CoverageImportSummary["precision"];
+}
+
+export interface CoverageRangeIndexWorkerData {
+  kind: "coverage-range-index";
+  build: Pick<BuildManifest, "hash" | "assets">;
+  recordingFile: string;
+}
+
+export type CoverageRangeIndex = Array<[assetId: string, ranges: ChromeCoverageRange[]]>;
+
+export async function loadCoverageRangeIndex(
+  input: CoverageRangeIndexWorkerData,
+): Promise<CoverageRangeIndex> {
+  if ((await stat(input.recordingFile)).size > MAX_COVERAGE_ANALYSIS_BYTES) {
+    throw new Error("Coverage JSON exceeds the 128 MiB in-memory analysis guard.");
+  }
+  const coverage = JSON.parse(await readFile(input.recordingFile, "utf8")) as unknown;
+  if (!Array.isArray(coverage)) throw new Error("Chrome Coverage JSON must contain an array.");
+  const { matched } = await matchCoverage(input.build, coverage as ChromeCoverageEntry[]);
+  return [...matched].map(([assetId, entry]) => [assetId, entry.ranges]);
 }
 
 function stagedFile(directory: string, value: string): string {

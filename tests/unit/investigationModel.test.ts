@@ -296,6 +296,15 @@ describe("InvestigationModel", () => {
     };
     const build = snapshot([]);
     build.manifest.modules = [target, suite, barrel, entry];
+    build.originalSources = new Map([
+      ["app-config.js", "export function createWebAppConfigImpl() {}"],
+      [
+        "suite.js",
+        'import { createWebAppConfigImpl } from "./app-config.js"; export function createWebSuite() { return createWebAppConfigImpl(); }',
+      ],
+      ["index.js", 'export { createWebSuite } from "./suite.js";'],
+      ["entry.js", 'import { createWebSuite } from "./index.js"; createWebSuite();'],
+    ]);
     const edge = (
       id: string,
       originId: string,
@@ -314,7 +323,14 @@ describe("InvestigationModel", () => {
       location: null,
     });
     build.references = [
-      edge("suite-app-config", "suite", "target", ["createWebAppConfigImpl"]),
+      edge(
+        "suite-app-config",
+        "suite",
+        "target",
+        ["createWebAppConfigImpl"],
+        true,
+        "./app-config.js",
+      ),
       edge("barrel-app-config-generic", "barrel", "target", null, true, "./app-config.js"),
       edge(
         "barrel-app-config-inactive",
@@ -324,8 +340,8 @@ describe("InvestigationModel", () => {
         false,
         "./app-config.js",
       ),
-      edge("barrel-suite", "barrel", "suite", ["createWebSuite"]),
-      edge("entry-barrel", "entry", "barrel", ["createWebSuite"]),
+      edge("barrel-suite", "barrel", "suite", ["createWebSuite"], true, "./suite.js"),
+      edge("entry-barrel", "entry", "barrel", ["createWebSuite"], true, "./index.js"),
     ];
     const model = new InvestigationModel(build);
 
@@ -335,29 +351,384 @@ describe("InvestigationModel", () => {
         edge: step.edge.id,
         depth: step.depth,
         importedExport: step.importedExport,
+        importedBinding: {
+          exportedName: step.importedBinding.exportedName,
+          localName: step.importedBinding.localName,
+        },
         importerExports: step.importerExports,
+        importerBindings: step.importerBindings.map(({ exportedName, localName }) => ({
+          exportedName,
+          localName,
+        })),
       })),
     ).toEqual([
       {
         edge: "suite-app-config",
         depth: 1,
         importedExport: "createWebAppConfigImpl",
+        importedBinding: {
+          exportedName: "createWebAppConfigImpl",
+          localName: "createWebAppConfigImpl",
+        },
         importerExports: ["createWebSuite"],
+        importerBindings: [{ exportedName: "createWebSuite", localName: "createWebSuite" }],
       },
       {
         edge: "barrel-suite",
         depth: 2,
         importedExport: "createWebSuite",
+        importedBinding: { exportedName: "createWebSuite", localName: "createWebSuite" },
         importerExports: ["createWebSuite"],
+        importerBindings: [{ exportedName: "createWebSuite", localName: "createWebSuite" }],
       },
       {
         edge: "entry-barrel",
         depth: 3,
         importedExport: "createWebSuite",
+        importedBinding: { exportedName: "createWebSuite", localName: "createWebSuite" },
         importerExports: [],
+        importerBindings: [],
       },
     ]);
+    expect(chain?.binding).toMatchObject({
+      exportedName: "createWebAppConfigImpl",
+      localName: "createWebAppConfigImpl",
+    });
     expect(chain?.truncated).toBe(false);
+  });
+
+  it("continues only through the importer export that contains the imported binding use", () => {
+    const base = manifest().modules.find((module) => module.id === "target") as BuildModule;
+    const event: BuildModule = {
+      ...base,
+      id: "event",
+      identifier: "/project/event.ts",
+      name: "./event.ts",
+      resource: "/project/event.ts",
+      usedExports: ["messageRenderEvent"],
+      providedExports: ["messageRenderEvent"],
+    };
+    const messageCount: BuildModule = {
+      ...base,
+      id: "message-count",
+      identifier: "/project/message-count.ts",
+      name: "./message-count.ts",
+      resource: "/project/message-count.ts",
+      usedExports: ["clearState", "setThreshold", "startWatch"],
+      providedExports: ["clearState", "setThreshold", "startWatch"],
+    };
+    const consumer = (id: string): BuildModule => ({
+      ...base,
+      id,
+      identifier: `/project/${id}.ts`,
+      name: `./${id}.ts`,
+      resource: `/project/${id}.ts`,
+      entry: true,
+      usedExports: true,
+      providedExports: null,
+    });
+    const build = snapshot([]);
+    build.manifest.modules = [
+      event,
+      messageCount,
+      consumer("start-consumer"),
+      consumer("clear-consumer"),
+      consumer("threshold-consumer"),
+    ];
+    build.originalSources = new Map([
+      ["event.ts", "export const messageRenderEvent = createEvent();"],
+      [
+        "message-count.ts",
+        [
+          'import { messageRenderEvent } from "./event";',
+          "export const setThreshold = () => {};",
+          "export const startWatch = () => {",
+          '  messageRenderEvent.on("rendered", () => {});',
+          "};",
+          "export const clearState = () => {};",
+        ].join("\n"),
+      ],
+    ]);
+    build.references = [
+      {
+        id: "message-count-event",
+        originId: "message-count",
+        targetId: "event",
+        dependencyType: "esm import specifier",
+        request: "./event",
+        exports: ["messageRenderEvent", "on"],
+        active: true,
+        location: null,
+        sourcePath: "/project/message-count.ts",
+        // Deliberately stale: carrier inference must follow the imported binding use.
+        sourceLocation: {
+          start: { line: 2, column: 0 },
+          end: { line: 2, column: 10 },
+        },
+      },
+      {
+        id: "start-message-count",
+        originId: "start-consumer",
+        targetId: "message-count",
+        dependencyType: "esm import specifier",
+        request: "./message-count",
+        exports: ["startWatch"],
+        active: true,
+        location: null,
+      },
+      {
+        id: "clear-message-count",
+        originId: "clear-consumer",
+        targetId: "message-count",
+        dependencyType: "esm import specifier",
+        request: "./message-count",
+        exports: ["clearState"],
+        active: true,
+        location: null,
+      },
+      {
+        id: "threshold-message-count",
+        originId: "threshold-consumer",
+        targetId: "message-count",
+        dependencyType: "esm import specifier",
+        request: "./message-count",
+        exports: ["setThreshold"],
+        active: true,
+        location: null,
+      },
+    ];
+
+    const chain = new InvestigationModel(build).exportImporterChain("event", "messageRenderEvent");
+
+    expect(
+      chain?.steps.map((step) => ({
+        edge: step.edge.id,
+        importedExport: step.importedExport,
+        importerExports: step.importerExports,
+        precision: step.relationPrecision,
+      })),
+    ).toEqual([
+      {
+        edge: "message-count-event",
+        importedExport: "messageRenderEvent",
+        importerExports: ["startWatch"],
+        precision: "exact",
+      },
+      {
+        edge: "start-message-count",
+        importedExport: "startWatch",
+        importerExports: [],
+        precision: "unavailable",
+      },
+    ]);
+  });
+
+  it("keeps default-export class names visible across importer hops", () => {
+    const base = manifest().modules.find((module) => module.id === "target") as BuildModule;
+    const foundation: BuildModule = {
+      ...base,
+      id: "foundation",
+      identifier: "/project/foundation.js",
+      name: "./foundation.js",
+      resource: "/project/foundation.js",
+      usedExports: ["default"],
+      providedExports: ["default"],
+    };
+    const inner: BuildModule = {
+      ...foundation,
+      id: "inner",
+      identifier: "/project/inner.js",
+      name: "./inner.js",
+      resource: "/project/inner.js",
+    };
+    const preview: BuildModule = {
+      ...foundation,
+      id: "preview",
+      identifier: "/project/preview.js",
+      name: "./preview.js",
+      resource: "/project/preview.js",
+    };
+    const build = snapshot([]);
+    build.manifest.modules = [foundation, inner, preview];
+    build.originalSources = new Map([
+      ["foundation.js", "export default class PreviewInnerFoundation {}"],
+      [
+        "inner.js",
+        'import PreviewInnerFoundation from "./foundation.js"; export default class PreviewInner extends PreviewInnerFoundation {}',
+      ],
+      [
+        "preview.js",
+        'import PreviewInner from "./inner.js"; export default class Preview extends PreviewInner {}',
+      ],
+    ]);
+    build.references = [
+      {
+        id: "inner-foundation",
+        originId: "inner",
+        targetId: "foundation",
+        dependencyType: "esm import specifier",
+        request: "./foundation.js",
+        exports: ["default"],
+        active: true,
+        location: null,
+      },
+      {
+        id: "preview-inner",
+        originId: "preview",
+        targetId: "inner",
+        dependencyType: "esm import specifier",
+        request: "./inner.js",
+        exports: ["default"],
+        active: true,
+        location: null,
+      },
+    ];
+
+    const chain = new InvestigationModel(build).exportImporterChain("foundation", "default");
+
+    expect(chain?.binding).toMatchObject({
+      exportedName: "default",
+      localName: "PreviewInnerFoundation",
+    });
+    expect(
+      chain?.steps.map((step) => ({
+        parentId: step.parentId,
+        imported: {
+          exportedName: step.importedBinding.exportedName,
+          localName: step.importedBinding.localName,
+        },
+        carriers: step.importerBindings.map(({ exportedName, localName }) => ({
+          exportedName,
+          localName,
+        })),
+      })),
+    ).toEqual([
+      {
+        parentId: null,
+        imported: { exportedName: "default", localName: "PreviewInnerFoundation" },
+        carriers: [{ exportedName: "default", localName: "PreviewInner" }],
+      },
+      {
+        parentId: "inner-foundation:default:1",
+        imported: { exportedName: "default", localName: "PreviewInner" },
+        carriers: [{ exportedName: "default", localName: "Preview" }],
+      },
+    ]);
+  });
+
+  it("uses native export ownership edges and stops module-execution terminals", () => {
+    const consumer = source(
+      "src/consumer.js",
+      "consumer",
+      "export const forwarded = value; export const alternate = value;",
+    );
+    const target = source("src/target.js", "target", "export const value = 1;");
+    const entry = source(
+      "src/entry.js",
+      "entry",
+      "import { forwarded } from './consumer.js'; console.log(forwarded);",
+    );
+    const build = snapshot([consumer, target, entry]);
+    const consumerModule = build.manifest.modules.find((module) => module.id === "consumer");
+    if (!consumerModule) throw new Error("Missing consumer module");
+    consumerModule.entry = false;
+    consumerModule.providedExports = ["forwarded", "alternate"];
+    consumerModule.usedExports = ["forwarded", "alternate", "unrelated"];
+    build.manifest.modules.push({
+      id: "entry",
+      identifier: "/project/src/entry.js",
+      readableIdentifier: "./src/entry.js",
+      name: "./src/entry.js",
+      resource: "/project/src/entry.js",
+      moduleType: "javascript/esm",
+      chunks: [],
+      issuer: null,
+      entry: true,
+      size: 20,
+      usedExports: true,
+      providedExports: ["unrelatedEntryExport"],
+      optimizationBailout: [],
+      nested: false,
+    });
+    build.manifest.capabilities.exportUsageGraph = "native";
+    build.exportUsageEdges = [
+      {
+        id: "usage-forwarded",
+        dependencyId: "dep-value",
+        originModuleId: "consumer",
+        originExport: ["forwarded"],
+        targetModuleId: "target",
+        targetExport: ["value", "field"],
+        location: { start: { line: 1, column: 25 }, end: { line: 1, column: 30 } },
+        sourcePath: "src/consumer.js",
+        sourceLocation: {
+          start: { line: 1, column: 25 },
+          end: { line: 1, column: 30 },
+        },
+      },
+      {
+        id: "usage-alternate",
+        dependencyId: "dep-value",
+        originModuleId: "consumer",
+        originExport: ["alternate"],
+        targetModuleId: "target",
+        targetExport: ["value", "field"],
+        location: { start: { line: 1, column: 25 }, end: { line: 1, column: 30 } },
+        sourcePath: "src/consumer.js",
+        sourceLocation: {
+          start: { line: 1, column: 25 },
+          end: { line: 1, column: 30 },
+        },
+      },
+      {
+        id: "usage-entry",
+        dependencyId: "dep-forwarded",
+        originModuleId: "entry",
+        originExport: null,
+        targetModuleId: "consumer",
+        targetExport: ["forwarded"],
+        location: { start: { line: 1, column: 57 }, end: { line: 1, column: 66 } },
+        sourcePath: "src/entry.js",
+        sourceLocation: {
+          start: { line: 1, column: 57 },
+          end: { line: 1, column: 66 },
+        },
+      },
+    ];
+    const model = new InvestigationModel(build, report([consumer, target, entry]), new Map());
+
+    const chain = model.exportImporterChain("target", "value");
+    expect(chain).toMatchObject({ precision: "native", truncated: false });
+    expect(chain?.steps).toHaveLength(2);
+    expect(chain?.steps[0]).toMatchObject({
+      importedExport: "value.field",
+      importedBinding: { exportedName: "value.field", localName: "value.field" },
+      importerExports: ["forwarded", "alternate"],
+      relationPrecision: "exact",
+      usageEdgeId: "usage-forwarded",
+    });
+    expect(chain?.steps[1]).toMatchObject({
+      importedExport: "forwarded",
+      importerExports: [],
+      relationPrecision: "exact",
+      usageEdgeId: "usage-entry",
+    });
+    expect(chain?.steps.some((step) => step.importerExports.includes("unrelated"))).toBe(false);
+    expect(chain?.steps.some((step) => step.importerExports.includes("unrelatedEntryExport"))).toBe(
+      false,
+    );
+    expect(model.snippet("usage-forwarded")).toMatchObject({
+      kind: "usage",
+      available: true,
+      filename: "src/consumer.js",
+      location: { start: { line: 1, column: 25 } },
+    });
+    expect(model.exportDeclaration("consumer", "forwarded")).toMatchObject({
+      kind: "declaration",
+      available: true,
+      filename: "src/consumer.js",
+      location: { start: { line: 1 } },
+    });
   });
 
   it("finds the dependency request when Rspack does not expose a usable location", () => {
