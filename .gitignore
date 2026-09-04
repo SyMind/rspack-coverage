@@ -3,5 +3,5 @@ dist
 coverage
 .DS_Store
 *.log
-tests/fixtures/**/dist
-tests/fixtures/**/Coverage-*.json
+**/tests/fixtures/**/dist
+**/tests/fixtures/**/Coverage-*.json

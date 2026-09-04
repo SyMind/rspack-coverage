@@ -3,11 +3,11 @@
   "files": {
     "includes": [
       "**",
-      "!dist",
-      "!node_modules",
-      "!.rslib",
-      "!tests/fixtures/**/dist",
-      "!tests/fixtures/**/Coverage-*.json"
+      "!**/dist",
+      "!**/node_modules",
+      "!**/.rslib",
+      "!**/tests/fixtures/**/dist",
+      "!**/tests/fixtures/**/Coverage-*.json"
     ]
   },
   "formatter": {

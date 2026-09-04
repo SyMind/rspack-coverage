@@ -1,0 +1,62 @@
+{
+  "name": "star-export-loader",
+  "version": "0.1.0",
+  "description": "Restore prebundled namespace runtimes to native ESM namespace re-exports for Rspack tree shaking.",
+  "keywords": [
+    "rspack",
+    "loader",
+    "tree-shaking",
+    "rollup",
+    "rolldown",
+    "esbuild"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "main": "./loader.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./loader.cjs"
+    },
+    "./api": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "loader.cjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rslib build",
+    "pretest": "pnpm build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@babel/parser": "7.28.4",
+    "@babel/traverse": "7.28.4",
+    "@babel/types": "7.28.4",
+    "magic-string": "0.30.19"
+  },
+  "peerDependencies": {
+    "@rspack/core": ">=1.0.0"
+  },
+  "devDependencies": {
+    "@rslib/core": "0.23.2",
+    "@rspack/core": "2.2.1",
+    "@types/babel__traverse": "7.28.0",
+    "@types/node": "24.13.3",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}

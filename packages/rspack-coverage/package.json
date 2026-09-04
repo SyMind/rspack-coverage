@@ -1,0 +1,77 @@
+{
+  "name": "rspack-coverage",
+  "version": "0.1.0",
+  "description": "Import Chrome JavaScript Coverage and map runtime usage back to Rspack chunks, modules, and original source.",
+  "keywords": [
+    "rspack",
+    "coverage",
+    "bundle-analysis",
+    "source-map",
+    "performance"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "rspack-coverage": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "dev": "rsbuild dev",
+    "build": "pnpm build:lib && pnpm build:ui",
+    "build:lib": "rslib build",
+    "build:ui": "rsbuild build",
+    "typecheck": "tsc --noEmit",
+    "pretest": "pnpm build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "format": "biome check --write .",
+    "format:check": "biome check .",
+    "verify": "pnpm format:check && pnpm typecheck && pnpm test && pnpm build"
+  },
+  "dependencies": {
+    "@babel/parser": "7.28.4",
+    "@fontsource-variable/geist": "5.3.0",
+    "@fontsource-variable/geist-mono": "5.3.0",
+    "@jridgewell/trace-mapping": "0.3.31",
+    "@tanstack/react-virtual": "3.14.10",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "peerDependencies": {
+    "@rspack/core": ">=1.0.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.7",
+    "@microsoft/api-extractor": "7.59.0",
+    "@rsbuild/core": "2.2.1",
+    "@rsbuild/plugin-react": "2.1.0",
+    "@rslib/core": "0.23.2",
+    "@rspack/cli": "2.2.1",
+    "@rspack/core": "2.2.1",
+    "@testing-library/jest-dom": "7.0.0",
+    "@testing-library/react": "16.3.2",
+    "@types/node": "24.13.3",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "jsdom": "30.0.1",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}
